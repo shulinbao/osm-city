@@ -2295,6 +2295,36 @@ class Transit {
   }
 
   /**
+   * **按坐标取路网**（P4 惰性建图，见 deploy/REGIONS.md §7.1）。
+   *
+   * 分区惰性模式下 `this.rail` / `this.bus` 不是一张图，而是"按区域建图的协调器"
+   * （`server/regions.js` 的 `RegionGraphSource`）：它按坐标挑出**属于该区域的那一张图实例**。
+   * 关键点：协调器**只是选一张图交给调用方**，绝不把两张图的节点表并起来 ——
+   * 虚拟路口 id 每个实例都从 −1 开始编号（`railgraph.js` 的 `VIRTUAL_NODE_ID`），
+   * 拼图必然撞号（§6.5.1 的最硬一条禁令）。
+   *
+   * 开关关着时 `this.rail` 是普通 `RailGraph`（没有 `graphAt`）⇒ 原样返回，
+   * 这条路径与改动前**逐字节相同**。
+   */
+  graphAt(kind, lat, lon) {
+    const g = this.graph(kind);
+    if (g && typeof g.graphAt === 'function') return g.graphAt(lat, lon) || g;
+    return g;
+  }
+
+  /**
+   * **选/建"用来寻路的那张图"**（P4，§6.5.2 方案 C）：
+   * 把线路各站的节点 id 交给路网，由它决定用哪张区域图、还是按走廊 bbox **新建一张临时图**。
+   * 返回 `{ graph, route }`，或 null = "这次没有专门的图"（调用方退回老路径 `this.graph(kind)`）。
+   * 开关关着时 `this.graph(kind)` 是普通 RailGraph（没有 `routeFor`）⇒ 返回 null，行为不变。
+   */
+  routeFor(kind, nodeIds) {
+    const g = this.graph(kind);
+    if (!g || typeof g.routeFor !== 'function') return null;
+    return g.routeFor(nodeIds);
+  }
+
+  /**
    * 有没有"要用道路网"的线路（公交）。index.js 用它决定启动时要不要花那 8~10 秒建道路网
    * （实测 91873 条道路 / 107 万段 / 10.1 s）：纯铁路城市直接跳过，第一次真的用到公交时
    * 再由 graph('bus') → ensureBusGraph() 惰性建。判据与 graph() 保持同一处口径（graphFor）。
@@ -2302,6 +2332,29 @@ class Transit {
   needsRoadGraph() {
     for (const line of this._st.allLines.all()) if (graphFor(line.kind) === 'bus') return true;
     return false;
+  }
+
+  /**
+   * **P4：给"走廊图预热"用的线路清单**（deploy/REGIONS.md §6.5.2 方案 C）：
+   * 每条线路的 `kind` 与**各站吸附到的节点 id**。只读，不改任何状态。
+   * 取不到车站/节点就跳过那一条 —— 预热只是优化，缺了会在第一次重建路径时同步补上。
+   */
+  corridorTargets() {
+    const out = [];
+    let lines = [];
+    try { lines = this._st.allLines.all() || []; } catch { return out; }
+    for (const line of lines) {
+      try {
+        const stops = this._parseStops(line.stops);
+        const nodeIds = [];
+        for (const sid of stops) {
+          const s = this._st.station.get(sid);
+          if (s && s.node_id != null) nodeIds.push(Number(s.node_id));
+        }
+        if (nodeIds.length >= 2) out.push({ id: line.id, kind: line.kind, nodeIds });
+      } catch { /* 单条线路解析失败不影响别的 */ }
+    }
+    return out;
   }
 
   /* --------------------------- 车站需求（只看覆盖人口） --------------------------- */
@@ -3414,7 +3467,8 @@ class Transit {
       ? (unlimited ? Infinity : cfgBus)
       : Math.max(1, Number(this.config.railSnapMeters) || 120);
     const measureM = Math.max(Number.isFinite(maxM) ? maxM : 0, Number(this.config.snapMeasureMeters) || 20000);
-    const g = this.graph(kind);
+    // P4（惰性建图）：吸附的目标是**点击坐标所在区域**的那张图 —— 见 graphAt 的说明
+    const g = this.graphAt(kind, lat, lon);
     if (!g || !g.nearestNode) return { ok: true, nodeId: null, wayId: null, lat, lon, distance: null, noGraph: true };
     // 路网是空的（比如底图里还没有可通行的道路）：报出**实测距离**（#2 要求失败要说清多远）
     if (g.nodes && g.nodes.size === 0) {
@@ -5020,8 +5074,12 @@ class Transit {
     }
     const nodeIds = stations.map((s) => s.node_id);
     if (line.loop) nodeIds.push(nodeIds[0]);
-    const g = this.graph(line.kind);
-    const route = g.routeThrough(nodeIds);
+    const routePlan = this.routeFor(line.kind, nodeIds);
+    // ⚠ 惰性模式下 `routePlan.graph` 可能是 null（一张就绪的区域图都没有 + 跨区域被拒）——
+    //    那时退回协调器本身只是为了拿到 `mode / nodes.size / wayCount` 这几个数去拼报错文案，
+    //    寻路仍然用 routePlan.route 的那条 error（不会静默给一条错路径）。
+    const g = (routePlan && routePlan.graph) ? routePlan.graph : this.graph(line.kind);
+    const route = (routePlan && routePlan.route) ? routePlan.route : g.routeThrough(nodeIds);
     if (route.error) {
       const detail = `${route.error}（所用路网：${g.mode === 'bus' ? '道路' : '铁路'}，${g.nodes.size} 个节点 / ${g.wayCount} 条路段）`;
       this._st.updateLine.run(line.name, line.color, line.kind, JSON.stringify(stops), line.loop, null, 0, detail, Date.now(), line.schedule, line.id);

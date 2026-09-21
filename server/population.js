@@ -910,6 +910,66 @@ class Population {
     };
   }
 
+  /**
+   * **按区域增量重算人口网格（P4 惰性建图，见 deploy/REGIONS.md §7.3 第 4 条）**。
+   *
+   * 与 `buildAll()` 的差别（两个都要，用途不同）：
+   *   · `buildAll()` = "整库重建"：先 `DELETE FROM population_cells` 再全表扫一遍 —— 对**整个数据集**成立，
+   *     但代价与库大小成正比（真实数据集分钟级），而且**不能按区域切开**；
+   *   · 本方法 = "**只为这一块重算**"，**幂等**：逐条走 `touchWay` 的同一套逻辑
+   *     （先减掉这条 way 原来的贡献、删掉它的 source 行，再按当前标签重新算一遍），
+   *     所以重复调用同一块不会重复计数，也不会动到块外的格子。
+   *
+   * 判据是 way 的**物化 bbox** 与给定矩形的**相交**（`min_lat IS NULL` 的 way 一并收录：宁可多算，绝不漏算）；
+   * 与 `buildAll()` 的口径一致的地方是：都只处理"闭合且面积 ≥ 20 m²"的地块（在 `contributionOf` 里判）。
+   *
+   * 事务：整块 `BEGIN`/`COMMIT`。**调用方不要把它套在别的事务里**（嵌套 BEGIN 会抛）。
+   * 返回 `{ ways, cells, ms, population, jobs }`，与 `buildAll()` 同形（population/jobs 是全库合计，不是本块合计）。
+   */
+  buildRegion(bbox, options = {}) {
+    const b = bbox && typeof bbox === 'object' ? bbox : null;
+    const minLon = Number(b && (b.minLon !== undefined ? b.minLon : b.min_lon));
+    const minLat = Number(b && (b.minLat !== undefined ? b.minLat : b.min_lat));
+    const maxLon = Number(b && (b.maxLon !== undefined ? b.maxLon : b.max_lon));
+    const maxLat = Number(b && (b.maxLat !== undefined ? b.maxLat : b.max_lat));
+    if (![minLon, minLat, maxLon, maxLat].every(Number.isFinite) || !(minLon < maxLon && minLat < maxLat)) {
+      throw new Error('buildRegion：bbox 不合法（需要 min<max 的四个有限数）');
+    }
+    if (!this._st.taggedWaysInBbox) {
+      this._st.taggedWaysInBbox = this.db.prepare(`SELECT id, tags FROM ways
+        WHERE deleted = 0 AND tags IS NOT NULL
+          AND (min_lat IS NULL OR (max_lat >= ? AND min_lat <= ? AND max_lon >= ? AND min_lon <= ?))`);
+    }
+    const t0 = Date.now();
+    let ways = 0;
+    let cells0 = this._st.countCells.get().c;
+    this.db.exec('BEGIN');
+    try {
+      for (const row of this._st.taggedWaysInBbox.all(minLat, maxLat, minLon, maxLon)) {
+        const r = this.touchWay(row.id);
+        if (r && (r.added || r.removed)) ways += 1;
+        if (ways % 20000 === 0 && options.onProgress) options.onProgress(ways);
+      }
+      // 与 buildAll 同一件事：记下这次的模型版本，下次启动就知道要不要重建
+      try { this._st.setMeta.run('population_model', String(MODEL_VERSION)); } catch { /* 老库没有 meta 表就算了 */ }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+    this._modelChecked = true;
+    this._modelStale = false;
+    this._bumpVersion();
+    const totals = this._st.sumTotals.get();
+    const cells = this._st.countCells.get().c;
+    return {
+      ways, cells, ms: Date.now() - t0, cellsBefore: cells0, cellsAfter: cells,
+      population: Math.round(totals.pop || 0),
+      jobs: Math.round(totals.jobs || 0),
+      bbox: { minLon, minLat, maxLon, maxLat },
+    };
+  }
+
   /** 增量更新：某个 way 被改动后，只重算它原来和现在覆盖的格子 */
   touchWay(wayId) {
     const old = this._st.getSource.get(wayId);

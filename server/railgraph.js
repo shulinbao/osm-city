@@ -224,6 +224,27 @@ class Heap {
   get size() { return this.a.length; }
 }
 
+/**
+ * 作用域 bbox 的归一化（P4 惰性建图用，见 `RailGraph` 构造函数的 `options.bbox`）：
+ * 认 `{minLon,minLat,maxLon,maxLat}`（也认 `min_lon` 等下划线写法）；
+ * 四个数不全 / min ≥ max ⇒ 返回 **null**（= 不作作用域，与改动前完全一致）。
+ * 这个函数是纯函数，不读不写任何东西。
+ */
+function normalizeScopeBbox(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const n = (a, b) => {
+    const v = raw[a] !== undefined ? raw[a] : raw[b];
+    return Number.isFinite(Number(v)) ? Number(v) : null;
+  };
+  const minLon = n('minLon', 'min_lon');
+  const minLat = n('minLat', 'min_lat');
+  const maxLon = n('maxLon', 'max_lon');
+  const maxLat = n('maxLat', 'max_lat');
+  if ([minLon, minLat, maxLon, maxLat].some((v) => v === null)) return null;
+  if (!(minLon < maxLon && minLat < maxLat)) return null;
+  return { minLon, minLat, maxLon, maxLat };
+}
+
 class RailGraph {
   constructor(db, options = {}) {
     this.db = db;
@@ -245,12 +266,75 @@ class RailGraph {
     this._segList = null;        // 与网格配套的段表
     this._segOfWay = new Map();  // wayId -> 段索引数组
     const like = this.mode === 'bus' ? '%highway%' : '%railway%';
+    /**
+     * **可选的作用域 bbox（P4 惰性建图，见 deploy/REGIONS.md §6.5.2 方案 C / §7）**：
+     * 传了 `options.bbox` 时，这张图**只从落在该矩形内的 way 建**（"按区域/走廊建图"）。
+     *   · 不传（默认）⇒ SQL 与改动前**逐字相同**，行为逐字节不变（既有测试全部照旧）；
+     *   · 判据 = way 的物化 bbox（`ways.min_lat/max_lat/min_lon/max_lon`，基表列，不是 R*Tree）
+     *     与作用域矩形**相交**；`min_lat IS NULL` 的 way 一并收录（宁可多建，绝不漏建）。
+     *   · **节点不设作用域**：一条 way 与矩形相交，它用到的全部节点都要进来，
+     *     否则几何会被截断、边会断掉（这与"分片按 way 收录、节点全带"同一个道理）。
+     */
+    this.scopeBbox = normalizeScopeBbox(options.bbox);
+    const scopeSql = this.scopeBbox
+      ? ' AND (min_lat IS NULL OR (max_lat >= ? AND min_lat <= ? AND max_lon >= ? AND min_lon <= ?))'
+      : '';
+    const scopeArgs = this.scopeBbox
+      ? [this.scopeBbox.minLat, this.scopeBbox.maxLat, this.scopeBbox.minLon, this.scopeBbox.maxLon]
+      : null;
+    /**
+     * 参数位置固定的包装：`railWays` 没有调用方参数（作用域参数在最后），
+     * `wayById` 的调用方参数（id）在**最前**，作用域参数跟在它后面。
+     * 只包成 `{all, get, iterate}` 三个方法 —— `buildGraphSliced` 要求 `railWays` 有 `.iterate()`。
+     */
+    const scoped = (stmt, leading) => (scopeArgs ? {
+      all: (...a) => stmt.all(...a.slice(0, leading), ...scopeArgs, ...a.slice(leading)),
+      get: (...a) => stmt.get(...a.slice(0, leading), ...scopeArgs, ...a.slice(leading)),
+      iterate: (...a) => stmt.iterate(...a.slice(0, leading), ...scopeArgs, ...a.slice(leading)),
+      run: (...a) => stmt.run(...a.slice(0, leading), ...scopeArgs, ...a.slice(leading)),
+    } : stmt);
     this._st = {
-      railWays: db.prepare(`SELECT id, tags FROM ways WHERE deleted = 0 AND tags LIKE '${like}'`),
+      railWays: scoped(db.prepare(`SELECT id, tags FROM ways WHERE deleted = 0 AND tags LIKE '${like}'${scopeSql}`), 0),
       wayNodes: db.prepare('SELECT node_id FROM way_nodes WHERE way_id = ? ORDER BY seq'),
       nodeById: db.prepare('SELECT id, lat, lon FROM nodes WHERE id = ? AND deleted = 0'),
-      wayById: db.prepare('SELECT id, tags, deleted FROM ways WHERE id = ?'),
+      wayById: scoped(db.prepare(`SELECT id, tags, deleted FROM ways WHERE id = ?${scopeSql}`), 1),
     };
+  }
+
+  /**
+   * **释放这张图**（P4 的"内存要能释放"）：把内部结构清空并置 null，引用一丢就能被 GC 回收。
+   * 与 `build()` 开头那段清理是同一套（外加把段平行数组也放掉），但**不动 `_st`**
+   * （预编译语句与 db 句柄留着，同一个实例还能再 `build()` 一次）。
+   * 注意：RSS 不一定立刻下降（V8 不急着把页还给 OS）—— 那是运行时行为，如实记账。
+   */
+  dispose() {
+    for (const key of ['nodes', 'wayInfo', 'wayNodes', '_segOfWay']) {
+      const m = this[key];
+      if (m && typeof m.clear === 'function') m.clear();
+    }
+    this._segGrid = null;
+    this._segList = null;
+    this._segWay = null;
+    this._segA = null;
+    this._segB = null;
+    this._segX1 = null;
+    this._segY1 = null;
+    this._segX2 = null;
+    this._segY2 = null;
+    this._segLen = null;
+    this._jamStats = null;
+    this._kx = null;
+    this._cellOX = null;
+    this._cellOY = null;
+    this.virtualNodeCount = 0;
+    this.junctionCount = 0;
+    this._vnodeSeq = 0;
+    this.wayCount = 0;
+    this.edgeCount = 0;
+    this.segmentCount = 0;
+    this.builtAt = 0;
+    this.disposedAt = Date.now();
+    return this;
   }
 
   /**
@@ -1376,7 +1460,7 @@ class RailGraph {
 module.exports = {
   RailGraph, parseMaxSpeed, RUNNABLE, DEFAULT_SPEED, BUS_ROADS, BUS_FORBIDDEN,
   BUS_CONGESTION, URBAN_SPEED_CAP, SPEED_CAP_BY_CLASS, isDrivableHighway,
-  BUS_ROAD_DEFAULT_SPEED, BUS_CONGESTION_DEFAULT,
+  BUS_ROAD_DEFAULT_SPEED, BUS_CONGESTION_DEFAULT, normalizeScopeBbox,
   // #15 / #16：虚拟路口与拥堵定价用的常量与纯函数（测试与工具直接用）
   JUNCTION_DENSITY_SCALE, JUNCTION_CELL_M, JUNCTION_CONGESTION_MIN, LINK_WAY_ID,
   junctionCongestion, effectiveLayerOf, planarCrossing,

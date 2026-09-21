@@ -1670,11 +1670,289 @@
      * 下面几万行的写入逻辑一行都不用改：
      *   · `nodePack{ids,lat,lon}`（三列差分整数）        → `nodes {id: [lat, lon]}`（绝对值）
      *   · `ways[id][1]`（每条 way 内的节点 id 差分）    → 绝对节点 id 数组
-     *   · `displayLines` 的 `coords` / `paths[i]`（扁平差分整数） → `[[lat, lon], …]`
+     *   · `displayLines` / `displayAreas` 的 `coords` + `segs`（② 的摊平形状：
+     *     所有段首尾相接的扁平差分数组 + 段长表）→ `[[lat, lon], …]` 的 `coords` + `paths`
      * 展开后把 `payload.enc` 置空：同一块 payload 合并两次也不会解两次（幂等）。
      * 没有 `payload.enc` 的响应（老服务端 / 自检里的假数据 / limits.compact=false）原样放过。
      * 代价：一次线性循环（z13 四万多个节点，实测 &lt;2 ms），换来的是少传一半字节。
      */
+    /* ---------- 二进制矢量载荷 BIN v1 的解码（见 server/osmdb.js 的格式说明） ---------- */
+    /**
+     * **只改编码、不改语义**：二进制载荷解出来的对象与"紧凑 JSON 载荷"**逐字段相同**
+     * （tests/bin-payload-test.js 在真实数据集上逐档对拍），所以这里解完照样交给
+     * `unpackPayload` 展开成老形状 —— 解码只有一条路径，`mergePayload` 以下一行都不用改。
+     *
+     * 只依赖浏览器原生能力：`DataView`（小端）+ `TextDecoder`（UTF-8）。
+     * 整数是 LEB128 变长整数（uvarint）+ zigzag（svarint），**不能走 32 位位运算**
+     * （节点 id 首值可以到 ~1.2e10 > 2^32），所以用 `v += (b & 0x7f) * mul`。
+     *
+     * 抛错即"别用二进制"：魔数/版本不认识、段越界、varint 截断 → 抛；
+     * `mapdata.js` 的 `_fetch` 收到 `err.dshBin` 后会关掉二进制并**原样退回 `fmt=json` 重取一次**。
+     *
+     * ⚠ **耗时：解码比 JSON 那条路慢 2~3 倍，这是必须知道的代价。**
+     * 用 `tests/tmp-bin/measure-decode-bin.js`（照抄 `tools/measure-decode.js` 的口径：真
+     * `tests/client-vm.js` 宿主 + 真 `public/js/**`、每档 20 次、每轮取新鲜载荷）实测：
+     *
+     *   z     JSON.parse+unpack   BIN decode+unpack    倍数
+     *   z9         4.32 ms            12.76 ms         2.9×
+     *   z10        4.63 ms            10.06 ms         2.2×
+     *   z13        2.69 ms             8.84 ms         3.3×
+     *   z14        1.22 ms             4.97 ms         4.1×
+     *   z15       12.44 ms            21.83 ms         1.8×
+     *   z16       13.35 ms            24.84 ms         1.9×
+     *
+     * 换算成绝对量：低缩放多花 4~8 ms、编辑档多花 9~12 ms，换来的是**字节少 63~69%**
+     * （过网 gzip 后少 11~19%）。原因是结构性的：`JSON.parse` 是 V8 的原生解析器，
+     * 而这里是**纯 JS 逐 varint 解析 + 几千次字符串 `TextDecoder.decode`**。
+     * 试过把逐字节读从 `DataView.getUint8` 换成 `raw[at++]` 直接下标 —— **实测没有变快**
+     * （见 `u8()` 上的注释），所以这条差距目前没有低成本的解法；
+     * 要再快就得改格式（例如坐标流按定长位宽打包、少数字符串表），那是另一件事。
+     */
+    decodeBinaryPayload(bytes) {
+      const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      if (u8.length < 8) throw new Error('二进制载荷太短（' + u8.length + ' 字节）');
+      if (u8[0] !== 0x44 || u8[1] !== 0x53 || u8[2] !== 0x48 || u8[3] !== 0x42) {
+        throw new Error('二进制载荷魔数不对（不是 DSHB）');
+      }
+      const version = u8[4];
+      if (version !== 1) throw new Error('不认识的二进制载荷版本：' + version);
+      const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+      const sectionCount = dv.getUint16(6, true);
+      if (8 + sectionCount * 10 > u8.length) throw new Error('二进制载荷段目录越界');
+      /** 段目录：kind → {offset, length}（按 kind 找，不按顺序） */
+      const dir = Object.create(null);
+      for (let i = 0; i < sectionCount; i++) {
+        const at = 8 + i * 10;
+        const kind = dv.getUint8(at);
+        const offset = dv.getUint32(at + 2, true);
+        const length = dv.getUint32(at + 6, true);
+        if (offset + length > u8.length) throw new Error('二进制载荷段 ' + kind + ' 越界');
+        dir[kind] = { offset, length };
+      }
+      const KIND_CORE = 1;
+      const KIND_STRINGS = 2;
+      const KIND_NODES = 3;
+      const KIND_WAYS = 4;
+      const KIND_RELATIONS = 5;
+      const KIND_LINES = 6;
+      const KIND_AREAS = 7;
+
+      /** UTF-8 解码器（浏览器原生；建一次就复用，几百上千条字符串不用反复 new） */
+      const textDecoder = World._binTextDecoder || (World._binTextDecoder = new TextDecoder('utf-8'));
+      /** 逐字节读取用直接下标（多字节小端字段才用 DataView；见下面 u8() 的注释） */
+      const raw = u8;
+      /** 段内读取器：全是位置游标 + 解析一行就往前走，不做任何缓冲 */
+      const readerAt = (offset, length) => {
+        let at = offset;
+        const end = offset + length;
+        const r = {
+          /**
+           * 单字节走 `raw[at++]` 直接下标；只有多字节的小端字段才用 `DataView`。
+           *
+           * ⚠ 老实说：**这个改法实测没有变快**。原本以为 `DataView.getUint8` 的逐字节方法调用
+           * 是二进制解码慢的主因，改成直接下标之后用 `tests/tmp-bin/measure-decode-bin.js`
+           * （真 `tests/client-vm.js` 宿主 + 真 `public/js/**`）测 z9~z16：
+           *   12.76 / 10.06 / 8.84 / 4.97 / 21.83 / 24.84 ms
+           * → 13.81 / 11.11 / 10.30 / 5.76 / 20.41 / 24.47 ms
+           * **全在噪声里**（每档 min~max 自身就散布 8~26 ms）。保留它只因为它更简单、不更慢，
+           * **不要把它当成一处已证实的优化**。二进制解码真正的代价是结构性的：
+           * "纯 JS 逐 varint 解析 + 几千次字符串 decode" vs "V8 原生 `JSON.parse`"，
+           * 实测整体慢 2~3 倍（见 `decodeBinaryPayload` 顶部关于耗时的那段说明）。
+           */
+          u8() { if (at >= end) throw new Error('二进制载荷段读越界'); return raw[at++]; },
+          /** LEB128 无符号变长整数（低位在前） */
+          uvarint() {
+            let v = 0;
+            let mul = 1;
+            let b;
+            do {
+              if (at >= end) throw new Error('二进制载荷 varint 截断');
+              b = raw[at++];
+              v += (b & 0x7f) * mul;
+              mul *= 128;
+            } while (b & 0x80);
+            return v;
+          },
+          /** zigzag 变长整数（正负各半的增量必须这么编，否则小的负数也占满 5 字节） */
+          svarint() {
+            const u = r.uvarint();
+            return (u % 2) ? -((u + 1) / 2) : u / 2;
+          },
+          /** UTF-8 字符串：uvarint 字节长度 + 原始字节 */
+          str() {
+            const n = r.uvarint();
+            if (at + n > end) throw new Error('二进制载荷字符串越界');
+            const s = textDecoder.decode(raw.subarray(at, at + n));
+            at += n;
+            return s;
+          },
+        };
+        return r;
+      };
+
+      /** 字符串表（kind 2）：下标 0 恒为空串，表里第一条的下标 = 1 */
+      const strings = [''];
+      if (dir[KIND_STRINGS]) {
+        const sr = readerAt(dir[KIND_STRINGS].offset, dir[KIND_STRINGS].length);
+        const n = sr.uvarint();
+        for (let i = 0; i < n; i++) strings.push(sr.str());
+      }
+      const strAt = (i) => (i > 0 && i < strings.length ? strings[i] : '');
+
+      /**
+       * 标签集：`0` = 没有标签（null），否则 `count+1` = 键值对个数，随后 count × (keyIdx, valIdx)。
+       * **null 与 `{}` 必须分得开**（服务端里两种"空"都有，客户端直接把它们当对象用）。
+       */
+      const readTags = (r) => {
+        const m = r.uvarint();
+        if (!m) return null;
+        const n = m - 1;
+        const tags = {};
+        for (let i = 0; i < n; i++) {
+          const k = strAt(r.uvarint());
+          tags[k] = strAt(r.uvarint());
+        }
+        return tags;
+      };
+
+      /** CORE（kind 1）：除几何以外的全部字段，仍然是 UTF-8 JSON —— 直接当载荷的底子 */
+      const payload = dir[KIND_CORE]
+        ? JSON.parse(textDecoder.decode(u8.subarray(dir[KIND_CORE].offset, dir[KIND_CORE].offset + dir[KIND_CORE].length)))
+        : {};
+
+      /**
+       * NODES（kind 3）：三列 delta（首值绝对，与 JSON 版 nodePack 逐个相同）+ nodeTags。
+       * **保持 delta 不放回绝对值**：下游 `unpackPayload` 就是按 delta 展开的，两边口径一致。
+       */
+      if (dir[KIND_NODES]) {
+        const nr = readerAt(dir[KIND_NODES].offset, dir[KIND_NODES].length);
+        const n = nr.uvarint();
+        const ids = new Array(n);
+        const lat = new Array(n);
+        const lon = new Array(n);
+        // **刻意不在这里放回绝对值**：JSON 版 nodePack 里存的就是增量，
+        // 下游 `unpackPayload` 会累加一次；这里再累加一遍就会"加两次"，坐标直接飞掉。
+        for (let i = 0; i < n; i++) ids[i] = nr.svarint();
+        for (let i = 0; i < n; i++) lat[i] = nr.svarint();
+        for (let i = 0; i < n; i++) lon[i] = nr.svarint();
+        payload.nodePack = { ids, lat, lon };
+        const tagged = nr.uvarint();
+        const nodeTags = {};
+        let id = 0;
+        for (let i = 0; i < tagged; i++) {
+          id += nr.svarint();
+          nodeTags[id] = readTags(nr);
+        }
+        payload.nodeTags = nodeTags;
+      }
+
+      /** WAYS（kind 4）：id 差分 + version + flags + 引用差分（**原样搬运**服务端那份 profile 内 delta） */
+      if (dir[KIND_WAYS]) {
+        const wr = readerAt(dir[KIND_WAYS].offset, dir[KIND_WAYS].length);
+        const n = wr.uvarint();
+        const ways = {};
+        let id = 0;
+        for (let i = 0; i < n; i++) {
+          id += wr.svarint();
+          const version = wr.uvarint();
+          const flags = wr.u8();
+          const refCount = wr.uvarint();
+          const refs = new Array(refCount);
+          for (let j = 0; j < refCount; j++) refs[j] = wr.svarint();
+          const length = (flags & 4) ? wr.svarint() : 0;
+          const tags = (flags & 2) ? readTags(wr) : null;
+          ways[id] = [version, refs, tags, (flags & 1) ? 1 : 0, length];
+        }
+        payload.ways = ways;
+      }
+
+      /** RELATIONS（kind 5）：成员类型是小枚举，role 走字符串表（绝大多数是空串 = 下标 0） */
+      if (dir[KIND_RELATIONS]) {
+        const rr = readerAt(dir[KIND_RELATIONS].offset, dir[KIND_RELATIONS].length);
+        const n = rr.uvarint();
+        const relations = {};
+        const TYPES = ['node', 'way', 'relation'];
+        let id = 0;
+        for (let i = 0; i < n; i++) {
+          id += rr.svarint();
+          const version = rr.uvarint();
+          const flags = rr.u8();
+          const memberCount = rr.uvarint();
+          const members = new Array(memberCount);
+          let ref = 0;
+          for (let j = 0; j < memberCount; j++) {
+            const type = TYPES[rr.u8()] || 'node';
+            ref += rr.svarint();
+            members[j] = [type, ref, strAt(rr.uvarint())];
+          }
+          const tags = (flags & 1) ? readTags(rr) : null;
+          let crop = null;
+          if (flags & 2) {
+            crop = {
+              cropped: true,
+              reason: 'viewport',
+              memberTotal: rr.uvarint(), memberKept: rr.uvarint(),
+              memberWaysTotal: rr.uvarint(), memberWaysKept: rr.uvarint(),
+              memberNodesTotal: rr.uvarint(), memberNodesKept: rr.uvarint(),
+              memberRelsTotal: rr.uvarint(), memberRelsKept: rr.uvarint(),
+            };
+          }
+          relations[id] = [version, members, tags, crop];
+        }
+        payload.relations = relations;
+      }
+
+      /**
+       * DISPLAY_LINES（kind 6）/ DISPLAY_AREAS（kind 7）：同一格式。
+       * 重建出来的条目就是 ② 的摊平形状（`coords` 扁平 + `segs` 段长表，**不带 paths**），
+       * 由 `unpackPayload` 再切回 `coords` / `paths`。
+       */
+      const readDisplay = (kind) => {
+        if (!dir[kind]) return null;
+        const r = readerAt(dir[kind].offset, dir[kind].length);
+        const count = r.uvarint();
+        if (!count) return null;
+        const out = new Array(count);
+        for (let i = 0; i < count; i++) {
+          const entry = {};
+          entry.class = strAt(r.uvarint());
+          const eflags = r.u8();
+          if (eflags & 1) entry.name = strAt(r.uvarint());
+          if (eflags & 2) entry.rel = r.uvarint();      // 面关系的条目带关系 id（displayAreas 专用）
+          entry.tags = readTags(r) || {};
+          const segCount = r.uvarint();
+          const segs = new Array(segCount);
+          let total = 0;
+          for (let j = 0; j < segCount; j++) { const t = r.uvarint(); segs[j] = t; total += t; }
+          const flat = new Array(total * 2);
+          let k = 0;
+          for (let j = 0; j < segCount; j++) {
+            // 与 NODES 段同一个口径：**存增量、不放回绝对值** ——
+            // `unpackPayload` 的 `unpackPath` 会按段累加一次（每段差分复位，首值就是绝对量化值）
+            for (let t = 0; t < segs[j]; t++) {
+              flat[k++] = r.svarint();
+              flat[k++] = r.svarint();
+            }
+          }
+          entry.coords = flat;
+          entry.segs = segs;
+          out[i] = entry;        }
+        return out;
+      };
+      const lines = readDisplay(KIND_LINES);
+      if (lines) payload.displayLines = lines;
+      const areas = readDisplay(KIND_AREAS);
+      if (areas) payload.displayAreas = areas;
+      /**
+       * `enc` 里的 CORE JSON 描述的是**服务端 JSON 那一份载荷**的形状（默认 `'split'`），
+       * 而这里解出来的显示条目**一定是** `segs` 形状（DISPLAY 段的格式就是这样，见 osmdb.js）。
+       * 交给 `unpackPayload` 之前把说明书对准**手上这个对象**：否则"声明说 split、条目却带 segs"
+       * 会让它按老形状去读扁平数组 —— 正是我们要防的那种误画。
+       */
+      if (payload.enc) payload.enc.displayPaths = 'flat+segs';
+      return payload;
+    },
+
     unpackPayload(payload) {
       const enc = payload && payload.enc;
       if (!enc) return false;
@@ -1709,25 +1987,75 @@
           arr[1] = abs;
         }
       }
-      const linesSrc = payload.displayLines;
-      if (linesSrc) {
-        for (let i = 0; i < linesSrc.length; i++) {
-          const l = linesSrc[i];
+      /**
+       * 低缩放合并折线（displayLines）与合并面（displayAreas）的几何形状，
+       * **由服务端的 `enc.displayPaths` 显式声明**（见 osmdb.js 的格式说明）：
+       *   · `'flat+segs'`      → ② 摊平：`coords` 是一个扁平数组、`segs` 是段长表。
+       *     先按 `segs` 切成"每段一个扁平数组"，再逐段 `unpackPath` 展开成 `[[lat, lon], …]`：
+       *     `coords` = 第一段、`paths` = 其余段（与摊平前**逐点相同**，`render.js` 读的就是这两个字段）；
+       *   · `undefined` / `'split'` → 老形状（`coords` + `paths`，每段一个扁平数组），直接逐段展开。
+       *
+       * **不认识的取值绝不静默乱画**：服务端比客户端新时（比如将来加了第三种形状），
+       * 老客户端把"多段首尾相接的扁平数组"当成只有一段，会把低缩放路网画成贯穿全图的折线
+       * —— 不报错、不崩溃、只是画错，是最难查的一类问题。所以这里：
+       *   1. 每次载荷**只报一次** `console.error`（说清是什么取值、本客户端只认哪两个）；
+       *   2. 再补一次 `util.toast` 提示刷新页面（每次会话只弹一次，不刷屏）；
+       *   3. 然后**按结构兜底**（条目上有 `segs` 就按扁平解、没有就按老形状解）——
+       *      最坏情况也只是"按能读出来的读"，绝不会把多段几何当成一段。
+       */
+      const shape = enc.displayPaths === undefined || enc.displayPaths === null ? 'split' : String(enc.displayPaths);
+      const flatShape = shape === 'flat+segs';
+      if (!flatShape && shape !== 'split') {
+        const msg = '[world] 收到不认识的几何形状 enc.displayPaths=' + JSON.stringify(shape)
+          + '（本客户端只认 "flat+segs" 与 "split"）：已按结构兜底解码，低缩放几何可能不正确，请刷新页面。';
+        try { console.error(msg); } catch { /* 控制台不可用不影响解码 */ }
+        if (!World._shapeWarned) {
+          World._shapeWarned = true;
+          try { util.toast('地图数据格式不认识（服务端已升级）：低缩放可能画得不对，请刷新页面', 'error'); } catch { /* 提示失败不影响解码 */ }
+        }
+      }
+      const expandDisplay = (list) => {
+        for (let i = 0; i < list.length; i++) {
+          const l = list[i];
           if (!l) continue;
+          /**
+           * 判据顺序（**结构优先于声明**）：
+           *   1. `l.segs` 存在 → 这条几何就是扁平的，**必须**按扁平解。
+           *      二进制载荷那条路就是这样：`decodeBinaryPayload` 的 DISPLAY 段本来就带段长表，
+           *      与 JSON 那份 `enc.displayPaths` 说什么无关（它描述的是 JSON 的形状）。
+           *      把"带着 segs 却当老形状解"当成可能，正是会产生"多段被当成一段"的那种误画。
+           *   2. 否则按 `enc.displayPaths` 的声明走（`flat+segs` → 扁平；`split` → 老形状）。
+           * 不认识的声明上面已经 `console.error` 出声了，这里只是照结构读得出来的读。
+           */
+          const asFlat = flatShape || !!l.segs;
+          if (asFlat && l.segs) {
+            const segs = l.segs;
+            const flat = l.coords || [];
+            let at = 0;
+            const parts = new Array(segs.length);
+            for (let j = 0; j < segs.length; j++) {
+              const n = segs[j] * 2;
+              parts[j] = flat.slice(at, at + n);
+              at += n;
+            }
+            l.coords = parts.length ? World.unpackPath(parts[0], lScale) : [];
+            if (parts.length > 1) {
+              const rest = new Array(parts.length - 1);
+              for (let j = 1; j < parts.length; j++) rest[j - 1] = World.unpackPath(parts[j], lScale);
+              l.paths = rest;
+            }
+            delete l.segs;
+            continue;
+          }
           if (l.coords) l.coords = World.unpackPath(l.coords, lScale);
           if (l.paths) for (let j = 0; j < l.paths.length; j++) l.paths[j] = World.unpackPath(l.paths[j], lScale);
         }
-      }
-      // 低缩放合并面（displayAreas）：与折线同一套编码（量化 + 每环内差分）
+      };
+      const linesSrc = payload.displayLines;
+      if (linesSrc) expandDisplay(linesSrc);
+      // 低缩放合并面（displayAreas）：与折线同一套编码（量化 + 每段内差分）
       const areasSrc = payload.displayAreas;
-      if (areasSrc) {
-        for (let i = 0; i < areasSrc.length; i++) {
-          const ar = areasSrc[i];
-          if (!ar) continue;
-          if (ar.coords) ar.coords = World.unpackPath(ar.coords, lScale);
-          if (ar.paths) for (let j = 0; j < ar.paths.length; j++) ar.paths[j] = World.unpackPath(ar.paths[j], lScale);
-        }
-      }
+      if (areasSrc) expandDisplay(areasSrc);
       return true;
     },
 

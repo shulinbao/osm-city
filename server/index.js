@@ -13,7 +13,19 @@ const path = require('node:path');
 const zlib = require('node:zlib');
 
 const { Auth } = require('./auth');
-const { OsmDB } = require('./osmdb');
+// encodeBinaryPayload / BIN_CONTENT_TYPE：二进制矢量载荷 BIN v1（见 osmdb.js 开头的格式说明）
+const { encodeBinaryPayload, BIN_CONTENT_TYPE, BIN_ACCEPT_TOKEN } = require('./osmdb');
+/**
+ * openRegionDB：分区流式（region sharding）的唯一入口，见 server/regions.js。
+ * **默认关**：关闭时它原样返回 `new OsmDB(config.osmDb, …)`（不读注册表、不开分片、行为逐字节不变）。
+ *
+ * P4（`regions.lazy`，见 deploy/REGIONS.md §7）：**按区域惰性建图**。
+ * `createRegionLazyWorld` 只在 `regions.mode:'on'` 且 `lazy` 不为 false 时才返回东西；
+ * 返回 null 时下面照旧 `new RailGraph(db, {mode})` —— 开关关着时**一行都不会变**。
+ */
+const {
+  openRegionDB, regionsOptionsOf, createRegionLazyWorld, RegionGraphSource,
+} = require('./regions');
 const { OsmOps, OpError, GroupError, UndoBus } = require('./osmops');
 const { RailGraph } = require('./railgraph');
 const { Population } = require('./population');
@@ -86,13 +98,70 @@ function loadConfig() {
   }
   const port = Number(argOf('port') || process.env.PORT || cfg.port || 8787);
   const dataDir = path.resolve(ROOT, argOf('data') || process.env.DATA_DIR || cfg.dataDir || 'data');
-  const osmDb = path.resolve(ROOT, argOf('osm') || process.env.OSM_DB || cfg.osmDb || path.join(dataDir, 'osm', 'osm.sqlite'));
-  return Object.assign({}, cfg, { port, dataDir, osmDb, allowGuests: resolveAllowGuests(argv, cfg) });
+  const osmArg = argOf('osm') || process.env.OSM_DB || null;
+  const osmDb = path.resolve(ROOT, osmArg || cfg.osmDb || path.join(dataDir, 'osm', 'osm.sqlite'));
+  return Object.assign({}, cfg, {
+    port, dataDir, osmDb,
+    allowGuests: resolveAllowGuests(argv, cfg),
+    /** 库路径是不是**显式**给的（`--osm` / `OSM_DB`）—— 分区开关要用它（见 resolveRegionsSwitch） */
+    explicitOsm: !!osmArg,
+  });
+}
+
+/**
+ * **分区流式开关（config.json 的 `regions` 块）——默认关。**
+ *
+ * 优先级：命令行 > 环境变量 > config.json > 默认 off
+ *   node server/index.js --regions              # 打开（验收 / 对照实例用）
+ *   node server/index.js --regions=off          # 明确关闭
+ *   node server/index.js --no-regions           # 明确关闭
+ *   DSH_REGIONS=1 node server/index.js          # 打开
+ *   { "regions": { "mode": "on" } }             # 打开
+ *
+ * **硬规则（REGIONS.md §9.0）**：显式给了 `--osm` / `OSM_DB` 就**强制关**——所有既有测试套件
+ * 都是 `--port <p> --data <tmp> --osm <tmp库>` 自起实例，这条规则保证它们**不会被分区污染**。
+ * 唯一的例外是**同时**显式写了 `--regions` / `--regions=on`：那是"我知道我在干什么"，
+ * 验收用的对照实例正是这一种（单库/回退库指向哪一份要能自己指定）。
+ */
+function resolveRegionsSwitch(argv, cfg, explicitOsm) {
+  const truthy = (v) => {
+    const s = String(v == null ? '' : v).trim().toLowerCase();
+    return s === '' || s === '1' || s === 'true' || s === 'yes' || s === 'on';
+  };
+  const falsy = (v) => ['0', 'false', 'no', 'off'].includes(String(v == null ? '' : v).trim().toLowerCase());
+  const reg = (cfg && typeof cfg.regions === 'object' && cfg.regions) || {};
+  let mode = (reg.mode === 'on' || reg.mode === true) ? 'on' : 'off';
+  let source = 'config.json';
+  const env = process.env.DSH_REGIONS;
+  if (env != null && String(env).trim() !== '') {
+    if (truthy(env)) { mode = 'on'; source = 'env:DSH_REGIONS'; }
+    else if (falsy(env)) { mode = 'off'; source = 'env:DSH_REGIONS'; }
+  }
+  const eq = argv.findIndex((a) => a === '--regions' || a.startsWith('--regions='));
+  if (argv.includes('--no-regions')) { mode = 'off'; source = 'argv:--no-regions'; }
+  else if (eq >= 0) {
+    const flag = argv[eq];
+    const at = flag.indexOf('=');
+    mode = at >= 0 && falsy(flag.slice(at + 1)) ? 'off' : 'on';
+    source = 'argv:--regions';
+  }
+  if (mode === 'on' && explicitOsm && source !== 'argv:--regions') {
+    console.warn('[regions] 显式给了 --osm/OSM_DB ⇒ 分区强制关闭（REGIONS.md §9.0：测试套件都显式给 --osm，'
+      + '不许被分区污染）。真要开：再加一个显式的 --regions');
+    mode = 'off';
+    source = 'forced-off:explicit-osm';
+  }
+  return { mode, source, registryPath: reg.registry || null };
 }
 
 const config = loadConfig();
 /** 游客登录是否允许（默认 false）。全文件只读这一个常量，别再各自去翻 config。 */
 const ALLOW_GUESTS = config.allowGuests === true;
+/**
+ * 分区流式的开关（默认 off，见 resolveRegionsSwitch）。**全文件只读这一个常量**，
+ * 真正的分支在 server/regions.js 的 openRegionDB 里：关闭时它连注册表都不读。
+ */
+const REGIONS_SWITCH = resolveRegionsSwitch(process.argv.slice(2), config, config.explicitOsm);
 const LIMITS = Object.assign(
   {
     opsPer10s: 120,
@@ -181,6 +250,16 @@ const LIMITS = Object.assign(
      * 想整包按老形状下发（对照/排查用）：`"compact": false`。
      */
     compact: true,
+    /**
+     * **二进制矢量载荷**（BIN v1，格式说明见 osmdb.js 开头「二进制矢量载荷」那一段）。
+     * `/api/map` 按**能力协商**决定这一份响应走 BIN 还是 JSON：
+     *   1. 请求参数 `fmt=bin` / `fmt=json` **优先级最高**（json 就是排障用的逃生阀，一票否决）；
+     *   2. 否则看 `Accept` 头里有没有 `application/vnd.dsh.osm.bin`；
+     *   3. 都没有 → JSON（老客户端、curl、工具脚本一律照旧）。
+     * 置 false = 服务端整体只发 JSON（客户端会看到 `content-type: application/json` 并自动退回，
+     * 所以不会坏 —— 见 public/js/mapdata.js 的 DEFAULTS.binary）。
+     */
+    binary: true,
     /** 空间索引自检/自愈（见 osmdb.js 的 _auditSpatialIndexes）：
      * 导入器回填几何时把 way_index / relation_index 的第 5 列写成了 max_lon（笔误），
      * 导致视口查询失去"纬度下界"，把视口**南边**的 way 也全拉进候选（实测 17%~37%）。
@@ -248,11 +327,19 @@ const LIMITS = Object.assign(
 );
 
 fs.mkdirSync(path.dirname(config.osmDb), { recursive: true });
-const db = new OsmDB(config.osmDb, {
+/**
+ * 数据层的唯一入口（**分区流式的唯一改动点**，见 REGIONS.md §4.6 第 1/2 条）：
+ *   · 分区关（默认）→ 返回 `new OsmDB(config.osmDb, …)`：与改动前**同一个对象、同一套行为**；
+ *   · 分区开 → 返回 `RegionDB`（与 OsmDB 同形）：只有 `queryBbox` 会按视口分片扇出+合并，
+ *     **其余每一个方法（含全部写操作）都转发给那个单库** —— 所以新增元素与写操作仍然只走单库，
+ *     `IdAllocator` 一行未改（跨片撞号属于 P2，见 regions.js 开头的说明）。
+ */
+const db = openRegionDB(config, {
   auditIndexes: LIMITS.indexAudit !== false,
   wayLodIndexMaxZoom: LIMITS.wayLodIndexMaxZoom,
   wayLodSample: LIMITS.wayLodSample,
   nodePoiIndexMaxZoom: LIMITS.nodePoiIndexMaxZoom,
+  regions: REGIONS_SWITCH,
 });
 // 分组撤销总线：OSM 编辑（ops）与交通玩法（transit）共用同一条时间线，
 // 于是 beginGroup/endGroup（或 groupLabel）能把两边的一批操作合并成"一步"撤销/重做
@@ -276,24 +363,75 @@ console.log(ALLOW_GUESTS
     + ' 测试实例可以加 --allow-guests 或 DSH_ALLOW_GUESTS=1 打开');
 
 /* --------------------- 铁路经营玩法（路网 / 人口 / 模拟） --------------------- */
-const rail = new RailGraph(db, { mode: 'rail' });
-const road = new RailGraph(db, { mode: 'bus' });
+/**
+ * **P4：按区域惰性建图的开关**（见 `server/regions.js` 里 "P4" 那一大段 / deploy/REGIONS.md §7）。
+ *
+ *   · `REGIONS_OPTS.lazyOn` 只在 `config.regions.mode === 'on'`（或 `--regions=on`）**且** `lazy` 不为 false
+ *     时为真 —— 也就是说**关着分区时这个常量是 false，下面每一步都走老路**（逐字节不变）；
+ *   · 真的建出世界还要求注册表自检通过（`createRegionLazyWorld` 会再判一次）；
+ *   · `lazy:false` 是 P4 的一行回滚：等价于"启动时把图表全建出来"。
+ */
+const REGIONS_OPTS = regionsOptionsOf(config, REGIONS_SWITCH);
+let lazyWorld = createRegionLazyWorld(db, {
+  opts: REGIONS_OPTS,
+  // 建图必须走**切片版**（每片之间让出事件循环，§7.2 的硬要求；一次性 build() 会锁住端口十几秒）
+  buildGraph: (graph, o) => buildGraphSliced(graph, o),
+  // 有没有要用道路网的线路（与下面那个 needsBusGraph() 同一处口径）
+  needsBusGraph: () => needsBusGraph(),
+  // 某个区域的图就绪/卸载之后：线路路径该重算了（去抖在 world 里）
+  onPathsStale: () => { try { transit.onRailChanged(); } catch (err) { console.error('[regions.lazy] 线路路径重算失败:', err.message); } },
+  // 走廊图预热用的线路清单（P4：把"第一次重建路径时同步建走廊图"提前到后台切片做完）
+  linesOf: () => { try { return transit.corridorTargets(); } catch { return []; } },
+});
+/** 惰性建图**真的生效**了吗（世界建不出来就退回全量建图，行为与改动前一致） */
+const LAZY = !!lazyWorld;
+if (REGIONS_OPTS.lazyOn && !LAZY) {
+  console.warn('[regions.lazy] ⚠ 惰性建图已配置，但注册表不可用 ⇒ 退回"整库建图"（与改动前一致）');
+}
+/** 惰性模式下的"路网对象"：一个把**多张区域图**伪装成一张图的协调器（**绝不拼图**，见 regions.js） */
+const rail = LAZY ? new RegionGraphSource(lazyWorld, 'rail') : new RailGraph(db, { mode: 'rail' });
+const road = LAZY ? new RegionGraphSource(lazyWorld, 'bus') : new RailGraph(db, { mode: 'bus' });
+if (LAZY) {
+  // `/api/health` 的 regions 块里带上惰性建图的运行状态（只有挂上了才出现，见 RegionDB.regionsInfo）
+  try { db.lazyWorld = lazyWorld; } catch { /* 单库上挂不上也无所谓 */ }
+}
 let roadGraphBuilt = false;
 /**
  * 道路网按需构建（约 100 万个路段）。**启动时**走的是切片版 buildGraphSliced（见文件上方），
  * 这里这条同步路径只留给"启动时没有公交线路、后来玩家才新建第一条公交线"那种情况 ——
  * transit.js 的调用方要的是"立刻拿到图"，把它也变成异步要改 transit.js（不在本次范围内）。
  * 真实数据集上它是一次 10~18 秒的同步建图：端口开着，这段时间里的请求会排队。
+ *
+ * **P4 惰性模式**：不建整库，只把**当前激活区域**的道路图同步建出来（视口/资产通常已经预热过 ⇒ 往往是零成本）。
  */
 function ensureBusGraph() {
   if (roadGraphBuilt) return road;
   const t0 = Date.now();
+  if (LAZY) {
+    roadGraphBuilt = true;
+    /**
+     * **惰性模式在这里绝对不建图。** 老路径的语义是"整库同步建图"（10~18 s，整段占住事件循环）；
+     * 在惰性模式下照搬那件事的后果是**把当前所有激活区域一次同步建完**（实测：河北整省库上
+     * 2 片就花了 27.7 s，全部压在事件循环里 —— 见 tests/tmp-lazy/measure/on-lazy.log 的第一版读数）。
+     * 真正该发生的是**按需只建用到的那一片**：
+     *   · 站点吸附 → `graphAt(lat, lon)` → 只建**那一片**（而且视口/资产通常已经把它预热好了）；
+     *   · 线路寻路 → `routeFor(nodeIds)` → 复用一片区域图，或按走廊 bbox 新建一张（§6.5.2）。
+     * 这里只做两件事：宣布"道路网可用了"，以及把后台预热踢一脚（走**切片建图**，不锁事件循环）。
+     */
+    lazyWorld.kick();
+    console.log('[bus] 道路网（惰性）：不整批同步建图 —— 用到哪一片才建哪一片'
+      + '（视口/资产已在后台切片预热，见 /api/health 的 regions.lazy）');
+    return road;
+  }
   const stats = road.build();
   roadGraphBuilt = true;
   console.log(`[bus] 道路网构建完成（同步惰性路径，期间事件循环被占住）：${stats.ways} 条道路 / ${stats.edges} 段 / ${stats.nodes} 个节点（${stats.ms} ms）`);
   return road;
 }
 const population = new Population(db);
+if (LAZY) {
+  lazyWorld.population = population;          // 人口网格也按区域建（见 initTransitWorldLazy）
+}
 const transit = new Transit(db, {
   rail,
   ensureBusGraph,
@@ -508,8 +646,12 @@ async function buildGraphSliced(graph, opts = {}) {
 /**
  * 路网 / 人口 / 线路路径的初始化。**调用点在 httpServer.listen() 之后**（见文件末尾的启动段）：
  * 端口先开、静态页面先出，这些重活切片跑，期间 /api/* 一律 503 + 进度（/api/ready）。
+ *
+ * `LAZY`（`regions.mode:'on'` + `regions.lazy`）时改走 `initTransitWorldLazy()`：
+ * **只为激活区域建图**（§7.1 的判据，见 regions.js），未激活的区域不建图、不常驻。
  */
 async function initTransitWorld() {
+  if (LAZY) return initTransitWorldLazy();
   const t0 = Date.now();
   setInitStage('rail');
   console.log('[transit] 开始初始化（端口已开，重活切片跑，不锁事件循环）：铁路网 / 道路网 / 线路路径 / 人口网格');
@@ -559,6 +701,78 @@ async function initTransitWorld() {
   scheduleTransitSync(true);
   console.log(`[transit] 初始化完成，用时 ${((Date.now() - t0) / 1000).toFixed(1)} s`
     + `（其中线路路径 ${out.ms} ms / ${out.rebuilt} 条 · 建网 ${t1 - t0} ms）`);
+}
+
+/**
+ * **P4：按区域惰性建图的初始化**（deploy/REGIONS.md §7.3）。
+ *
+ * 与上面那条全量路径的差别只有一处：**建图的范围**。
+ *   · 启动阶段只建 **`alwaysActive` ∪ `assetShards`**（§7.1 的三个输入里，视口那一个启动时还没有玩家）；
+ *     实测口径下"唯一有资产的区域就是主片"，所以道路网那一项（全量权重 84）直接不花或只花一小部分；
+ *   · 人口网格**逐区域** `buildRegion()`（幂等、只算激活区域的格子），而不是全库 `buildAll()`；
+ *   · 线路路径重建**之前**先切片预热"走廊图"（§6.5.2），否则第一次重建会在同步路径里建走廊图；
+ *   · 最后进 `regions` 阶段：**后台**把非启动激活集的图建起来（`start()` + `kick()`，**不 await**）——
+ *     它**不进 `/api/ready` 的 done 判据**（§7.3 第 2 条 / R32）。
+ */
+async function initTransitWorldLazy() {
+  const t0 = Date.now();
+  setInitStage('rail');
+  console.log('[transit] 开始初始化（**按区域惰性建图**，见 deploy/REGIONS.md §7：只为激活区域建图）');
+  const started = await lazyWorld.activateStartup();
+  const info0 = lazyWorld.info();
+  const railStats = {
+    ways: info0.rail.ways, edges: info0.rail.edges, nodes: info0.rail.nodes,
+    ms: info0.rail.builtMs, virtualJunctions: rail.virtualNodeCount, junctions: rail.junctionCount,
+    junctionMs: 0, regions: info0.rail.ready,
+  };
+  console.log(`[rail] 铁路网（惰性）构建完成：${railStats.ways} 条轨道 / ${railStats.edges} 段 / ${railStats.nodes} 个节点`
+    + `（建图合计 ${railStats.ms} ms · ${railStats.regions.length} 个激活区域：${railStats.regions.join(',') || '无'}`
+    + ` · 其余 ${info0.rail.absent.length} 片**一片都没建**：${info0.rail.absent.join(',') || '无'}）`);
+  if (started.busWanted) {
+    setInitStage('road');
+    const info1 = lazyWorld.info();
+    roadGraphBuilt = info1.bus.ready.length > 0;
+    console.log(`[bus] 道路网（惰性）构建完成：${info1.bus.ways} 条道路 / ${info1.bus.edges} 段 / ${info1.bus.nodes} 个节点`
+      + `（建图合计 ${info1.bus.builtMs} ms · ${info1.bus.ready.length} 个激活区域：${info1.bus.ready.join(',') || '无'}）`);
+    console.log(`[bus] 分段耗时（各激活区域合计，与整库路径同一个口径）：段网格 ${info1.bus.phases.reindex || 0} ms`
+      + ` · 路口 ${info1.bus.phases.junctions || 0} ms（切不开的一段，见 index.js 上方的说明）`
+      + ` · 重铺边 ${info1.bus.phases.rebuildEdges || 0} ms`
+      + ` · 拥堵 ${(info1.bus.phases.congestion || 0) + (info1.bus.phases.applyCongestion || 0)} ms`
+      + `（其中刷边 ${info1.bus.phases.applyCongestion || 0} ms） · 收尾 ${info1.bus.phases.tail || 0} ms`);
+  }
+  setInitStage('population');
+  const cellCount = db.prepare('SELECT COUNT(*) AS c FROM population_cells').get().c;
+  let popStats = null;
+  if (cellCount === 0) {
+    // 网格是空的：**只为激活区域**算（population.buildRegion 是幂等的，重算同一块不会重复计数）
+    lazyWorld.populationMode = 'region';
+    const which = await lazyWorld.populationStartup();
+    popStats = population.totals();
+    console.log(`[pop] 首次启动：只为激活区域（${which.join(',') || '无'}）推算人口与岗位`
+      + ` → 全库 ${popStats.population} 人 / ${popStats.jobs} 个岗位 / ${popStats.cells} 格`
+      + `（未激活区域保持为空，等它被激活时再算）`);
+  } else {
+    popStats = population.totals();
+    console.log(`[pop] 已有人口网格：${popStats.population} 人 / ${popStats.jobs} 个岗位 / ${popStats.cells} 格`);
+  }
+  setInitStage('paths');
+  const t1 = Date.now();
+  // 先预热走廊图（**切片建图**，不锁事件循环）：跨区域的线路第一次重建路径时就不用同步建图了
+  const warm = await lazyWorld.warmupCorridors();
+  if (warm.built) console.log(`[regions.lazy] 走廊图预热：新建 ${warm.built} 张 / 跳过 ${warm.skipped} 条线路（切片建图）`);
+  const out = transit.onRailChanged();
+  transitReady = { rail: railStats, population: popStats, at: Date.now(), lazy: true };
+  scheduleTransitSync(true);
+  console.log(`[transit] 初始化完成（惰性），用时 ${((Date.now() - t0) / 1000).toFixed(1)} s`
+    + `（其中线路路径 ${out.ms} ms / ${out.rebuilt} 条 · 建网 ${t1 - t0} ms）`);
+  // ── regions 阶段：后台按需建图（**不 await、不进 done 判据**）────────────────
+  setInitStage('regions');
+  lazyWorld.start();
+  lazyWorld.kick();
+  const info2 = lazyWorld.info();
+  console.log(`[regions.lazy] 就绪：激活区域 ${info2.activeShards.join(',') || '无'}`
+    + ` · 铁路图就绪 ${info2.rail.ready.length} 片 · 道路图就绪 ${info2.bus.ready.length} 片`
+    + ` · 其余区域**一个字节都不建**（玩家视口/资产激活时才建，空闲 ${(info2.idleMs / 1000).toFixed(0)} s 后卸载）`);
 }
 let transitSyncTimer = null;
 let transitSyncFull = false;
@@ -857,6 +1071,8 @@ function onWsConnection(conn, req) {
     sessions.delete(conn);
     ops.releaseLocks(user.id);
     transit.dropPlayerView(session.userId);      // #广播按需：视口跟着连接一起走
+    // P4（惰性建图）：视口没了 ⇒ 那个区域可能不再激活 ⇒ 空闲到点就会被卸载（见 regions.js 的 sweep）
+    if (lazyWorld) lazyWorld.dropViewport(session.userId);
     broadcast({ t: 'sys', text: `${user.name} 离开了编辑室`, ts: Date.now() });
     broadcast({ t: 'locks', locks: ops.locksSnapshot() });
     schedulePresence();
@@ -890,6 +1106,9 @@ function setSessionView(session, view) {
     at: Date.now(),
   };
   transit.setPlayerView(session.userId, session.view);
+  // P4（惰性建图）：视口就是"激活区域"的现成信号（§7.1）—— 把视口覆盖到的区域标成激活并预热建图。
+  // 惰性关着时 lazyWorld 是 null，这一行不存在（行为与改动前逐字节相同）。
+  if (lazyWorld) lazyWorld.noteViewport(session.userId, session.view);
   return session.view;
 }
 
@@ -1056,41 +1275,195 @@ const MIME = {
   '.xml': 'application/xml; charset=utf-8',
 };
 
-/** 小于这个字节数的 JSON 不值得压缩（压缩后可能更大，还要多花 CPU/一次往返） */
+/** 小于这个字节数的载荷不值得压缩（压缩后可能更大，还要多花 CPU/一次往返） */
 const GZIP_MIN_BYTES = 1024;
 
-/** 解析 Accept-Encoding，判断客户端是否愿意接收 gzip（`gzip;q=0` 视为不接受） */
-function acceptsGzip(req) {
+/**
+ * **brotli 质量档（实测挑的，不是拍脑袋）**。
+ *
+ * 同一份 `/api/map` 响应体（真实数据集，Node 内置 zlib）：
+ *   z13 原始 936.1 KB，gzip 247.3 KB / 23.7 ms 为基准：
+ *     br q5  229.7 KB  22.2 ms  −7.1%  CPU 0.9×   ← **甜点：更小、还更便宜**
+ *     br q6  227.0 KB  28.0 ms  −8.2%  1.2×
+ *     br q7  224.1 KB  39.8 ms  −9.4%  1.7×
+ *     br q9  221.8 KB  70.0 ms  −10.3% 3.0×
+ *     br q11 192.4 KB 1341 ms   −22.2% 57×        ← 线上不可用
+ *   z16 原始 912.4 KB，gzip 227.1 KB / 16.0 ms：br q5 211.2 KB −7.0%（CPU 1.2×）· q6 209.3 KB −7.9%
+ * 所以取 **q5**：省 ~7% 传输、CPU 与 gzip 同量级（大响应上甚至更便宜）。
+ * 想要更小可以把 config 里的 `limits.brotli` 调成 6/7 —— 每加一档约多花 1.2~1.7× CPU、多省 1%。
+ */
+const BROTLI_QUALITY = (() => {
+  const n = Number(LIMITS && LIMITS.brotli);
+  return Number.isFinite(n) && n >= 0 && n <= 11 ? Math.floor(n) : 5;
+})();
+
+/**
+ * 解析 `Accept-Encoding` → 按 **q 值**选一个编码（RFC 9110 §12.5.3 的口径）。
+ * 返回 `'br'` / `'gzip'` / `'identity'`（identity = 不压，原样发）。
+ *
+ * 规则：
+ *   · 点名 br / gzip / identity，`*` 视为"其余没点名的编码"的默认 q；
+ *   · 同一编码出现多次取最大 q；**显式拒绝必须尊重**（`br;q=0` 就不许用 br，`gzip;q=0` 同理）；
+ *   · 只在**等价**时优先 br（q 相同），`gzip;q=1, br;q=0.5` 就老老实实走 gzip；
+ *   · 不认识的编码（zstd / deflate…）**忽略**，不因为客户端多写了个 zstd 就不压缩；
+ *   · 头缺失 / 空 → identity（不猜、也不偷偷压）。
+ *
+ * 边界：`identity;q=0`（"我只要压缩过的"）而 br/gzip 又都不可用时，**仍然发明文**。
+ * 按规范这里该回 406，但本项目的客户端全是自家页面（`fetch` 一律带完整的 Accept-Encoding），
+ * 回 406 只会让地图直接打不开 —— 发一份一定能读的明文是更不坏的选择。这条有测试钉着。
+ */
+function pickEncoding(req) {
   const raw = req && req.headers ? req.headers['accept-encoding'] : '';
-  if (!raw) return false;
+  if (!raw) return 'identity';
+  const q = { br: null, gzip: null, identity: null, star: null };
   for (const part of String(raw).split(',')) {
     const bits = part.trim().split(';');
     const coding = bits[0].trim().toLowerCase();
-    if (coding !== 'gzip' && coding !== '*') continue;
-    let q = 1;
+    if (!coding) continue;
+    let v = 1;
     for (let i = 1; i < bits.length; i++) {
       const m = /^\s*q\s*=\s*([0-9.]+)\s*$/i.exec(bits[i]);
-      if (m) q = Number(m[1]);
+      if (m) { const n = Number(m[1]); if (Number.isFinite(n)) v = Math.max(0, Math.min(1, n)); }
     }
-    if (!(q > 0)) continue; // 显式拒绝（gzip;q=0）
-    return true;
+    const key = coding === '*' ? 'star'
+      : (coding === 'br' || coding === 'gzip' || coding === 'identity' ? coding : null);
+    if (!key) continue;                       // 不认识的编码忽略
+    q[key] = q[key] === null ? v : Math.max(q[key], v);
   }
-  return false;
+  const qOf = (name) => {
+    if (q[name] !== null) return q[name];
+    if (q.star !== null) return q.star;       // 没点名 → 由 `*` 决定
+    return name === 'identity' ? 1 : 0;       // identity 没点名也没 `*` 时按可接受处理
+  };
+  const br = qOf('br');
+  const gz = qOf('gzip');
+  if (br > 0 && br >= gz) return 'br';        // 等价时优先 br（它更小）
+  if (gz > 0) return 'gzip';
+  if (qOf('identity') > 0) return 'identity';
+  return 'identity';                          // 见上面注释：宁可发明文，也不回 406
+}
+
+/** 兼容旧调用点（别处还有人在问"这个请求能不能压"） */
+function acceptsGzip(req) {
+  return pickEncoding(req) !== 'identity';
+}
+
+/**
+ * **客户端能力声明**（`?caps=`，逗号分隔）。目前只有一个：`flatsegs`
+ * —— "我认识 displayLines / displayAreas 的扁平几何（`coords` + `segs`）"。
+ *
+ * 为什么要它：`public/index.html` 引脚本是裸路径，部署瞬间**已打开的标签页仍跑旧客户端**，
+ * 而老客户端会把扁平数组当成只有一段来画（不报错、只是画错）。所以服务端**绝不单方面改协议**：
+ * 只有客户端明说自己认识扁平形状，才可能收到它（还要配置也允许，两道门串联，见 osmdb.js）。
+ * `?fmt=bin` 也算声明（能解二进制载荷的客户端必然认识 `segs`）。
+ */
+function clientCaps(url) {
+  const raw = url.searchParams.get('caps');
+  return { flatsegs: !!raw && String(raw).split(',').some((c) => c.trim().toLowerCase() === 'flatsegs') };
+}
+
+/**
+ * 按协商结果发一份 body。**压缩一律走异步回调版**（`zlib.gzip` / `zlib.brotliCompress`），
+ * 绝不用 `*Sync` —— 视口载荷几百 KB、多人同服时同步压缩会把事件循环钉住。
+ * `write(res, req, status, body, enc)` 是"真正落笔"的那个函数（JSON 与二进制各有一份）。
+ */
+function sendNegotiated(res, req, status, body, write) {
+  const enc = body.length >= GZIP_MIN_BYTES ? pickEncoding(req) : 'identity';
+  if (enc === 'identity') { write(res, req, status, body, 'identity'); return; }
+  const done = (err, out) => {
+    if (res.writableEnded || res.destroyed) return;   // 客户端已断开
+    // 压完反而更大（小 body / 已压缩的二进制）→ 老实发明文，别让客户端白解一遍
+    if (err || !out || out.length >= body.length) { write(res, req, status, body, 'identity'); return; }
+    write(res, req, status, out, enc);
+  };
+  if (enc === 'br') {
+    zlib.brotliCompress(body, {
+      params: {
+        [zlib.constants.BROTLI_PARAM_QUALITY]: BROTLI_QUALITY,
+        // 告诉 brotli 原始大小：它据此挑窗口，大响应上收益稳定且更省 CPU
+        [zlib.constants.BROTLI_PARAM_SIZE_HINT]: body.length,
+      },
+    }, done);
+  } else {
+    zlib.gzip(body, done);
+  }
 }
 
 /** 统一的 JSON 收尾：保持原有的 Content-Type / Cache-Control 与状态码不变 */
-function writeJSON(res, req, status, body, gzipped) {
+function writeJSON(res, req, status, body, enc) {
   const headers = {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': body.length,
     'Cache-Control': 'no-store',
     Vary: 'Accept-Encoding',
   };
-  if (gzipped) headers['Content-Encoding'] = 'gzip';
+  if (enc && enc !== 'identity') headers['Content-Encoding'] = enc;
   res.writeHead(status, headers);
   // HEAD 不发送 body，但保留 Content-Length（等于 GET 时会发送的字节数）
   if (req && req.method === 'HEAD') res.end();
   else res.end(body);
+}
+
+/**
+ * **二进制载荷的收尾**（BIN v1，见 osmdb.js 的「二进制矢量载荷」）。
+ *
+ * 与 `sendJSON` 是同一套：`Content-Type` 换成那个能力标识（客户端拿它当"这是 BIN"的权威判据）、
+ * `Cache-Control: no-store`、`Vary: Accept-Encoding` 照旧，`HEAD` 不发 body。
+ *
+ * 关于压缩：**BIN v1 自身不压缩**（只是 zigzag/varint + 字符串表去重），字节流里仍有多余的
+ * 统计冗余，实测 gzip 之后还能再小 ~2.9 倍，所以这里照旧压 —— 这不是"重复压缩"。
+ * 编码与 `sendJSON` 走**同一个协商函数**（br / gzip，异步）。
+ * 将来若某个版本自带压缩，必须在那份格式的 flags 里置"已压缩"标志并在这里跳过压缩。
+ */
+function writeBinary(res, req, status, body, contentType, enc) {
+  const headers = {
+    'Content-Type': contentType,
+    'Content-Length': body.length,
+    'Cache-Control': 'no-store',
+    Vary: 'Accept-Encoding',
+    'X-Content-Type-Options': 'nosniff',
+  };
+  if (enc && enc !== 'identity') headers['Content-Encoding'] = enc;
+  res.writeHead(status, headers);
+  if (req && req.method === 'HEAD') res.end();
+  else res.end(body);
+}
+
+/** 二进制载荷的发送（编码协商与门槛跟 sendJSON 完全是同一套） */
+function sendBinary(res, status, body, contentType = BIN_CONTENT_TYPE) {
+  const req = res.req || null;
+  if (status === 204 || status === 304) {
+    res.writeHead(status, { 'Cache-Control': 'no-store', Vary: 'Accept-Encoding' });
+    res.end();
+    return;
+  }
+  sendNegotiated(res, req, status, body, (r, rq, st, b, enc) => writeBinary(r, rq, st, b, contentType, enc));
+}
+
+/**
+ * 客户端愿不愿意收二进制载荷（协商第二条路；`?fmt=` 优先，见 /api/map）。
+ * 与客户端 `Accept: application/vnd.dsh.osm.bin, application/json` 里的那个串必须一致。
+ */
+function acceptsBinary(req) {
+  const raw = req && req.headers ? req.headers.accept : '';
+  return !!raw && String(raw).indexOf(BIN_ACCEPT_TOKEN) >= 0;
+}
+
+/**
+ * `/api/map` 的载荷编码协商（**三档优先级**，见 LIMITS.binary 的说明）：
+ *   1. `?fmt=bin` / `?fmt=json` 显式指定（json = 逃生阀，一票否决，排障用）；
+ *   2. `Accept` 里有 `application/vnd.dsh.osm.bin`；
+ *   3. 默认 JSON。
+ * 服务端把 binary 关掉（config `limits.binary = false`）时 `fmt=bin` 也只会拿到 JSON ——
+ * **不报错**：客户端以 content-type 为准，会自动退回 JSON（两侧都不认识对方也没关系）。
+ */
+function wantBinaryPayload(req, url) {
+  if (LIMITS.binary === false) return false;
+  const fmt = url.searchParams.get('fmt');
+  if (fmt === 'bin') return true;
+  if (fmt === 'json' || fmt === '0' || fmt === 'false') return false;
+  if (fmt) return false;        // 不认识的 fmt 一律退回 JSON（绝不猜）
+  return acceptsBinary(req);
 }
 
 function sendJSON(res, status, obj) {
@@ -1104,17 +1477,8 @@ function sendJSON(res, status, obj) {
     return;
   }
 
-  // 视口数据动辄几百 KB：走异步 gzip，避免在多人游戏里长时间阻塞事件循环
-  if (body.length >= GZIP_MIN_BYTES && acceptsGzip(req)) {
-    zlib.gzip(body, (err, gz) => {
-      if (res.writableEnded || res.destroyed) return; // 客户端已断开
-      if (err || !gz || gz.length >= body.length) { writeJSON(res, req, status, body, false); return; }
-      writeJSON(res, req, status, gz, true);
-    });
-    return;
-  }
-
-  writeJSON(res, req, status, body, false);
+  // 视口数据动辄几百 KB：编码按 Accept-Encoding 协商（br / gzip），压缩一律异步，别钉住事件循环
+  sendNegotiated(res, req, status, body, writeJSON);
 }
 
 async function readBody(req, maxBytes = 256 * 1024) {
@@ -1249,6 +1613,13 @@ const httpServer = http.createServer(async (req, res) => {
     if (pathname === '/api/health') {
       sendJSON(res, 200, {
         ok: true, online: sessions.size, data: db.info(),
+        /**
+         * 分区流式的运行状态（**只有分区开着时才出现这个键**，见 server/regions.js）：
+         * `declared / opened / missing` 是设计 P0 要求的可验证产出（"注册表声明了几片、
+         * 真的惰性打开了几片、有哪几片文件不在"），另外还有命中/回退计数与冲突计数。
+         * 关闭分区时 `db` 就是普通 OsmDB ⇒ **这个键不存在**，/api/health 的响应与改动前逐字节相同。
+         */
+        ...(typeof db.regionsInfo === 'function' ? { regions: db.regionsInfo() } : {}),
         locks: Object.keys(ops.locksSnapshot()).length,
         uptimeSec: Math.round(process.uptime()),
       });
@@ -1384,6 +1755,18 @@ const httpServer = http.createServer(async (req, res) => {
       const neverSend = neverSendRaw === null || neverSendRaw === '' ? null
         : (neverSendRaw === '0' || neverSendRaw === 'false' ? false : true);
       const started = Date.now();
+      /**
+       * 载荷编码协商（**只影响编码，不影响任何语义**，见 wantBinaryPayload / LIMITS.binary）：
+       * 同一份 queryBbox 结果，`fmt=bin` 走 BIN v1，其余情况照旧 JSON。
+       */
+      const wantBin = wantBinaryPayload(req, url);
+      /**
+       * 客户端能力（见 clientCaps）：`flatsegs` = 认识扁平几何。
+       * `fmt=bin` 一并算作声明 —— 二进制解出来的显示条目本来就是 `segs` 形状。
+       * 这个值只决定"能不能发扁平形状"，**还要求配置允许**（两条门串联，见 osmdb.js 的 flatDisplay）。
+       */
+      const caps = clientCaps(url);
+      const flatCaps = caps.flatsegs || wantBin;
       // 上限全部来自 config.json 的 limits.*（wayCandidates / nodeCandidates / relationLimit /
       // relationCropPad / relationCropMinMembers），每一项被砍掉多少条由 db.queryBbox 如实报在
       // payload.truncation 里（关系成员裁剪另见 payload.truncation.crop 与 relations[id][3]，
@@ -1411,6 +1794,9 @@ const httpServer = http.createServer(async (req, res) => {
         compact: LIMITS.compact,
         // 低缩放视图载荷（见 osmdb.js 开头「低缩放视图载荷」）：面几何也只发"画得出来的紧凑几何"
         view,
+        // 客户端能力声明（`?caps=flatsegs` 或 `fmt=bin`）：只决定"能不能"发扁平几何；
+        // 还要 config 的 limits.compact.displayFlat 也为 true 才会真的发（两道门串联，见 osmdb.js）
+        flatCaps,
       });
       payload.ms = Date.now() - started;
       /**
@@ -1444,7 +1830,31 @@ const httpServer = http.createServer(async (req, res) => {
         compact: payload.enc || (LIMITS.compact === false ? false : true),
         // 这次到底算没算视口要素统计（默认不算 → payload 里没有 stats 字段；见 limits.viewportStats）
         stats: wantStats,
+        // 这次响应用的是哪种载荷编码（`bin` = BIN v1 二进制；协商见 wantBinaryPayload）
+        fmt: wantBin ? 'bin' : 'json',
+        /**
+         * 这次客户端**声明了什么能力**、以及它有没有真的被用于扁平几何（验收用一眼看得出）：
+         *   flatsegs  客户端声明认识扁平几何（`?caps=flatsegs` 或 `fmt=bin`）
+         *   flatCaps  两道门（配置 limits.compact.displayFlat + 客户端声明）是否都通过
+         * 最终生效的几何形状看 `query.compact.displayPaths`（'split' = 老形状 / 'flat+segs' = 摊平）。
+         */
+        caps: { flatsegs: !!caps.flatsegs, flatCaps: !!flatCaps },
       };
+      /**
+       * 载荷编码：请求要二进制（且服务端允许）时先编 BIN。
+       * **编码失败一律退回 JSON**（老形状永远是对的）—— 所以这里宁可 try/catch 也不冒中断的风险。
+       * 客户端以响应的 `content-type` 为权威判据，两条路它都能解。
+       */
+      if (wantBin) {
+        try {
+          const bin = encodeBinaryPayload(payload);
+          sendBinary(res, 200, bin, BIN_CONTENT_TYPE);
+          return;
+        } catch (err) {
+          console.warn('[map] 二进制载荷编码失败，退回 JSON：', err.message);
+          payload.query.fmt = 'json';
+        }
+      }
       sendJSON(res, 200, payload);
       return;
     }
@@ -1829,6 +2239,21 @@ const INIT_STAGES = [
   { key: 'population', label: '人口网格', weight: 6, message: '正在准备人口网格' },
   { key: 'paths', label: '线路路径', weight: 5, message: '正在重建线路路径' },
 ];
+/**
+ * **P4：`regions` 阶段**（deploy/REGIONS.md §7.3 第 2 条）—— 排在 `paths` 之后，**权重 0**。
+ *
+ * 权重 0 是关键：`INIT_STAGE_TOTAL` 与 percent 的算法**一个数都不变**（`/api/ready` 的形状与
+ * 进度百分比在惰性模式下与改动前同口径）；同时这个阶段**不进 `initState.done` 的判据** ——
+ * `ready=true` 仍然只表示"可以接请求"，区域图的进度只作为 `progress.regions` 的**附加字段**回显。
+ * 换句话说：让 ready 等所有区域建完，就等于把惰性建图又变回全量建图（违反设计目标，见 R32）。
+ * 惰性关着时这个条目**不存在**（`INIT_STAGES` 与改动前逐字节相同）。
+ */
+if (LAZY) {
+  INIT_STAGES.push({
+    key: 'regions', label: '区域图（后台按需）', weight: 0,
+    message: '后台按需构建未激活区域的图（不影响就绪）',
+  });
+}
 const INIT_STAGE_TOTAL = INIT_STAGES.reduce((n, s) => n + s.weight, 0);
 const INIT_STAGE_INDEX = new Map(INIT_STAGES.map((s, i) => [s.key, i]));
 
@@ -1852,7 +2277,7 @@ const initState = {
 /** 初始化进度（内存里，纯读）：/api/ready 与 503 都用它 */
 function initPayload() {
   const elapsedMs = Date.now() - initState.startedAt;
-  return {
+  const out = {
     ready: !!initState.done,
     initializing: !initState.done,
     // 规范要求的字段形状：ready / message / progress{stage, percent}
@@ -1875,6 +2300,20 @@ function initPayload() {
     estimated: true,                        // 阶段内部是估计值（阶段边界是精确的）
     retryAfterMs: 1000,
   };
+  /**
+   * **P4 的附加字段**（§7.3 第 2 条）：区域惰性建图的进度。
+   * ⚠ 只有惰性建图开着时才出现 —— 关着时 `/api/ready` 的 JSON 与改动前逐字节相同。
+   */
+  if (lazyWorld) {
+    const info = lazyWorld.info();
+    out.progress.regions = {
+      active: info.activeShards, ready: info.rail.ready, building: info.rail.building,
+      absent: info.rail.absent, busReady: info.bus.ready,
+      builds: info.counters.builds, unloads: info.counters.unloads,
+    };
+    out.regions = info;
+  }
+  return out;
 }
 
 /** /api/ready：同样的状态，但明确"已就绪"时的样子（客户端一条轮询就够） */

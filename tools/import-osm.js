@@ -3,11 +3,20 @@
  * OSM XML 流式导入器（零第三方依赖，只用 Node 内置模块）
  *
  * 用法：
- *   node tools/import-osm.js --file <path.osm|path.osm.gz> --db <path.sqlite> [--limit N] [--force] [--quiet]
+ *   node tools/import-osm.js --file <path.osm|path.osm.gz|path.osm.pbf> --db <path.sqlite> [--limit N] [--force] [--quiet]
+ *   node tools/import-osm.js --file <…> --city <id> …     # 用 tools/cities.json 的预设决定 --db（按城市切数据集）
+ *
+ * 两种格式，按扩展名 + 文件头魔数自动识别（tools/pbf.js 的 detectKind）：
+ *   · OSM XML（.osm / .osm.gz）—— 本文件里的增量 SAX 扫描器 + gunzip 流式解压；
+ *   · OSM PBF（.osm.pbf / .pbf，Geofabrik 全国/分省数据就是这种）—— tools/pbf.js 的零依赖 protobuf 解析器。
+ *   两条路径**共用同一段写库代码**（insertElement）和同一套回填（backfillGeometry）：
+ *   visible="false" / visible=false 都跳过，tags 都存 JSON，editor=uid||user，ts 都是毫秒，
+ *   seq 从 0 起，closed 都是"≥2 个节点且首尾相同"。
  *
  * 设计要点：
- *   1) 全程流式：fs.createReadStream + zlib.createGunzip，自己写增量 XML 扫描器（找 '<'…'>'，
- *      解析属性，跨 chunk 断裂用 carry 缓冲区拼接），600 MB 的 XML 也不会整块进内存。
+ *   1) 全程流式：XML 用 fs.createReadStream + zlib.createGunzip + 自写增量扫描器（跨 chunk 断裂用
+ *      carry 缓冲区拼接）；PBF 按 blob 逐个读（4 字节长度 → BlobHeader → Blob → PrimitiveBlock），
+ *      同一时刻内存里只有一个 blob。600 MB 的 XML、1.5 GB 的全国 PBF 都不会整块进内存。
  *   2) 批量事务：每 5 万个元素（node + way 合计）COMMIT 一次，prepared statement 全程复用。
  *   3) 几何信息（ways 的 bbox / length、relations 的 bbox、三个 R*Tree 索引）在遍历结束后
  *      一次性用 SQL 批处理 + 一次有序流式遍历回填，绝不在 JS 里逐条查库。
@@ -22,6 +31,12 @@
  *
  * --limit N 的语义：node / way / relation **各自**计数（各自按文件顺序取前 N 个），
  * 三种元素都达到 N 后会提前结束读取。--limit 用于冒烟测试，被跳过的元素仍然占用配额。
+ * 这条语义对 XML 与 PBF 完全一致（PBF 路径在整块解完之后检查，粒度是"一个 blob"）。
+ *
+ * 关于"way 引用了不在本文件里的节点"：XML 与 PBF 的处理**本来就是同一套**，不需要特判 ——
+ * way_nodes 原样入库，几何回填用 `way_nodes JOIN nodes`，查不到的节点自然不参与聚合，
+ * 于是该 way 的 bbox/length 保持 NULL、也不会进 way_index（见 backfillGeometry 的注释）。
+ * 北京数据只有道路没有铁路、全国数据里 way 可能引用边界外的节点，都是这条路径兜住的。
  */
 const fs = require('fs');
 const path = require('path');
@@ -38,6 +53,7 @@ process.emitWarning = function (warning, ...rest) {
 };
 
 const { openDatabase, setMeta } = require('../server/dbschema.js');
+const { parsePbf, detectKind } = require('./pbf.js');
 
 const EARTH_R = 6378137;              // WGS84 长半轴（米），与 server/osmdb.js 一致
 const D2R = Math.PI / 180;
@@ -287,6 +303,56 @@ class OsmXmlSax {
 }
 
 /* ------------------------------------------------------------------ *
+ * 元素入库：XML 与 PBF 两条解析路径共用的唯一写库出口
+ * ------------------------------------------------------------------ */
+
+/**
+ * 把一条**规范化后**的元素写进库。两条解析路径都调它，所以"写进去的东西"不可能不一致：
+ *   node     { id, lat, lon, version, tags, editor, editorName, ts }
+ *   way      { id, version, tags, editor, editorName, ts, refs: [nodeId, …] }
+ *   relation { id, version, tags, editor, editorName, ts, members: [{type, ref, role}, …] }
+ * tags 可以是对象（含空对象，写库时与 null 一样都是 NULL）。
+ *
+ * @returns {boolean} true = 写入了；false = 数据不合法（只有 node 可能：lat/lon 不是有限数）
+ */
+function insertElement(stmts, counts, type, rec) {
+  const rowId = Math.trunc(Number(rec.id));
+  const version = Number.isFinite(Number(rec.version)) ? Math.trunc(Number(rec.version)) : 1;
+  const tags = rec.tags ? tagsToJson(rec.tags) : null;
+  const editor = rec.editor === undefined ? null : rec.editor;
+  const editorName = rec.editorName === undefined ? null : rec.editorName;
+  const ts = rec.ts === undefined ? null : rec.ts;
+
+  if (type === 'node') {
+    const lat = Number(rec.lat);
+    const lon = Number(rec.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+    stmts.node.run(rowId, lat, lon, version, tags, editor, editorName, ts);
+    counts.nodes++;
+    return true;
+  }
+  if (type === 'way') {
+    const refs = rec.refs;
+    const n = refs ? refs.length : 0;
+    const closed = n >= 2 && refs[0] === refs[n - 1] ? 1 : 0;
+    stmts.way.run(rowId, version, tags, editor, editorName, ts, n, closed);
+    for (let i = 0; i < n; i++) stmts.wayNode.run(rowId, i, refs[i]);
+    counts.ways++;
+    counts.way_nodes += n;
+    return true;
+  }
+  const members = rec.members || [];
+  stmts.relation.run(rowId, version, tags, editor, editorName, ts, members.length);
+  for (let i = 0; i < members.length; i++) {
+    const m = members[i];
+    stmts.relMember.run(rowId, i, m.type, m.ref, m.role);
+  }
+  counts.relations++;
+  counts.relation_members += members.length;
+  return true;
+}
+
+/* ------------------------------------------------------------------ *
  * 导入主流程
  * ------------------------------------------------------------------ */
 
@@ -308,10 +374,17 @@ function clearOsmData(db) {
   }
 }
 
-/** 打开输入流：.gz 用 gunzip 流式解压，其余按纯文本读 */
-function openInputStream(file) {
+/**
+ * 打开输入流。
+ * @param {string} file 输入文件
+ * @param {boolean} [useGunzip] 是否 gunzip 流式解压。调用方应当用 detectKind 的结果决定
+ *   （**不要只看扩展名**）：`.gz` 里包的可能是 XML 也可能是 PBF，反过来把一个内容其实是 gz 的
+ *   文件命名为 `.osm` 也不能靠扩展名认出来。没传时按老行为看扩展名。
+ */
+function openInputStream(file, useGunzip) {
+  const gunzipWanted = useGunzip === undefined ? /\.gz$/i.test(file) : !!useGunzip;
   const read = fs.createReadStream(file, { highWaterMark: READ_CHUNK });
-  if (/\.gz$/i.test(file)) {
+  if (gunzipWanted) {
     const gunzip = zlib.createGunzip({ chunkSize: READ_CHUNK });
     read.on('error', (err) => gunzip.destroy(err));
     return { stream: read.pipe(gunzip), read, gunzip };
@@ -327,18 +400,34 @@ function openInputStream(file) {
 async function importOsm(options) {
   const t0 = Date.now();
   const file = options.file;
-  const dbFile = options.db;
+  let dbFile = options.db;
   const quiet = !!options.quiet;
   const force = !!options.force;
   const limit = Number.isFinite(options.limit) && options.limit >= 0 ? Math.trunc(options.limit) : null;
 
-  if (!file || !dbFile) throw new Error('必须同时指定 --file 与 --db');
+  // --city <id>：从 tools/cities.json 取这座城市的库路径与中心点（没给 --db 时用它）
+  let city = null;
+  if (options.cityId) {
+    const { loadCities } = require('./fetch-osm.js');
+    const table = loadCities();
+    const entry = table.cities[options.cityId];
+    if (!entry) {
+      const ids = Object.keys(table.cities);
+      throw new Error('tools/cities.json 里没有城市 "' + options.cityId + '"' +
+        (ids.length ? '（可选：' + ids.join(', ') + '）' : '（文件不存在或为空）'));
+    }
+    city = { id: options.cityId, name: entry.name || options.cityId, center: entry.center || null };
+    if (!dbFile && entry.db) dbFile = path.resolve(__dirname, '..', entry.db);
+  }
+
+  if (!file || !dbFile) throw new Error('必须同时指定 --file 与 --db（或用 --city <id> 让 cities.json 决定 --db）');
   if (!fs.existsSync(file)) throw new Error('找不到输入文件：' + file);
   const stat = fs.statSync(file);
   if (!stat.isFile()) throw new Error('输入路径不是文件：' + file);
 
   const db = openDatabase(dbFile);
   const log = quiet ? () => {} : (msg) => process.stdout.write(msg + '\n');
+  if (city) log(`· 城市：${city.name}（${city.id}）→ 目标数据集 ${dbFile}`);
 
   try {
     // 目标库非空且没有 --force → 直接报错
@@ -356,16 +445,18 @@ async function importOsm(options) {
       clearOsmData(db);
     }
 
-    /* ---------------- prepared statement（全程复用） ---------------- */
-    const stNode = db.prepare(
-      'INSERT OR REPLACE INTO nodes(id, lat, lon, version, tags, editor, editor_name, ts, deleted) VALUES(?,?,?,?,?,?,?,?,0)');
-    const stWay = db.prepare(
-      'INSERT OR REPLACE INTO ways(id, version, tags, editor, editor_name, ts, deleted, node_count, closed) VALUES(?,?,?,?,?,?,0,?,?)');
-    const stWayNode = db.prepare('INSERT OR REPLACE INTO way_nodes(way_id, seq, node_id) VALUES(?,?,?)');
-    const stRelation = db.prepare(
-      'INSERT OR REPLACE INTO relations(id, version, tags, editor, editor_name, ts, deleted, member_count) VALUES(?,?,?,?,?,?,0,?)');
-    const stRelMember = db.prepare(
-      'INSERT OR REPLACE INTO relation_members(relation_id, seq, member_type, member_ref, role) VALUES(?,?,?,?,?)');
+    /* ---------------- prepared statement（全程复用；XML 与 PBF 共用） ---------------- */
+    const stmts = {
+      node: db.prepare(
+        'INSERT OR REPLACE INTO nodes(id, lat, lon, version, tags, editor, editor_name, ts, deleted) VALUES(?,?,?,?,?,?,?,?,0)'),
+      way: db.prepare(
+        'INSERT OR REPLACE INTO ways(id, version, tags, editor, editor_name, ts, deleted, node_count, closed) VALUES(?,?,?,?,?,?,0,?,?)'),
+      wayNode: db.prepare('INSERT OR REPLACE INTO way_nodes(way_id, seq, node_id) VALUES(?,?,?)'),
+      relation: db.prepare(
+        'INSERT OR REPLACE INTO relations(id, version, tags, editor, editor_name, ts, deleted, member_count) VALUES(?,?,?,?,?,?,0,?)'),
+      relMember: db.prepare(
+        'INSERT OR REPLACE INTO relation_members(relation_id, seq, member_type, member_ref, role) VALUES(?,?,?,?,?)'),
+    };
 
     /* ---------------- 解析状态 ---------------- */
     const counts = { nodes: 0, ways: 0, relations: 0, way_nodes: 0, relation_members: 0 };
@@ -468,37 +559,20 @@ async function importOsm(options) {
         const rowId = Number.isFinite(id) ? Math.trunc(id) : NaN;
         if (!Number.isFinite(rowId)) { skippedInvalid++; return; }
 
-        const version = parseIntOr(attrs.version, 1);
-        const editor = attrs.uid || attrs.user || null;
-        const editorName = attrs.user || null;
-        const ts = parseTimestamp(attrs.timestamp);
-
-        if (type === 'node') {
-          const lat = Number(attrs.lat);
-          const lon = Number(attrs.lon);
-          if (!Number.isFinite(lat) || !Number.isFinite(lon)) { skippedInvalid++; return; }
-          stNode.run(rowId, lat, lon, version, tagsToJson(currentTags), editor, editorName, ts);
-          counts.nodes++;
-          pending++;
-        } else if (type === 'way') {
-          const refs = currentRefs;
-          const n = refs.length;
-          const closed = n >= 2 && refs[0] === refs[n - 1] ? 1 : 0;
-          stWay.run(rowId, version, tagsToJson(currentTags), editor, editorName, ts, n, closed);
-          for (let i = 0; i < n; i++) stWayNode.run(rowId, i, refs[i]);
-          counts.ways++;
-          counts.way_nodes += n;
-          pending++;
-        } else {
-          const members = currentMembers;
-          stRelation.run(rowId, version, tagsToJson(currentTags), editor, editorName, ts, members.length);
-          for (let i = 0; i < members.length; i++) {
-            const m = members[i];
-            stRelMember.run(rowId, i, m.type, m.ref, m.role);
-          }
-          counts.relations++;
-          counts.relation_members += members.length;
-        }
+        // 规范化成 insertElement 的入参形状（PBF 路径给出的是同一个形状）
+        const wrote = insertElement(stmts, counts, type, {
+          id: rowId,
+          lat: attrs.lat, lon: attrs.lon,
+          version: parseIntOr(attrs.version, 1),
+          tags: currentTags,
+          editor: attrs.uid || attrs.user || null,
+          editorName: attrs.user || null,
+          ts: parseTimestamp(attrs.timestamp),
+          refs: currentRefs,
+          members: currentMembers,
+        });
+        if (!wrote) { skippedInvalid++; return; }
+        pending++;
 
         if (pending >= BATCH_ELEMENTS) {
           db.exec('COMMIT');
@@ -515,40 +589,110 @@ async function importOsm(options) {
       },
     });
 
+    /* ---------------- PBF 路径的元素处理 ---------------- */
+    /**
+     * PBF 的元素回调。**计数语义与 XML 路径逐条对齐**（这是 --limit / next_*_id 正确性的关键）：
+     *   · encountered[type] 对**每个**读到的元素 +1（含 visible=false 与被 --limit 截掉的）；
+     *   · maxSeenId 取"文件里出现过的最大 id"（同样含 visible=false / 超限的元素），
+     *     这样 meta.next_*_id 一定大于源文件里的任何 id，IdAllocator 不会撞号；
+     *   · 超过 --limit 的元素直接丢，但仍然占配额；
+     *   · visible=false 的元素跳过（不写任何行）；
+     *   · 三种元素都到 --limit → aborted = true（parsePbf 那边也会在同一个 blob 边界停下）。
+     */
+    const onPbfElement = (type, rec) => {
+      encountered[type]++;
+      const seenId = Math.trunc(Number(rec.id));
+      if (Number.isFinite(seenId) && seenId > maxSeenId[type]) maxSeenId[type] = seenId;
+      if (encountered[type] > limits[type]) return;
+      if (rec.visible === false) { skippedInvisible++; return; }
+      if (!Number.isFinite(seenId)) { skippedInvalid++; return; }
+      if (!insertElement(stmts, counts, type, {
+        id: seenId, lat: rec.lat, lon: rec.lon, version: rec.version,
+        tags: rec.tags, editor: rec.editor, editorName: rec.editorName, ts: rec.ts,
+        refs: rec.refs, members: rec.members,
+      })) { skippedInvalid++; return; }
+      pending++;
+      if (pending >= BATCH_ELEMENTS) {
+        db.exec('COMMIT');
+        db.exec('BEGIN');
+        pending = 0;
+        sampleMemory();
+        maybeLog();
+      }
+      if (limits.node !== Infinity &&
+        encountered.node >= limits.node && encountered.way >= limits.way && encountered.relation >= limits.relation) {
+        aborted = true;
+      }
+    };
+
     /* ---------------- 流式读取 ---------------- */
-    log(`· 读取 ${path.basename(file)}（${formatBytes(stat.size)}${/\.gz$/i.test(file) ? '，gunzip 流式解压' : ''}）…`);
-    const { stream, read, gunzip } = openInputStream(file);
-    const decoder = new StringDecoder('utf8');
+    // 格式识别：先看文件头魔数，再看扩展名兜底（.gz 里包的是 XML 还是 PBF 也能认出来）
+    const kind = detectKind(file);
+    const FORMAT_LABEL = {
+      pbf: 'OSM PBF（protobuf）', 'gzip-pbf': 'OSM PBF（gz 包着）',
+      xml: 'OSM XML', 'gzip-xml': 'OSM XML（gunzip 流式解压）',
+    };
+    if (kind === 'unknown' || kind === 'empty') {
+      throw new Error(`认不出这个文件的格式（开头既不是 OSM PBF 也不是 XML）：${file}\n` +
+        '支持的输入：.osm / .osm.gz（XML）、.osm.pbf / .pbf（PBF）。也可以先看看文件是不是下载了一半。');
+    }
+    const isPbf = kind === 'pbf' || kind === 'gzip-pbf';
+    log(`· 读取 ${path.basename(file)}（${formatBytes(stat.size)}，格式 ${FORMAT_LABEL[kind]}）…`);
+    let pbfStats = null;
 
     db.exec('BEGIN');
     try {
-      await new Promise((resolve, reject) => {
-        let settled = false;
-        const done = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
-        const stopInput = () => {
-          read.destroy();
-          if (gunzip) gunzip.destroy();
-        };
-        stream.on('data', (chunk) => {
-          try {
-            sax.write(decoder.write(chunk));
-          } catch (err) {
+      if (isPbf) {
+        pbfStats = await parsePbf(file, {
+          gunzip: kind === 'gzip-pbf',
+          limit,                                   // 与下面自己的计数一致；提前收工时在这个 blob 边界停
+          onHeader(header) {
+            sourceVersion = '0.6';                 // PBF 就是 OSM 0.6 模型（required_features 里有 OsmSchema-V0.6）
+            if (header.bbox) {
+              sourceBounds = {
+                min_lat: header.bbox.min_lat, min_lon: header.bbox.min_lon,
+                max_lat: header.bbox.max_lat, max_lon: header.bbox.max_lon,
+              };
+            }
+          },
+          onWarning(msg) { log('· 注意：' + msg); },
+          onNode: (n) => onPbfElement('node', n),
+          onWay: (w) => onPbfElement('way', w),
+          onRelation: (r) => onPbfElement('relation', r),
+        });
+        if (pbfStats.aborted) aborted = true;
+        if (pbfStats.truncated) log('· 注意：PBF 文件末尾的 blob 不完整，可能被截断，已忽略残片。');
+      } else {
+        const { stream, read, gunzip } = openInputStream(file, kind === 'gzip-xml');
+        const decoder = new StringDecoder('utf8');
+        await new Promise((resolve, reject) => {
+          let settled = false;
+          const done = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
+          const stopInput = () => {
+            read.destroy();
+            if (gunzip) gunzip.destroy();
+          };
+          stream.on('data', (chunk) => {
+            try {
+              sax.write(decoder.write(chunk));
+            } catch (err) {
+              done(reject, err);
+              stopInput();
+              return;
+            }
+            if (aborted) stopInput();
+          });
+          stream.on('end', () => {
+            try { sax.write(decoder.end()); } catch { /* 尾部解码失败忽略 */ }
+            done(resolve);
+          });
+          stream.on('error', (err) => {
+            if (aborted) { done(resolve); return; } // --limit 提前断开导致的 premature close 不算失败
             done(reject, err);
-            stopInput();
-            return;
-          }
-          if (aborted) stopInput();
+          });
+          stream.on('close', () => { if (aborted) done(resolve); });
         });
-        stream.on('end', () => {
-          try { sax.write(decoder.end()); } catch { /* 尾部解码失败忽略 */ }
-          done(resolve);
-        });
-        stream.on('error', (err) => {
-          if (aborted) { done(resolve); return; } // --limit 提前断开导致的 premature close 不算失败
-          done(reject, err);
-        });
-        stream.on('close', () => { if (aborted) done(resolve); });
-      });
+      }
       db.exec('COMMIT');
     } catch (err) {
       try { db.exec('ROLLBACK'); } catch { /* ignore */ }
@@ -556,7 +700,7 @@ async function importOsm(options) {
     }
     pending = 0;
 
-    if (sax.truncated) log('· 注意：文件末尾有未闭合的标签，可能被截断，已忽略残片。');
+    if (!isPbf && sax.truncated) log('· 注意：文件末尾有未闭合的标签，可能被截断，已忽略残片。');
     const elementMs = Date.now() - t0;
     log(`· 元素写入完成：nodes=${counts.nodes} ways=${counts.ways} relations=${counts.relations}` +
       `${aborted ? '（已到达 --limit，提前结束读取）' : ''}，耗时 ${(elementMs / 1000).toFixed(1)}s`);
@@ -590,6 +734,7 @@ async function importOsm(options) {
 
     db.exec('BEGIN');
     setMeta(db, 'source_file', path.basename(file));
+    setMeta(db, 'source_format', isPbf ? kind : 'xml');   // pbf / gzip-pbf / xml / gzip-xml
     setMeta(db, 'source_version', sourceVersion || '0.6');
     setMeta(db, 'imported_at', new Date().toISOString());
     setMeta(db, 'counts', JSON.stringify(finalCounts));
@@ -598,6 +743,12 @@ async function importOsm(options) {
         min_lat: box.min_lat, min_lon: box.min_lon, max_lat: box.max_lat, max_lon: box.max_lon,
       }));
     if (sourceBounds) setMeta(db, 'source_bounds', JSON.stringify(sourceBounds));
+    // --city：把"这个库是哪座城市"如实记进库里（服务端 /api/health 的 data.source 也会带上源文件名）
+    if (city) {
+      setMeta(db, 'data_city', city.id);
+      setMeta(db, 'data_city_name', city.name || city.id);
+      if (city.center) setMeta(db, 'default_center', JSON.stringify(city.center));
+    }
     setMeta(db, 'next_node_id', nextIds.node);
     setMeta(db, 'next_way_id', nextIds.way);
     setMeta(db, 'next_relation_id', nextIds.relation);
@@ -610,6 +761,8 @@ async function importOsm(options) {
     const dbBytes = fs.existsSync(dbFile) ? fs.statSync(dbFile).size : 0;
     return {
       file, db: dbFile, ms,
+      format: isPbf ? kind : 'xml',
+      city: city ? city.id : null,
       counts: finalCounts,
       inserted: counts,
       aborted, skippedInvisible, skippedInvalid,
@@ -621,6 +774,7 @@ async function importOsm(options) {
       indexes: { node_index: geom.nodeIndex, way_index: geom.wayIndex, relation_index: geom.relIndex },
       dbBytes,
       peakRss,
+      pbf: pbfStats,
       elementsPerSec: ms > 0 ? (finalCounts.nodes + finalCounts.ways + finalCounts.relations) / (ms / 1000) : 0,
     };
   } finally {
@@ -735,16 +889,20 @@ function backfillGeometry(db, log, quiet) {
  * ------------------------------------------------------------------ */
 
 const USAGE = [
-  '用法：node tools/import-osm.js --file <path.osm|path.osm.gz> --db <path.sqlite> [--limit N] [--force] [--quiet]',
-  '  --file   要导入的 OSM XML 文件（支持 .osm 与 .osm.gz）',
+  '用法：node tools/import-osm.js --file <path.osm|path.osm.gz|path.osm.pbf> --db <path.sqlite> [--limit N] [--force] [--quiet]',
+  '      node tools/import-osm.js --file <…> --city <id> [--limit N] [--force] [--quiet]',
+  '  --file   要导入的 OSM 数据（自动识别：.osm / .osm.gz 是 XML，.osm.pbf / .pbf 是 PBF）',
   '  --db     目标 SQLite 数据库文件（不存在会自动创建表结构）',
+  '  --city   用 tools/cities.json 里的城市预设决定 --db（并把这个城市记进库的 meta，便于如实报告数据集）',
   '  --limit  只导入前 N 个元素（node / way / relation 各自计数），用于冒烟测试',
   '  --force  目标库已有数据时清空后重新导入',
   '  --quiet  只打印最后一行摘要',
+  '',
+  '例：node tools/import-osm.js --file data/osm/china-latest.osm.pbf --db data/osm/china.sqlite --force',
 ].join('\n');
 
 function parseArgs(argv) {
-  const out = { file: null, db: null, limit: null, force: false, quiet: false, help: false };
+  const out = { file: null, db: null, cityId: null, limit: null, force: false, quiet: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const eq = a.indexOf('=');
@@ -759,6 +917,7 @@ function parseArgs(argv) {
     switch (key) {
       case '--file': case '-f': out.file = takeValue(); break;
       case '--db': case '-d': out.db = takeValue(); break;
+      case '--city': out.cityId = takeValue(); break;
       case '--limit': case '-n': {
         const v = Number(takeValue());
         if (!Number.isFinite(v) || v < 0) throw new Error('--limit 需要是非负整数');
@@ -786,7 +945,7 @@ function printSummary(r) {
   const lines = [
     '',
     '===== OSM 导入结果 =====',
-    `源文件        : ${path.basename(r.file)}`,
+    `源文件        : ${path.basename(r.file)}（格式 ${r.format}${r.city ? '，城市 ' + r.city : ''}）`,
     `目标数据库    : ${r.db}（${formatBytes(r.dbBytes)}）`,
     `nodes         : ${r.counts.nodes}（空间索引 ${r.indexes.node_index}）`,
     `ways          : ${r.counts.ways}（way_nodes ${r.counts.way_nodes}，空间索引 ${r.indexes.way_index}）`,
@@ -813,7 +972,7 @@ async function main() {
     process.exitCode = 1;
     return;
   }
-  if (args.help || (!args.file && !args.db)) {
+  if (args.help || (!args.file && !args.db && !args.cityId)) {
     process.stdout.write(USAGE + '\n');
     process.exitCode = args.help ? 0 : 1;
     return;
@@ -834,4 +993,7 @@ async function main() {
 
 if (require.main === module) main();
 
-module.exports = { importOsm, parseArgs, OsmXmlSax, clearOsmData, formatBytes, metersBetween, buildSummaryLine };
+module.exports = {
+  importOsm, parseArgs, OsmXmlSax, clearOsmData, formatBytes, metersBetween, buildSummaryLine,
+  insertElement, backfillGeometry,
+};

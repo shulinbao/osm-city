@@ -1,0 +1,74 @@
+{
+  "_comment": "城市数据集注册表（唯一出处）。tools/fetch-osm.js 与 tools/import-osm.js 的 --city 都读这里；deploy/docker-entrypoint.sh 通过 `node tools/fetch-osm.js --city <id> --print-env --env-prefix CITY_` 取路径与 URL。设计说明见 deploy/CITIES.md。",
+  "_why_tools_dir": "放在 tools/ 而不是 deploy/ 是因为 Dockerfile 只会 COPY tools/ 与 deploy/docker-entrypoint.sh —— 放这里容器里就有了，不需要改 Dockerfile。",
+  "_paths": "source / db 都是相对项目根目录的路径（容器里项目根是 /app）。",
+  "_estimates": "estSourceMB / estDbMB / estImportMinutes 是**实测值或按实测外推**，见 deploy/DEPLOY.md 的容量表；estDbMB 用来做磁盘预检，宁可保守。",
+  "default": "beijing",
+  "cities": {
+    "beijing": {
+      "name": "北京（BBBike 提取包，XML）",
+      "kind": "osm.gz",
+      "source": "data/osm/Beijing.osm.gz",
+      "db": "data/osm/osm.sqlite",
+      "url": "https://download.bbbike.org/osm/bbbike/Beijing/Beijing.osm.gz",
+      "center": { "lat": 39.9042, "lng": 116.4074, "zoom": 16 },
+      "estSourceMB": 47,
+      "estDbMB": 530,
+      "estImportMinutes": 1.5,
+      "memoryGB": 2,
+      "note": "项目原来的默认数据集（本机实测：47 MB 源文件 → 555 MB 库，2.18M 节点 / 335K way，导入约 1~2 分钟）。库路径保持 data/osm/osm.sqlite 不变，老部署升级后行为不变。"
+    },
+    "beijing-pbf": {
+      "name": "北京（Geofabrik 分省包，PBF）",
+      "kind": "osm.pbf",
+      "source": "data/osm/beijing-latest.osm.pbf",
+      "db": "data/osm/beijing.sqlite",
+      "url": "https://download.geofabrik.de/asia/china/beijing-latest.osm.pbf",
+      "center": { "lat": 39.9042, "lng": 116.4074, "zoom": 16 },
+      "estSourceMB": 36,
+      "estDbMB": 950,
+      "estImportMinutes": 2,
+      "memoryGB": 2,
+      "note": "已实测：35.1 MB PBF → 928 MB 库（4.83M 节点 / 519K way / 12.6K relation），导入 110 秒（元素 54s + 几何回填 55s），峰值内存 194 MB。比 BBBike 的北京包更全（含铁路、行政边界）。"
+    },
+    "hebei": {
+      "name": "河北（Geofabrik 分省包，PBF）",
+      "kind": "osm.pbf",
+      "source": "data/osm/hebei-latest.osm.pbf",
+      "db": "data/osm/hebei.sqlite",
+      "url": "https://download.geofabrik.de/asia/china/hebei-latest.osm.pbf",
+      "center": { "lat": 38.0428, "lng": 114.5149, "zoom": 10 },
+      "estSourceMB": 190,
+      "estDbMB": 5000,
+      "estImportMinutes": 10,
+      "memoryGB": 3,
+      "note": "容量按北京分省包实测的 26 倍比率外推（未实测）。分省包是整体替换时粒度适中的选择：比全国小一个数量级，但仍然跨市。"
+    },
+    "china": {
+      "name": "全国（Geofabrik china-latest，PBF）",
+      "kind": "osm.pbf",
+      "source": "data/osm/china-latest.osm.pbf",
+      "db": "data/osm/china.sqlite",
+      "url": "https://download.geofabrik.de/asia/china-latest.osm.pbf",
+      "center": { "lat": 34.5, "lng": 108.9, "zoom": 5 },
+      "estSourceMB": 1524,
+      "estDbMB": 40000,
+      "estImportMinutes": 90,
+      "memoryGB": 4,
+      "note": "⚠ 实测外推（不是猜的）：源文件 1.49 GB；用 Range 只下前 24 MiB 实测到 13.1 万节点/MiB，全国约 1.5~2.0 亿节点；按北京分省包实测的 201 B/节点 外推，库约 25~40 GB、导入约 1~2 小时。**不是** 4~6 GB —— 详见 deploy/DEPLOY.md 的容量表与风险一节。"
+    },
+    "monaco": {
+      "name": "摩纳哥（Geofabrik 小样本，PBF）",
+      "kind": "osm.pbf",
+      "source": "data/osm/monaco-latest.osm.pbf",
+      "db": "data/osm/monaco.sqlite",
+      "url": "https://download.geofabrik.de/europe/monaco-latest.osm.pbf",
+      "center": { "lat": 43.7384, "lng": 7.4246, "zoom": 14 },
+      "estSourceMB": 1,
+      "estDbMB": 11,
+      "estImportMinutes": 0.2,
+      "memoryGB": 1,
+      "note": "已实测：676 KB PBF → 11.2 MB 库（41,703 节点 / 6,248 way / 348 relation），导入 0.9 秒。tests/pbf-import-test.js 与文档都拿它做端到端样例。"
+    }
+  }
+}

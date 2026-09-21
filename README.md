@@ -22,10 +22,18 @@ node server/index.js          # 启动（默认 8787）
 ```bash
 # 1) 下载 OSM 数据（北京，46.8 MB；已下载过可跳过）
 #    来源：https://download.bbbike.org/osm/bbbike/Beijing/Beijing.osm.gz
-#    全国数据：https://download.geofabrik.de/asia/china-latest.osm.pbf（1.5 GB，需自备 XML 或先转格式）
+node tools/fetch-osm.js --city beijing      # 断点续传 + .md5 校验 + 下载前磁盘预检（也可以自己下）
+#    可用的数据集预设：beijing / beijing-pbf / hebei / china / monaco（见 tools/cities.json）
+#    node tools/fetch-osm.js --city hebei --print-env    # 只打印它会用的 URL/库/容量预估，不下载
 
-# 2) 导入数据集（北京约 60 秒）
-node tools/import-osm.js --file data/osm/Beijing.osm.gz --db data/osm/osm.sqlite --force
+# 2) 导入数据集（北京约 1 分钟；给了 --city 就不用再给 --db，它会自己决定库路径）
+node tools/import-osm.js --city beijing --force
+
+#    也直接支持 Geofabrik 的 **.osm.pbf**（按魔数识别格式，不需要先转 XML）：
+#    node tools/import-osm.js --file data/osm/hebei-latest.osm.pbf --db data/osm/osm.sqlite --force
+#    ⚠ 全国包（china-latest.osm.pbf，1.5 GB）导出来的库**不是几 GB**：实测外推约 **25~40 GB**、
+#      导入 1~2 小时、需要 ≥45 GB 可用磁盘（见 deploy/DEPLOY.md §2C 的容量表）。单机玩请用**分省包**；
+#      另外 `--limit` 在全国包上基本没用（PBF 把节点排在最前面，要读到 way 段才停）。
 
 # 3) 启动服务器
 node server/index.js
@@ -250,6 +258,10 @@ node tools/check-screenshot.js tests/screenshot.png   # 截图像素自检（含
   （11626 段 / 25554 点，平均一段 2.2 个点）。把 `coords` + `paths` 摊平成一个数组 + 段长表，
   按实测大约能再省 200 KB/屏（约 −20%），这一改动纯属编码、不碰语义。
 - 接入 OSM API + OAuth2，把「变更集」真正提交到 OpenStreetMap（带人工确认与冲突解决）
-- 导入 Geofabrik 全国数据（1.5 GB PBF，需要补一个 PBF 解析器）、按城市切换数据集
+- ~~导入 Geofabrik 全国数据（1.5 GB PBF，需要补一个 PBF 解析器）、按城市切换数据集~~ —— **已做**：
+  零依赖 PBF 解析器（`tools/pbf.js`）+ 导入器支持 `.osm.pbf`（`tools/import-osm.js`）
+  + 服务端自下载（`tools/fetch-osm.js`，断点续传/校验/磁盘预检）
+  + 城市注册表与 `--city`（`tools/cities.json`）；设计与"还差哪几处 `server/**` 改动"见 `deploy/CITIES.md`。
+  注意**全国库实测外推 25~40 GB**（不是几 GB），单机请用分省包。
 - 更完整的 OSM 语义：完善的 relation 编辑（route/边界）、`area` 判定、历史版本浏览与回滚单条改动
 - 移动端触控编辑、离线编辑队列、审阅模式（改动先进入待审列表再合并）

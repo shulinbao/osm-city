@@ -81,6 +81,29 @@
     gapFetch: true,
     gapMaxFrac: 0.95,
     gapMaxParts: 4,
+    /**
+     * **二进制矢量载荷**（BIN v1，格式说明在 `server/osmdb.js` 开头的「二进制矢量载荷」那一段）。
+     *
+     * 协商是**双保险**的，两侧不认识对方时都自动退回 JSON：
+     *   1. 客户端在自己的能力里带上 `fmt=bin`（查询参数）+ `Accept: application/vnd.dsh.osm.bin`
+     *      （见 `_mapOnce`）；
+     *   2. 服务端按 `fmt` → `Accept` → 默认 JSON 的顺序决定（见 server/index.js 的 /api/map）；
+     *   3. 客户端**以响应的 `content-type` 为权威判据**：不是 bin 就当 JSON 解 —— 于是
+     *      "新客户端 + 老服务端"（老服务端不认识 fmt=bin，照旧返回 JSON）什么都不用做就对；
+     *   4. "新服务端 + 老客户端"也不可能坏：不带 `fmt`、不带那个 Accept 就一律走 JSON。
+     *
+     * **同一轮请求还会带上 `caps=flatsegs`**（见 `_mapOnce`）：声明"本客户端认识扁平几何
+     * （displayLines/displayAreas 的 `coords` + `segs`）"。服务端只有在**收到这个声明且配置允许**
+     * 时才可能发扁平形状；老标签页 / 老缓存 JS 不声明 → 一律拿到老形状，部署时不会被新协议打坏。
+     * 详见 `server/index.js` 的 `clientCaps()` 与 `server/osmdb.js` 的 `PACK_DEFAULTS.displayFlat`。
+     *
+     * **逃生阀**：`?fmt=json`（页面地址，例如 `http://127.0.0.1:8787/?fmt=json`）强制关掉二进制，
+     * 也可以在控制台 `MapData.setBinary(false)`。二进制解码失败时（版本不认识等）客户端会
+     * 自动关掉它并**原样退回 JSON 重取一次**，不会把这一屏卡住。
+     *
+     * 关掉它不影响任何语义：解出来的对象与 JSON 载荷逐字段相同（`World.decodeBinaryPayload`）。
+     */
+    binary: true,
   };
 
   /**
@@ -89,6 +112,23 @@
    * 两边口径不一致时会出现"World 已经把要素卸载了、MapData 却还认为这块已覆盖"的假覆盖。
    */
   const KEEP_PAD_FALLBACK = 0.25;
+
+  /**
+   * 页面地址上的逃生阀（见 DEFAULTS.binary）：`?fmt=json` 时**这一整页**都退回 JSON 载荷。
+   * 排障用（"到底是二进制解码的问题还是数据的问题"），一行 URL 就能切开。
+   * 拿不到 location（自检里的最小宿主）就当没有。
+   */
+  function pageWantsJson() {
+    try {
+      const loc = typeof window !== 'undefined' ? window.location : null;
+      const search = loc && loc.search ? String(loc.search) : '';
+      if (!search) return false;
+      const m = /[?&]fmt=([^&]*)/.exec(search);
+      return !!m && decodeURIComponent(m[1]).toLowerCase() === 'json';
+    } catch {
+      return false;
+    }
+  }
 
   /**
    * **"只看不改"边界（客户端唯一一处）** —— 与 `server/osmdb.js` 的 `VIEW_ONLY_MAX_ZOOM`（**14**）
@@ -198,6 +238,12 @@
       tiles: { last: 0, depth: 0, capped: 0, split: 0, requested: 0 },
       /** 起始瓦片数的"记忆"：这次拆过块，下次直接按拆过的规模请求（少一次往返） */
       tilePref: 1,
+      /**
+       * 二进制载荷被关掉了吗（见 DEFAULTS.binary）：
+       *   · 页面地址带 `?fmt=json`（逃生阀）或 `createLoader({binary:false})` → 一开始就是关的；
+       *   · 运行中解码失败（版本不认识 / 不是 BIN）→ `_mapRequest` 把它置 true 并退回 JSON 重取。
+       */
+      binOff: d.binary === false || pageWantsJson(),
       /**
        * 空闲预取（见 DEFAULTS.prefetchPad）：**默认关闭**，只有显式 setPrefetch(true) 才开。
        * 关着的时候"视野外的区块"既不发请求、也不留缓存范围。
@@ -757,6 +803,18 @@
         return DEFAULTS.gapFetch;
       },
 
+      /**
+       * 二进制矢量载荷的开关（见 DEFAULTS.binary）。
+       *   MapData.setBinary(false)  → 退回纯 JSON（排障 / 对照实测）
+       *   MapData.setBinary(true)   → 打开（并把"解码失败"那次自动关掉的状态复位）
+       * 只影响**下一次请求**用哪种编码；已经在本地的那份数据不受影响（两者解出来逐字段相同）。
+       */
+      setBinary(on) {
+        DEFAULTS.binary = on !== false;
+        if (DEFAULTS.binary) loader.binOff = false;
+        return DEFAULTS.binary;
+      },
+
       /** 分阶段快照：一次"拖一屏"到底慢在哪儿（net / parse / merge / index / tiles） */
       stages() {
         const s = loader.stats;
@@ -778,7 +836,23 @@
             applyMs: Math.round(s.applyMs || 0),
           },
           prefetch: { on: !!loader.prefetch.on, tiles: s.prefetchTiles || 0, ways: s.prefetchWays || 0, pad: DEFAULTS.prefetchPad },
+          /**
+           * 载荷编码的账（见 DEFAULTS.binary）：这一块响应来的到底是 BIN 还是 JSON，
+           * 以及"二进制解码失败自动退回 JSON"发生过几次（>0 说明该查解码器/版本了）。
+           */
+          payload: {
+            fmt: s.lastFmt || (loader.wantBin() ? 'bin' : 'json'),
+            bin: s.binPayloads || 0,
+            json: s.jsonPayloads || 0,
+            binFallback: s.binFallback || 0,
+            binaryOn: loader.wantBin(),
+          },
         };
+      },
+
+      /** 载荷编码的快照（状态栏/排查/自检用；见 DEFAULTS.binary） */
+      payloadStats() {
+        return loader.stages().payload;
       },
 
       /**
@@ -959,29 +1033,101 @@
         };
       },
 
+      /** 这一轮请求该不该要二进制载荷（见 DEFAULTS.binary）；`setBinary(false)` 可以整体关掉 */
+      wantBin() {
+        return DEFAULTS.binary !== false && loader.binOff !== true;
+      },
+
+      /**
+       * 一次 /api/map 请求（**含"二进制不可用就自动退回 JSON"的重试**）。
+       * 返回 `{ payload, tNet, bytes }`；请求已过期（stale）时返回 null。
+       */
+      async _mapRequest(bbox, zoom, signal, job, wantBin) {
+        try {
+          return await loader._mapOnce(bbox, zoom, signal, job, wantBin);
+        } catch (err) {
+          /**
+           * 二进制**解码**失败（`err.dshBin`：不是 BIN / 版本不认识 / 段越界）→
+           * 关掉二进制、原样退回 JSON **重取一次**。只在解码失败时兜底：
+           * 网络错误、HTTP 错误、以及新一轮视口导致的 abort 都照旧往上抛
+           * （否则一次抖动就会被误判成"二进制不可用"，把这条优化永久关掉）。
+           */
+          if (!wantBin || !err || !err.dshBin) throw err;
+          loader.binOff = true;
+          loader.stats.binFallback = (loader.stats.binFallback || 0) + 1;
+          try { d.status('二进制载荷不可用，已退回 JSON'); } catch { /* 提示失败不影响取数 */ }
+          return loader._mapOnce(bbox, zoom, signal, job, false);
+        }
+      },
+
+      /**
+       * 真正发一次请求并解析。**协商的关键在这一句**：以响应的 `content-type` 为权威判据 ——
+       * 服务端不认识 `fmt=bin`（老服务端）就照旧返回 `application/json`，这里就当 JSON 解，
+       * 客户端什么都不用做；反过来服务端返回 BIN 时，`Accept` / `fmt` 只是"我有能力"的声明。
+       */
+      async _mapOnce(bbox, zoom, signal, job, wantBin) {
+        const fmt = wantBin ? 'bin' : 'json';
+        /**
+         * `caps=flatsegs`：**声明本客户端认识扁平几何**（`coords` + `segs`）。
+         * 服务端只有在收到这个声明**且**配置允许时才可能发扁平形状；不声明（老标签页、老缓存 JS、
+         * curl）就一律发老形状 —— 部署时正在玩的旧标签页因此不会被新协议打坏，刷新后才升级。
+         * 见 server/index.js 的 clientCaps 与 osmdb.js 里 `flatDisplay` 那一段。
+         */
+        const url = `/api/map?minLon=${bbox.minLon}&minLat=${bbox.minLat}&maxLon=${bbox.maxLon}`
+          + `&maxLat=${bbox.maxLat}&zoom=${zoom}&fmt=${fmt}&caps=flatsegs`
+          + `&token=${encodeURIComponent(loader.token || '')}`;
+        const init = { headers: { Accept: wantBin ? 'application/vnd.dsh.osm.bin, application/json' : 'application/json' } };
+        if (signal) init.signal = signal;
+        if (!d.fetch) throw new Error('当前环境没有 fetch');
+        const res = await d.fetch(url, init);
+        const tNet = d.now();
+        if (loader._isStale(job)) return null; // 响应到达时已经被取代
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.error || ('HTTP ' + res.status));
+        }
+        let bytes = 0;
+        let ctype = '';
+        try {
+          const h = res.headers;
+          if (h && h.get) {
+            bytes = Number(h.get('content-length')) || 0;
+            ctype = String(h.get('content-type') || '').toLowerCase();
+          }
+        } catch { bytes = 0; ctype = ''; }
+        let payload;
+        if (wantBin && ctype.indexOf('application/vnd.dsh.osm.bin') >= 0) {
+          const buf = await res.arrayBuffer();
+          try {
+            payload = d.world.decodeBinaryPayload(new Uint8Array(buf));
+          } catch (err) {
+            if (err && typeof err === 'object') err.dshBin = true;
+            throw err;
+          }
+          loader.stats.binPayloads = (loader.stats.binPayloads || 0) + 1;
+          loader.stats.lastFmt = 'bin';
+        } else {
+          payload = await res.json();
+          loader.stats.jsonPayloads = (loader.stats.jsonPayloads || 0) + 1;
+          loader.stats.lastFmt = wantBin ? 'json-fallback' : 'json';
+        }
+        return { payload, tNet, bytes };
+      },
+
       async _fetch(job) {
         const { bbox, zoom, signal } = job;
         if (loader._isStale(job)) return null; // 排队期间就被取代
         const t0 = d.now();
-        const url = `/api/map?minLon=${bbox.minLon}&minLat=${bbox.minLat}&maxLon=${bbox.maxLon}&maxLat=${bbox.maxLat}&zoom=${zoom}&token=${encodeURIComponent(loader.token || '')}`;
         let payload;
         let tNet = t0;
         let tParsed = t0;
         let bytes = 0;
         try {
-          if (!d.fetch) throw new Error('当前环境没有 fetch');
-          const res = await d.fetch(url, signal ? { signal } : undefined);
-          tNet = d.now();
-          if (loader._isStale(job)) return null; // 响应到达时已经被取代
-          if (!res.ok) {
-            const data = await res.json().catch(() => ({}));
-            throw new Error(data.error || ('HTTP ' + res.status));
-          }
-          try {
-            const cl = res.headers && res.headers.get ? res.headers.get('content-length') : null;
-            bytes = Number(cl) || 0;
-          } catch { bytes = 0; }
-          payload = await res.json();
+          const r = await loader._mapRequest(bbox, zoom, signal, job, loader.wantBin());
+          if (!r) return null;
+          payload = r.payload;
+          tNet = r.tNet;
+          bytes = r.bytes;
           tParsed = d.now();
         } catch (err) {
           if (loader._isAbort(err)) return null; // 新一轮视口已开始，旧响应直接丢弃

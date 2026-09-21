@@ -31,10 +31,11 @@ data/osm/
 tests/backup-*.json
 tests/backup-*.json.sha256
 
-# 诊断脚本残留：tests/tmp-*.js 里出现过硬编码的 admin/admin 凭据，
-# 以及"从 users.json 里读出真实 token 再去请求"的脚本
-tests/tmp-*.js
-tests/tmp-*.txt
+# 诊断脚本/临时产物残留：tests/tmp-*.js 里出现过硬编码的 admin/admin 凭据，
+# 以及"从 users.json 里读出真实 token 再去请求"的脚本。
+# ⚠ 这里用 `tests/tmp-*` 一把盖住**所有扩展名**：之前按扩展名逐个列（.js / .txt），
+# 结果漏掉了 `tests/tmp-abort.osm` 这种数据文件 —— 一次 `git add -A` 就会把它提交上去。
+tests/tmp-*
 
 # 测试实例的数据目录（每个都带一份 users.json 副本）
 tests/lagfix/
@@ -43,6 +44,11 @@ tests/tmp-lagfix/
 # 临时验证产物（含 Edge 临时 profile 与账号库副本）
 tmp-verify/
 tmp-*/
+
+# 本地度量与排障的**输出**（基线 JSON、日志、临时库、下载的数据包）。
+# 脚本本身（measure-*.js / inspect-shard.js / shard-overlap-check.js …）已经挪进 tools/ 随仓库留存，
+# 这里只忽略 logs/ 下的产物，避免把几十个基线 JSON 和临时 sqlite 提交上去。
+logs/
 
 # 与本项目无关的另一份代码（passport/，约 3.3 GB）——
 # 它躺在同一个工作目录里，不忽略掉的话一次 `git add -A` 就会把它整包提交上去。

@@ -6,10 +6,44 @@
  * 元素采用"软删除"（deleted=1）以便历史和回滚，视口查询会过滤掉。
  */
 const fs = require('node:fs');
+const { DatabaseSync } = require('node:sqlite');
 const {
   openDatabase, getMeta, setMeta, IdAllocator,
   backfillWayLod, ensureLodIndexes, WAY_LOD_INDEX, NODE_POI_INDEX, NODE_POI_LOW_PREDICATE,
 } = require('./dbschema');
+
+/**
+ * ==================== 只读打开（分片库专用，见 server/regions.js） ====================
+ *
+ * `openDatabase()` 是"服务端自己那个库"的打开方式：它会 `PRAGMA journal_mode = WAL`、
+ * 跑 `SCHEMA_SQL` 与迁移、允许回填**写**。**分片库一律不能用它**：
+ * 分区流式的第一阶段（P1）分片是**只读素材**（写路径仍然只走主库，见 server/regions.js 的说明），
+ * 一旦用可写连接打开分片，启动时的迁移/回填/自愈就会去改那些 .sqlite 文件。
+ *
+ * 所以这里给一个只读连接（实测：`new DatabaseSync(file, {readOnly:true})` 可以 prepare 写语句，
+ * 但执行时被 SQLite 拒绝：`attempt to write a readonly database`；`temp_store` / `cache_size`
+ * 是**连接级** pragma，只读库照样能设）。
+ * 服务端会跳过全部"自愈/回填/建索引"路径（见 OsmDB 构造函数里的 `this.readOnly` 分支）。
+ */
+function openReadOnlyDatabase(file) {
+  const db = new DatabaseSync(file, { readOnly: true });
+  db.exec('PRAGMA temp_store = MEMORY');
+  db.exec('PRAGMA cache_size = -64000');
+  return db;
+}
+
+/**
+ * 只读库的 `road_class / lod_zoom` 抽查（替代 `backfillWayLod()` 的写路径）：
+ * 抽 3000 行看物化列填过没有 —— 填过就用低缩放计划，没填过就退回 R*Tree（慢一点，绝不少要素）。
+ */
+function lodColumnsFilled(db) {
+  try {
+    const row = db.prepare('SELECT COUNT(*) AS c FROM (SELECT lod_zoom FROM ways LIMIT 3000) WHERE lod_zoom IS NULL').get();
+    return !!row && row.c === 0;
+  } catch {
+    return false;
+  }
+}
 
 const EARTH_R = 6378137;
 const D2R = Math.PI / 180;
@@ -1013,12 +1047,41 @@ const PACK_DEFAULTS = {
   // 从这一档起是"编辑档"：精度不降 —— 与"可点选/可编辑"同一条边界（见 VIEW_ONLY_MAX_ZOOM）
   editZoom: VIEW_ONLY_MAX_ZOOM + 1,
   lineScale: 1e5,     // displayLines 折线坐标的量化（= 合并时的 coordDigits 5 位）
+  /**
+   * ②：displayLines / displayAreas 的几何是"一个扁平数组 + 段长表"（见 packDisplayGeometry），
+   * 还是老形状（`coords` + `paths` 每段一个数组）。
+   *
+   * **默认 `false`（老形状）** —— 这是实测加部署安全两方面的结论，不是保守：
+   *   · **实测不省字节**：`tests/bin-payload-bench.js` 在真实数据集上逐档对拍，
+   *     摊平后 z9 +0.5% / z10 +0.55% / z13 +2.0% / z14 +1.7% / z15 +0.007% / z16 +0.004%，
+   *     合计 **+35.9 KB（+0.64%）**。算术上也说得通：省掉的是每段两个方括号，
+   *     付出的是每段一个"段长数字 + 逗号"，净差 = Σ(段长位数) − 段数；本数据平均一段 2.2 个点，
+   *     段长多为 1~2 位 → 净差 ≈ 0。**它真正的价值是让 JSON 与 BIN 共用同一个几何形状**
+   *     （BIN 段的段长就是每段 1 字节 varint，编解码各只有一条路径），
+   *     而这件事由二进制编码器内部的 `displaySegmentsOf()` 完成，**不需要改 JSON 的对外形状**。
+   *   · **部署安全**：`public/index.html` 引脚本是裸路径（`<script src="/js/world.js">`，无 `?v=`），
+   *     所以线上一次部署时，**已经打开的旧标签页**会继续跑旧 JS。若服务端这时开始发扁平几何，
+   *     旧客户端会把"多段首尾相接的扁平数组"当成只有一段、而 `paths` 又不存在 ——
+   *     低缩放路网被画成贯穿全图的折线，**不报错、不崩溃、只是画错**，多人在线时必然命中。
+   *     默认发老形状就没有这个问题：老客户端拿到的与改动前逐字节相同（实测每档恰好只差
+   *     143 字节的 `enc.rule` 文档串）。新客户端要二进制时走 `fmt=bin`，那条路径根本不经过 JSON 形状。
+   *
+   * **两道门串联，缺一不发扁平形状**（改动协议的事绝不单方面做）：
+   *   1. 这里（配置）为 `true`；
+   *   2. **这一次请求的客户端声明了能力**：`?caps=flatsegs` 或 `?fmt=bin`（见 queryBbox 的 `flatCaps`）。
+   * 所以即使运维把配置打开，**没声明能力的老标签页/老缓存 JS/curl 仍然拿到老形状** ——
+   * "部署不会打坏正在玩的人"这条是结构性保证，不靠人去记得同步发版。
+   * 想要扁平形状（A/B 实测、排障）：`limits.compact = {on:true, displayFlat:true}` + 客户端带 `caps=flatsegs`。
+   */
+  displayFlat: false,
 };
 function packOptsOf(raw) {
   const o = Object.assign({}, PACK_DEFAULTS);
   if (raw === false) o.on = false;
   else if (raw && typeof raw === 'object') {
     if (raw.on === false) o.on = false;
+    // 扁平形状默认关（见 PACK_DEFAULTS.displayFlat 的实测与部署说明）；显式给布尔值才覆盖
+    if (typeof raw.displayFlat === 'boolean') o.displayFlat = raw.displayFlat;
     for (const k of ['viewScale', 'editScale', 'lineScale']) {
       const v = Number(raw[k]);
       if (Number.isFinite(v) && v > 0) o[k] = v;
@@ -1069,6 +1132,174 @@ function packPathFlat(coords, scale) {
     pla = la; plo = lo;
   }
   return out;
+}
+/**
+ * ==================== ② displayLines / displayAreas 的"摊平"编码 ====================
+ * **纯属编码，不碰语义**。
+ *
+ * 先说清楚**现在没在用它**：`PACK_DEFAULTS.displayFlat` 默认 `false`（见那里的实测与部署安全说明），
+ * 而且就算配置打开了，也**只有声明了能力（`?caps=flatsegs` 或 `fmt=bin`）的客户端**才会收到扁平形状。
+ * 这一段实现保留着：二进制段的几何本来就是 `segs` 形状，两种形状共用一套代码省一条分支；
+ * 想 A/B 实测或排障时，`limits.compact = {on:true, displayFlat:true}` + 客户端带 `caps=flatsegs` 即可。
+ *
+ * 它想解决的问题：一个显示条目的几何本来是 `coords`（第一段）+ `paths`（其余段），
+ * **每段各自一个扁平数组**，于是 JSON 里有一堆 `[[…],[…]]` 的方括号、逗号与 `"paths":` 键。
+ *
+ * 摊平成：
+ *   coords: [dLat0,dLon0, dLat1,dLon1, …]   ← **所有段首尾相接**的一个扁平数组
+ *   segs:   [n0, n1, …]                     ← 段长表（每段几个点）
+ * 差分**每段复位**（与老编码逐段打包完全一致），所以解出来逐点相同；
+ * 客户端 `World.unpackPayload`（world.js）按 `enc.displayPaths` 切回老形状，
+ * 于是 `World.mergeDisplayLines` / `render.js` 一行都不用改。
+ * `paths` 字段在摊平后不再出现；`coords` 仍然是**第一段**（顺序不变：coords → paths[0] → paths[1] …）。
+ *
+ * ⚠ **实测结论：它并不省字节，所以默认关。**（数字全部来自本仓库自己的实测台，不是推算）
+ *   `node tests/bin-payload-bench.js`（1400×900 + pad 0.05，中心天安门，真实数据集）逐档对拍：
+ *   摊平后 z9 +0.5% · z10 +0.55% · z13 +2.0% · z14 +1.7% · z15/z16 0（那两档没有合并几何），
+ *   合计 **+35.9 KB（+0.64%）**。算术上必然：省掉的是每段 2 个方括号，付出的是每段一个
+ *   "段长数字 + 逗号"，净差 = `Σ(段长位数) − 段数`。
+ *   想按屏核对，看 `tests/tmp-bin/breakdown.js` 输出的 displayLines 内部拆账：
+ *   坐标整数 56% · 标签/名字/class 35% · **纯结构（键名/括号/逗号）只有 9%**。
+ *   所以 ② 能碰到的上限就是那 9%，而"字符串表去重"（① BIN v1 干的事）打的才是那 35%。
+ */
+function packDisplayGeometry(entry, scale) {
+  const src = [entry.coords];
+  if (entry.paths) for (let i = 0; i < entry.paths.length; i++) src.push(entry.paths[i]);
+  const lens = new Array(src.length);
+  let total = 0;
+  // 注意：src[i] 是**打包之前**的 `[[lat, lon], …]`，所以它的 length 就是**点数**（不要再 >>1）
+  for (let i = 0; i < src.length; i++) { const n = src[i].length; lens[i] = n; total += n * 2; }
+  const flat = new Array(total);
+  let at = 0;
+  for (let i = 0; i < src.length; i++) {
+    const f = packPathFlat(src[i], scale);
+    for (let j = 0; j < f.length; j++) flat[at++] = f[j];
+  }
+  delete entry.paths;
+  entry.coords = flat;
+  entry.segs = lens;
+  return entry;
+}
+/**
+ * 摊平条目 → "每段一个扁平数组"（摊平前的形状）。二进制编码器与自检共用它，
+ * 免得"两种形状"的逻辑散在两处。
+ */
+function displaySegmentsOf(entry) {
+  const out = [];
+  if (entry.segs) {
+    let at = 0;
+    for (let i = 0; i < entry.segs.length; i++) {
+      const n = entry.segs[i] * 2;
+      out.push(entry.coords.slice(at, at + n));
+      at += n;
+    }
+    return out;
+  }
+  if (entry.coords) out.push(entry.coords);
+  if (entry.paths) for (const p of entry.paths) out.push(p);
+  return out;
+}
+/**
+ * ==================== 载荷打包（queryBbox 的收尾那一段，单一出处） ====================
+ *
+ * **为什么要抽成函数**：`server/regions.js`（分区流式，第一阶段 = 只读查询走分片）在**多片**
+ * 时要把各片的原始查询结果合并成一份载荷。合并**必须早于打包**（`packNodesColumnar` 出来的是
+ * delta 列，压完就不能再按 id 去重了 —— 见下面的说明），所以分片路径要"各片拿老形状
+ * （`compact:false`）→ JS 侧合并 → **用同一段打包代码**打包"。
+ *
+ * 打包代码**绝不能有第二份**（两份迟早会漂，而且漂了以后 BIN 段与 JSON 段会不一致），
+ * 所以这里把 `queryBbox` 尾部原样搬成一个模块级函数：`queryBbox` 自己也调它 ——
+ * 也就是说"抽取前后 queryBbox 的输出逐字节相同"是可断言、已实测的
+ * （`node tests/region-payload-hash.js`，抽取前后逐档 sha256 相同）。
+ *
+ * 入参里的 `nodes / nodeTags / ways / relations / lines / areas` **会被就地修改**
+ * （ways[id][1] 换成 delta、折线坐标换成量化整数）—— 调用方要自己保证传进来的是"可以改的副本"。
+ *
+ * 关于顺序：返回对象的**键顺序与改动前逐字相同**（BIN 的 CORE/JSON 段与 JSON 响应都受它影响），
+ * 所以这里的字面量顺序不要随手调整。
+ */
+function packQueryResult({
+  nodes, nodeTags, ways, relations, truncation, totals, zoom, complete, viewOnly,
+  lines, areas, pack, coalesceOpts, capsFlat,
+}) {
+  const lineList = lines || [];
+  const areaList = areas || [];
+  if (!pack.on) {
+    // 老形状（`limits.compact: false`）：坐标原样下发，nodePack / enc 都不出现
+    return {
+      nodes, nodeTags, ways, relations, truncated: !complete, truncation, totals, zoom,
+      viewOnly: !!viewOnly,
+      // 低缩放合并折线（视图用：只有几何，没有 way id）。没有合并时整个字段不出现，
+      // 客户端拿 `payload.displayLines` 是否存在就能判断"这一档是不是只读视图"。
+      ...(lineList.length ? { displayLines: lineList } : {}),
+      // 低缩放的面几何（视图用：量化 + 简化过的环，同样没有 way id，见「低缩放视图载荷」）
+      ...(areaList.length ? { displayAreas: areaList } : {}),
+    };
+  }
+  /**
+   * 坐标精度的"编辑档"起点：**跟随合并/视图载荷的边界**（默认 15 = VIEW_ONLY_MAX_ZOOM + 1）——
+   * 从这一档起客户端能点选/编辑，几何就给全精度 1e-7°；"只看不改"的档位给 1e-6°（≈0.11 m）足够。
+   * 这样两侧只有**一条**边界：config 改了 limits.coalesce.minZoom（或 on:false）时这里跟着走，
+   * 绝不会出现"这一档可编辑、但坐标被降精度"的自相矛盾。
+   */
+  const editFloor = coalesceOpts.minZoom > 0 ? coalesceOpts.minZoom : pack.editZoom;
+  const nodeScale = zoom >= editFloor ? pack.editScale : pack.viewScale;
+  // 折线的量化位数跟着合并时的 coordDigits 走（默认 5 位）：这样打包是**无损**的
+  const lineScale = Math.pow(10, coalesceOpts.coordDigits || 5);
+  for (const key in ways) ways[key][1] = packRefDeltas(ways[key][1]);
+  /**
+   * **② 摊平（见 packDisplayGeometry）：必须由客户端能力开关控制，绝不单方面改协议。**
+   *
+   * `public/index.html` 引脚本用的是**裸路径**（`<script src="/js/world.js">`，没有 `?v=`），
+   * 所以部署的一瞬间，**已经打开的标签页 / 命中缓存的旧 JS 仍会继续跑老客户端**；
+   * 本项目是多人在线，"正在玩的人不会自动刷新"是常态而不是边界情况。
+   * 老客户端读扁平几何会把"多段首尾相接的扁平数组"当成**只有一段**（`paths` 又不存在）——
+   * 低缩放的线与面被画成穿过全图的折线，**不报错、不崩溃、只是画错**，这类事故最难查。
+   *
+   * 所以门是**两道、串联**的（缺一不可）：
+   *   1. 配置允许（`limits.compact.displayFlat = true` 显式打开；**默认 false**，见 PACK_DEFAULTS）；
+   *   2. **这一次请求的客户端声明了能力**：`?caps=` 里含 `flatsegs`，或者 `?fmt=bin`。
+   * 只满足 1 不满足 2（老标签页 / 老客户端 / curl）→ 照旧发老形状 `coords` + `paths`。
+   * 于是"部署不会打坏正在玩的人"：老标签页拿到的与改动前**逐字节相同**，玩家刷新后才升级。
+   *
+   * `fmt=bin` 之所以也算声明，是因为二进制解码出来的显示条目本来就是 `segs` 形状
+   * （`World.decodeBinaryPayload`），能收二进制载荷的客户端必然已经认识 `segs`。
+   */
+  const flatDisplay = pack.displayFlat === true && capsFlat === true;
+  for (let i = 0; i < lineList.length; i++) {
+    const l = lineList[i];
+    if (flatDisplay) { packDisplayGeometry(l, lineScale); continue; }
+    l.coords = packPathFlat(l.coords, lineScale);
+    if (l.paths) for (let j = 0; j < l.paths.length; j++) l.paths[j] = packPathFlat(l.paths[j], lineScale);
+  }
+  // displayAreas（低缩放视图载荷的面几何）与折线同一套编码：每条环扁平差分 + 量化
+  for (let i = 0; i < areaList.length; i++) {
+    const a = areaList[i];
+    if (flatDisplay) { packDisplayGeometry(a, lineScale); continue; }
+    a.coords = packPathFlat(a.coords, lineScale);
+    if (a.paths) for (let j = 0; j < a.paths.length; j++) a.paths[j] = packPathFlat(a.paths[j], lineScale);
+  }
+  return {
+    nodePack: packNodesColumnar(nodes, nodeScale), nodeTags, ways, relations,
+    truncated: !complete, truncation, totals, zoom,
+    viewOnly: !!viewOnly,
+    enc: {
+      v: flatDisplay ? 2 : 1,
+      nodeScale,                 // 坐标 = 整数 / nodeScale
+      lineScale,                 // 折线坐标 = 整数 / lineScale
+      wayRefs: 'delta',          // ways[id][1] 是"每条 way 内 delta"的节点 id
+      displayPaths: flatDisplay ? 'flat+segs' : 'split',
+      rule: 'nodes 换成列式 delta 三列 nodePack{ids,lat,lon}；ways[id][1] 与 displayLines / displayAreas 的坐标'
+        + '都是差分（首值绝对）；坐标量化到 1/nodeScale。'
+        + (flatDisplay
+          ? 'displayLines / displayAreas 的几何摊平成 coords（所有段首尾相接的扁平差分数组）+ segs（段长表，每段点数），'
+            + 'coords 的第一段点数 = segs[0]。'
+          : 'displayLines / displayAreas 的几何是 coords（第一段）+ paths（其余段），每段一个扁平差分数组。')
+        + '客户端 World.unpackPayload 展开回老形状。',
+    },
+    ...(lineList.length ? { displayLines: lineList } : {}),
+    ...(areaList.length ? { displayAreas: areaList } : {}),
+  };
 }
 /**
  * 组内接龙：返回若干条**节点序列**（每条是一段不分叉的路径）。
@@ -1151,10 +1382,453 @@ function simplifyTrailMeters(pts, tolM) {
   return out;
 }
 
+/* ==================== 二进制矢量载荷 BIN v1（zigzag + varint 增量编码） ==================== */
+/**
+ * ## 格式说明（BIN v1）—— 字段顺序 / 变体类型 / 版本号
+ *
+ * 目标：把"紧凑载荷"（已经是列式 delta + 差分坐标，但**仍然是 JSON**）再压下去。
+ * JSON 剩下的开销全是**结构**：键名（每一条 way 都要把 `"version":` 写一遍）、括号与逗号、
+ * 以及十进制整数的每一位。二进制把它们换成 varint 变长整数 + **一张全局去重的字符串表**。
+ *
+ * ### 字节序与整数变体
+ * 全部**小端**（客户端用 DataView 默认的小端 + TextDecoder 解码，都是浏览器原生能力）。
+ * 除了魔数、版本、flags 与段目录里的定长字段，**所有整数都是变长整数**：
+ *   · `uvarint(v)` 无符号 LEB128：每字节 7 位有效位（低位在前），最高位 = "还有后续字节"。
+ *   · `svarint(v)` 先 zigzag 再 uvarint：`v ≥ 0 → 2v`，`v < 0 → −2v−1`。
+ *     （zigzag 让"小的负数"也只占 1 字节 —— 坐标增量正负各半，不 zigzag 会让负数永远占满 5 字节。）
+ *   · 取值范围到 2^53−1（JS 安全整数）：节点 id 首值可以到 ~1.2e10 > 2^32，
+ *     所以编解码**都不走 32 位位运算**，用 `Math.floor(v / 128)`。
+ *   · 字符串 = `uvarint 字节长度` + UTF-8 原始字节。
+ *
+ * ### 文件布局（所有偏移相对文件开头）
+ * ```
+ * [0..3]   魔数 'D','S','H','B'（0x44 0x53 0x48 0x42）
+ * [4]      u8   version = 1                       ← **版本号**；客户端只认它认识的版本
+ * [5]      u8   flags   bit0 viewOnly · bit1 truncated（其余位保留，必须为 0）
+ * [6..7]   u16  sectionCount（本版本恒为 7；客户端按 kind 找段，不按顺序）
+ * [8..]    sectionCount × 10 字节的**段目录**（按 kind 升序）：
+ *            u8  kind      段类型
+ *            u8  sflags    段级标志（保留，本版本恒 0）
+ *            u32 offset    段起始偏移
+ *            u32 length    段字节数
+ * [8+10n..] 段数据（本实现按 kind 升序紧密排列，段之间不填充、不对齐）
+ * ```
+ *
+ * ### 段类型（kind）
+ * | kind | 名字 | 内容 |
+ * |------|------|------|
+ * | 1 | CORE          | UTF-8 JSON：**除几何以外的所有字段**（truncation / totals / zoom / truncated / viewOnly / enc / ms / query / stats …） |
+ * | 2 | STRINGS       | 字符串表 |
+ * | 3 | NODES         | nodePack + nodeTags |
+ * | 4 | WAYS          | ways 字典 |
+ * | 5 | RELATIONS     | relations 字典 |
+ * | 6 | DISPLAY_LINES | displayLines（低缩放合并折线，② 的摊平形状） |
+ * | 7 | DISPLAY_AREAS | displayAreas（低缩放合并面，同上） |
+ *
+ * CORE 刻意仍是 JSON：那些小字段本身高度重复（账本里的中文说明文案一个视口就 12 KB），
+ * 外层 gzip 对文本的收益远大于"再发明一套编码"，所以不必在这里抠。
+ *
+ * ### 字符串表（kind 2）
+ * `uvarint count`；随后 `count` 条 `(uvarint 字节长度 + UTF-8 字节)`。
+ * **约定：下标 0 恒为空串 ""，不出现在表里；表里第一条的下标 = 1。**
+ * 全包共用一张表 —— 重复的标签 key 与 value 只存一份（`highway=residential` 一屏重复上万次）。
+ *
+ * ### 标签集（tagset，多处复用）
+ * `uvarint countPlusOne`；`0` = **没有标签（null）**，否则 `countPlusOne - 1` = 键值对个数，
+ * 随后 `count × (uvarint keyIdx, uvarint valIdx)`，下标指向 STRINGS 表。
+ * 这个 +1 的哨兵是刻意的：服务端里 `tags` 有 `null` 与 `{}` 两种"空"，客户端直接把它们
+ * 当对象用，两者必须能原样区分（多花 0 字节 —— 1 与 0 在 varint 里一样宽）。
+ * 键的顺序 = 服务端 JSON 里那个对象的键顺序（**必须保序**：客户端拿它直接当 tags 用）。
+ *
+ * ### NODES 段（kind 3）
+ * ```
+ * uvarint nodeCount
+ * nodeCount × svarint   节点 id 增量（首值绝对 → 与 JSON 版 nodePack.ids 逐个相同）
+ * nodeCount × svarint   lat 增量（已量化：坐标 = 整数 / enc.nodeScale）
+ * nodeCount × svarint   lon 增量
+ * uvarint taggedCount
+ * taggedCount × ( svarint nodeId 增量（升序，首值绝对） + tagset )      → 重建 payload.nodeTags
+ * ```
+ *
+ * ### WAYS 段（kind 4）
+ * ```
+ * uvarint wayCount
+ * wayCount × {
+ *   svarint  id 增量（升序，首值绝对）
+ *   uvarint  version
+ *   u8       flags   bit0 closed · bit1 hasTags · bit2 hasLength
+ *   uvarint  refCount
+ *   refCount × svarint  节点 id 增量（**已经是服务端打包好的"每条 way 内 delta"**，原样搬运）
+ *   hasLength 时：svarint length
+ *   hasTags   时：tagset
+ * }
+ * ```
+ * 重建：`ways[id] = [version, refDeltas, tags|null, closed ? 1 : 0, length|0]`
+ *
+ * ### RELATIONS 段（kind 5）
+ * ```
+ * uvarint relCount
+ * relCount × {
+ *   svarint  id 增量（升序，首值绝对）
+ *   uvarint  version
+ *   u8       flags   bit0 hasTags · bit1 hasCrop
+ *   uvarint  memberCount
+ *   memberCount × { u8 type（0=node 1=way 2=relation）
+ *                   svarint ref 增量（**同一关系内**累计，首值绝对）
+ *                   uvarint roleIdx（字符串表下标，空 role = 0） }
+ *   hasTags 时：tagset
+ *   hasCrop 时：8 × uvarint（memberTotal, memberKept,
+ *                            memberWaysTotal, memberWaysKept,
+ *                            memberNodesTotal, memberNodesKept,
+ *                            memberRelsTotal, memberRelsKept）
+ * }
+ * ```
+ * 重建：`relations[id] = [version, [[type, ref, role], …], tags|null, crop|null]`，
+ * 其中 crop 重建为 `{ cropped: true, reason: 'viewport', …上面 8 个计数 }`。
+ *
+ * ### DISPLAY_LINES（kind 6）/ DISPLAY_AREAS（kind 7）—— 两个段同一格式
+ * ```
+ * uvarint entryCount
+ * entryCount × {
+ *   uvarint classIdx       字符串表下标（class 恒非空）
+ *   u8      flags          bit0 hasName · bit1 hasRel
+ *   hasName 时：uvarint nameIdx    字符串表下标（**没有 name 键时这个位就是 0**，
+ *                                  与 JSON 版"name 非空才有这个键"口径一致）
+ *   hasRel  时：uvarint rel        面关系条目上的关系 id（只有 displayAreas 的关系条目有）
+ *   tagset                 （空标签就是 count = 0）
+ *   uvarint segCount
+ *   segCount × uvarint     每段的点数（← 就是 ② 的段长表 segs）
+ *   Σ点数 × 2 × svarint    dLat, dLon 交替；**每段各自的第一个点是绝对量化值**（段间差分复位）
+ * }
+ * ```
+ * 重建：`{ class, tags, coords: 全部段首尾相接的扁平数组, segs: [每段点数], name?, rel? }`
+ * —— 正是 ② 的摊平形状，客户端 `World.unpackPayload` 再按 segs 切回 coords/paths。
+ *
+ * ⚠ 编码器对"条目上多出来的字段"是**零容忍**的（ways/relations/displayXxx 都查）：
+ * 见到不认识的键就抛错 → `/api/map` 退回 JSON。宁可慢一点，也绝不把服务端新加的字段
+ * 在二进制那一条路上悄悄吞掉（这类丢失在浏览器里表现为"少画一块/少一条路"，极难查）。
+ *
+ * ### 版本演进
+ *   · **段目录**让"加一个新段"不用动老段的解析（客户端跳过不认识的 kind）；
+ *   · 段内加字段的兼容做法：往 flags 里加位（本版本每个位都有明确含义，多出来的位一律当 0 处理）；
+ *   · **不兼容的改动必须把 version 加 1**：客户端遇到不认识的 version 会抛错，
+ *     `mapdata.js` 的 `_fetch` 收到异常后会自动退回 `fmt=json` 重取（协商与逃生阀见那边）。
+ *
+ * ### 与 gzip 的关系
+ * 本格式**自身不压缩**（只是变长整数 + 去重），字节流里仍有多余的统计冗余，外层 gzip 还能再小 ~2 倍，
+ * 所以服务端照旧按 `Accept-Encoding` 压 —— 这不是"重复压缩"（实测数字见 `node tests/bin-payload-bench.js`
+ * 的输出）。将来若把某个版本换成自带压缩的
+ * （例如内部套一层 LZ），**必须**在 flags 里置一个"已压缩"标志并让 `sendBinary` 跳过 gzip，
+ * 否则才是真的浪费。
+ *
+ * ### 只改编码，不改语义
+ * 段里搬运的一切都来自 `queryBbox` 已经算好的紧凑载荷：LOD 分级、`truncation` 账本
+ * （dropped / lodFiltered / complete / stopReason）、`VIEW_ONLY_MAX_ZOOM = 14` 的"只看不改"边界、
+ * `nodeTags` / 关系成员、编辑档（z15+）的真 way id + 全量几何 —— 一个数都不变，
+ * 只是换个写法搬到线上。客户端解出来的对象与 JSON 版**逐字段相同**（tests/bin-payload-test.js 用
+ * 真实数据集逐档对拍）。
+ */
+const BIN_VERSION = 1;
+const BIN_MAGIC = [0x44, 0x53, 0x48, 0x42];   // 'D' 'S' 'H' 'B'
+const BIN_HEADER_BYTES = 8;
+const BIN_DIR_ENTRY_BYTES = 10;
+const BIN_KIND = {
+  CORE: 1, STRINGS: 2, NODES: 3, WAYS: 4, RELATIONS: 5, DISPLAY_LINES: 6, DISPLAY_AREAS: 7,
+};
+/** 段顺序固定（kind 升序）：客户端按 kind 查目录，不依赖顺序，但固定下来更省事 */
+const BIN_SECTION_ORDER = [
+  BIN_KIND.CORE, BIN_KIND.STRINGS, BIN_KIND.NODES, BIN_KIND.WAYS,
+  BIN_KIND.RELATIONS, BIN_KIND.DISPLAY_LINES, BIN_KIND.DISPLAY_AREAS,
+];
+/** 走二进制时**不进 CORE JSON**的字段（几何全部走各自的段） */
+const BIN_GEOMETRY_KEYS = new Set([
+  'nodePack', 'nodes', 'nodeTags', 'ways', 'relations', 'displayLines', 'displayAreas',
+]);
+const BIN_REL_TYPES = ['node', 'way', 'relation'];
+const BIN_REL_TYPE_INDEX = { node: 0, way: 1, relation: 2 };
+
+/** 支持二进制的客户端能力标识（内容类型 + Accept 里的那个 token，两处必须是同一个串） */
+const BIN_CONTENT_TYPE = 'application/vnd.dsh.osm.bin';
+/** `Accept` 里出现这个子串就说明客户端会解二进制（协商第二条路；显式 `?fmt=` 优先级更高） */
+const BIN_ACCEPT_TOKEN = BIN_CONTENT_TYPE;
+
+/** 变长整数的写入器：预分配 + 翻倍扩容，`_need` 之后才直接写 buf */
+class ByteWriter {
+  constructor(cap) {
+    this.buf = Buffer.allocUnsafe(Math.max(64, cap || 4096));
+    this.len = 0;
+  }
+  _need(n) {
+    const need = this.len + n;
+    if (need <= this.buf.length) return;
+    let cap = this.buf.length * 2;
+    while (cap < need) cap *= 2;
+    const next = Buffer.allocUnsafe(cap);
+    this.buf.copy(next, 0, 0, this.len);
+    this.buf = next;
+  }
+  u8(v) { this._need(1); this.buf[this.len++] = v & 0xff; return this; }
+  u16(v) { this._need(2); this.buf.writeUInt16LE(v & 0xffff, this.len); this.len += 2; return this; }
+  u32(v) { this._need(4); this.buf.writeUInt32LE(v >>> 0, this.len); this.len += 4; return this; }
+  raw(buf) { this._need(buf.length); buf.copy(this.buf, this.len); this.len += buf.length; return this; }
+  /** 无符号 LEB128（**不走 32 位位运算**：节点 id 可以超过 2^32） */
+  uvarint(v) {
+    this._need(10);
+    let n = v;
+    while (n >= 0x80) { this.buf[this.len++] = (n % 128) | 0x80; n = Math.floor(n / 128); }
+    this.buf[this.len++] = n;
+    return this;
+  }
+  /** zigzag + uvarint（坐标增量正负各半，zigzag 才能让小的负数只占 1 字节） */
+  svarint(v) { return this.uvarint(v < 0 ? (-v) * 2 - 1 : v * 2); }
+  view() { return this.buf.subarray(0, this.len); }
+}
+
+/**
+ * 紧凑载荷 → BIN v1 缓冲区。
+ * **纯函数**：不改传进来的 payload（只读它），失败时抛错（调用方据此退回 JSON）。
+ * 只接受紧凑载荷（`payload.enc` 必须在）：非紧凑（`limits.compact=false`）时几何是 `nodes` 字典，
+ * 没有量化也没有 delta，编码它等于把老形状硬塞进新容器 —— 直接抛错更诚实。
+ */
+function encodeBinaryPayload(payload) {
+  if (!payload || typeof payload !== 'object') throw new Error('二进制载荷需要一个对象');
+  if (!payload.enc) throw new Error('二进制载荷只支持紧凑载荷（payload.enc 缺失：limits.compact 被关掉了？）');
+  if (payload.nodes) throw new Error('二进制载荷不支持老形状的 nodes 字典');
+
+  /* ---------- 字符串表：下标 0 恒为空串，表里第一条的下标 = 1 ---------- */
+  const stringList = [''];
+  const stringIndex = new Map([['', 0]]);
+  const intern = (s) => {
+    const key = s === undefined || s === null ? '' : String(s);
+    let i = stringIndex.get(key);
+    if (i === undefined) { i = stringList.length; stringList.push(key); stringIndex.set(key, i); }
+    return i;
+  };
+  /** 标签值必须是字符串：不是就抛错（→ JSON 回退），绝不悄悄 String() 改掉类型 */
+  const internValue = (v) => {
+    if (typeof v !== 'string') throw new Error('标签值不是字符串（tags.' + typeof v + '），退回 JSON');
+    return intern(v);
+  };
+  const writeTags = (bw, tags) => {
+    if (tags === null || tags === undefined) { bw.uvarint(0); return; }   // 0 = null（与"空对象"必须分得开）
+    const keys = Object.keys(tags);
+    bw.uvarint(keys.length + 1);
+    for (let i = 0; i < keys.length; i++) {
+      bw.uvarint(intern(keys[i]));
+      bw.uvarint(internValue(tags[keys[i]]));
+    }
+  };
+
+  /* ---------- NODES：nodePack（三列 delta） + nodeTags ---------- */
+  const bwNodes = new ByteWriter(1 << 16);
+  const np = payload.nodePack;
+  if (np && np.ids) {
+    const n = np.ids.length;
+    bwNodes.uvarint(n);
+    for (let i = 0; i < n; i++) bwNodes.svarint(np.ids[i]);
+    for (let i = 0; i < n; i++) bwNodes.svarint(np.lat[i]);
+    for (let i = 0; i < n; i++) bwNodes.svarint(np.lon[i]);
+  } else {
+    bwNodes.uvarint(0);
+  }
+  const nodeTags = payload.nodeTags || null;
+  const taggedIds = nodeTags ? Object.keys(nodeTags).map(Number) : [];
+  bwNodes.uvarint(taggedIds.length);
+  {
+    let prev = 0;
+    for (let i = 0; i < taggedIds.length; i++) {
+      const id = taggedIds[i];
+      bwNodes.svarint(id - prev);
+      prev = id;
+      writeTags(bwNodes, nodeTags[id]);
+    }
+  }
+
+  /* ---------- WAYS ---------- */
+  const bwWays = new ByteWriter(1 << 16);
+  const ways = payload.ways || null;
+  const wayIds = ways ? Object.keys(ways).map(Number) : [];
+  bwWays.uvarint(wayIds.length);
+  {
+    let prev = 0;
+    for (let i = 0; i < wayIds.length; i++) {
+      const id = wayIds[i];
+      const a = ways[id];
+      // ways[id] = [version, 节点 id 差分, tags|null, closed, length]：多一位就抛错（见格式说明的"零容忍"）
+      if (!Array.isArray(a) || a.length !== 5) throw new Error('ways[' + id + '] 的形状不是 5 元组，退回 JSON');
+      bwWays.svarint(id - prev);
+      prev = id;
+      bwWays.uvarint(Number(a[0]) || 0);
+      const refs = a[1] || [];
+      const tags = a[2] || null;
+      const length = Number(a[4]) || 0;
+      let flags = 0;
+      if (a[3]) flags |= 1;          // closed
+      if (tags) flags |= 2;          // hasTags
+      if (length) flags |= 4;        // hasLength（现在实现恒为 0：0 与"没有"等价，省一个字节）
+      bwWays.u8(flags);
+      bwWays.uvarint(refs.length);
+      for (let j = 0; j < refs.length; j++) bwWays.svarint(refs[j]);
+      if (flags & 4) bwWays.svarint(length);
+      if (flags & 2) writeTags(bwWays, tags);
+    }
+  }
+
+  /* ---------- RELATIONS ---------- */
+  const bwRels = new ByteWriter(1 << 14);
+  const relations = payload.relations || null;
+  const relIds = relations ? Object.keys(relations).map(Number) : [];
+  bwRels.uvarint(relIds.length);
+  {
+    let prev = 0;
+    for (let i = 0; i < relIds.length; i++) {
+      const id = relIds[i];
+      const a = relations[id];
+      // relations[id] = [version, [[type, ref, role], …], tags|null, crop|null]：同样是零容忍
+      if (!Array.isArray(a) || a.length !== 4) throw new Error('relations[' + id + '] 的形状不是 4 元组，退回 JSON');
+      bwRels.svarint(id - prev);
+      prev = id;
+      bwRels.uvarint(Number(a[0]) || 0);
+      const members = a[1] || [];
+      const tags = a[2] || null;
+      const crop = a[3] || null;
+      let flags = 0;
+      if (tags) flags |= 1;
+      if (crop) flags |= 2;
+      bwRels.u8(flags);
+      bwRels.uvarint(members.length);
+      let prevRef = 0;
+      for (let j = 0; j < members.length; j++) {
+        const m = members[j];
+        const t = BIN_REL_TYPE_INDEX[m[0]];
+        if (t === undefined) throw new Error('关系成员类型不认识：' + m[0] + '，退回 JSON');
+        if (m.length !== 3) throw new Error('关系成员不是 [type, ref, role] 三元组，退回 JSON');
+        bwRels.u8(t);
+        const ref = Number(m[1]) || 0;
+        bwRels.svarint(ref - prevRef);
+        prevRef = ref;
+        bwRels.uvarint(intern(m[2]));
+      }
+      if (flags & 1) writeTags(bwRels, tags);
+      if (flags & 2) {
+        bwRels.uvarint(Number(crop.memberTotal) || 0);
+        bwRels.uvarint(Number(crop.memberKept) || 0);
+        bwRels.uvarint(Number(crop.memberWaysTotal) || 0);
+        bwRels.uvarint(Number(crop.memberWaysKept) || 0);
+        bwRels.uvarint(Number(crop.memberNodesTotal) || 0);
+        bwRels.uvarint(Number(crop.memberNodesKept) || 0);
+        bwRels.uvarint(Number(crop.memberRelsTotal) || 0);
+        bwRels.uvarint(Number(crop.memberRelsKept) || 0);
+      }
+    }
+  }
+
+  /* ---------- DISPLAY_LINES / DISPLAY_AREAS（同一格式） ---------- */
+  /** 一个显示条目允许出现的键（多一个就抛错 → 退回 JSON，见格式说明的"零容忍"） */
+  const DISPLAY_ENTRY_KEYS = ['class', 'tags', 'coords', 'segs', 'paths', 'name', 'rel'];
+  const writeDisplay = (entries) => {
+    const bw = new ByteWriter(1 << 16);
+    const list = entries || [];
+    bw.uvarint(list.length);
+    for (let i = 0; i < list.length; i++) {
+      const e = list[i];
+      for (const k of Object.keys(e)) {
+        if (DISPLAY_ENTRY_KEYS.indexOf(k) < 0) throw new Error('显示条目上有不认识的字段 ' + k + '，退回 JSON');
+      }
+      bw.uvarint(intern(e.class));
+      let flags = 0;
+      if (e.name) flags |= 1;                       // hasName
+      if (e.rel !== undefined && e.rel !== null) flags |= 2;   // hasRel（只有 displayAreas 的关系条目有）
+      bw.u8(flags);
+      if (flags & 1) bw.uvarint(intern(e.name));
+      if (flags & 2) bw.uvarint(Number(e.rel) || 0);
+      writeTags(bw, e.tags || null);
+      // 几何：摊平形状（coords + segs）与老形状（coords + paths）都收，段序不变
+      const segs = e.segs || null;
+      const parts = segs ? null : displaySegmentsOf(e);
+      const segCount = segs ? segs.length : parts.length;
+      bw.uvarint(segCount);
+      if (segs) {
+        for (let j = 0; j < segs.length; j++) bw.uvarint(segs[j]);
+        const flat = e.coords || [];
+        for (let j = 0; j < flat.length; j++) bw.svarint(flat[j]);
+      } else {
+        for (let j = 0; j < parts.length; j++) bw.uvarint(parts[j].length >> 1);
+        for (let j = 0; j < parts.length; j++) {
+          const f = parts[j];
+          for (let k = 0; k < f.length; k++) bw.svarint(f[k]);
+        }
+      }
+    }
+    return bw;
+  };
+  const bwLines = writeDisplay(payload.displayLines);
+  const bwAreas = writeDisplay(payload.displayAreas);
+
+  /* ---------- CORE：除几何以外的全部字段，仍然是 JSON ---------- */
+  const core = {};
+  for (const k of Object.keys(payload)) {
+    if (BIN_GEOMETRY_KEYS.has(k)) continue;
+    core[k] = payload[k];
+  }
+  const coreBuf = Buffer.from(JSON.stringify(core), 'utf8');
+
+  /* ---------- STRINGS ---------- */
+  const bwStrings = new ByteWriter(1 << 14);
+  bwStrings.uvarint(stringList.length - 1);
+  for (let i = 1; i < stringList.length; i++) {
+    const b = Buffer.from(stringList[i], 'utf8');
+    bwStrings.uvarint(b.length);
+    bwStrings.raw(b);
+  }
+
+  /* ---------- 组装：头 + 段目录 + 段数据 ---------- */
+  const bodies = {
+    [BIN_KIND.CORE]: coreBuf,
+    [BIN_KIND.STRINGS]: bwStrings.view(),
+    [BIN_KIND.NODES]: bwNodes.view(),
+    [BIN_KIND.WAYS]: bwWays.view(),
+    [BIN_KIND.RELATIONS]: bwRels.view(),
+    [BIN_KIND.DISPLAY_LINES]: bwLines.view(),
+    [BIN_KIND.DISPLAY_AREAS]: bwAreas.view(),
+  };
+  const count = BIN_SECTION_ORDER.length;
+  let total = BIN_HEADER_BYTES + count * BIN_DIR_ENTRY_BYTES;
+  for (const kind of BIN_SECTION_ORDER) total += bodies[kind].length;
+  const out = Buffer.allocUnsafe(total);
+  out[0] = BIN_MAGIC[0]; out[1] = BIN_MAGIC[1]; out[2] = BIN_MAGIC[2]; out[3] = BIN_MAGIC[3];
+  out[4] = BIN_VERSION;
+  out[5] = (payload.viewOnly ? 1 : 0) | (payload.truncated ? 2 : 0);
+  out.writeUInt16LE(count, 6);
+  let at = BIN_HEADER_BYTES;
+  let offset = BIN_HEADER_BYTES + count * BIN_DIR_ENTRY_BYTES;
+  for (const kind of BIN_SECTION_ORDER) {
+    const buf = bodies[kind];
+    out[at] = kind;
+    out[at + 1] = 0;
+    out.writeUInt32LE(offset, at + 2);
+    out.writeUInt32LE(buf.length, at + 6);
+    at += BIN_DIR_ENTRY_BYTES;
+    buf.copy(out, offset);
+    offset += buf.length;
+  }
+  return out;
+}
+
 class OsmDB {
   constructor(file, options = {}) {
     this.file = file;
-    this.db = openDatabase(file);
+    /**
+     * **只读模式**（`readOnly: true`，分片库专用；见文件上方 openReadOnlyDatabase 的说明）：
+     * 只影响"怎么打开库"和"哪些自愈/回填路径要跳过"，**查询结果一个字节都不变**
+     *   · 打开：只读连接（写操作会被 SQLite 拒绝，实测报 `attempt to write a readonly database`）
+     *   · 物化列（road_class / lod_zoom）：只抽查，不回填；缺了就让低缩放退回 R*Tree
+     *   · 视口索引（idx_nodes_tagged）：只核对在不在，**不建**（分片库已经带了这个索引）
+     *   · 空间索引自检/自愈（_auditSpatialIndexes）：整段跳过（自愈要写库），审计结果记 'read-only'
+     * 默认 false —— 服务端自己那个库的行为与改动前逐字节相同。
+     */
+    this.readOnly = options.readOnly === true;
+    this.db = this.readOnly ? openReadOnlyDatabase(file) : openDatabase(file);
     this.ids = new IdAllocator(this.db);
     this._st = {};
     this._countsCache = null;
@@ -1175,8 +1849,10 @@ class OsmDB {
      * **顺序：先回填、后建索引**（批量构建 159 ms，反过来要 32 万次 UPDATE 维护索引）。
      * 任一步失败 → `_wayLodReady = false` → 低缩放退回旧的 R*Tree 扫描，画面不受影响。
      */
-    const wayLodFilled = backfillWayLod(this.db, wayLodKeysOf, { sample: options.wayLodSample }) === true;
-    const lodIndexed = ensureLodIndexes(this.db) === true;
+    const wayLodFilled = this.readOnly
+      ? lodColumnsFilled(this.db)                                   // 只读：只能抽查，不能回填
+      : backfillWayLod(this.db, wayLodKeysOf, { sample: options.wayLodSample }) === true;
+    const lodIndexed = this.readOnly ? this._hasIndex(WAY_LOD_INDEX) : ensureLodIndexes(this.db) === true;
     this._wayLodReady = wayLodFilled && lodIndexed;
     /** 低缩放 POI 计划生效的最大缩放（见 _nodePoiPlan；config limits.nodePoiIndexMaxZoom） */
     const poiMax = Number(options.nodePoiIndexMaxZoom);
@@ -1200,6 +1876,16 @@ class OsmDB {
    */
   _ensureViewportIndexes() {
     this._nodeIndexReady = false;
+    /**
+     * 只读连接（分片库）：不能 CREATE INDEX、也不能自愈重建。只核对索引在不在 ——
+     * 分片库是导入器建的，`idx_nodes_tagged` 本来就有；缺了就退回 R*Tree（结果一致，只是慢些）。
+     * 空间索引自检整段跳过（它的自愈是写操作），审计结果记成 'read-only' 便于 /api/health 看出来。
+     */
+    if (this.readOnly) {
+      this._nodeIndexReady = this._hasIndex('idx_nodes_tagged');
+      this._indexAudit = { skipped: 'read-only' };
+      return;
+    }
     try {
       const row = this.db.prepare(
         "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_nodes_tagged'"
@@ -1469,12 +2155,18 @@ class OsmDB {
    * **紧凑编码开启时（默认，见文件开头「紧凑载荷」）形状变成**：
    * { nodePack: {ids:[d…], lat:[d…], lon:[d…]},   ← 列式差分整数（替代 nodes 字典）
    *   ways: {id: [version, [d…], tags|null, closed, length]},   ← 第 2 位也是差分（每条 way 内）
-   *   displayLines: [{class, tags, coords:[lat0,lon0,dLat1,dLon1,…], paths:[…]}],  ← 折线坐标扁平差分
-   *   enc: {v, nodeScale, lineScale, wayRefs:'delta', rule},    ← 解码说明书
+   *   displayLines: [{class, tags, name?, coords:[d…], segs:[…]}],  ← 坐标扁平差分 + 段长表（见 ②）
+   *   displayAreas: 同上（面关系条目还会多一个 rel = 关系 id）
+   *   enc: {v, nodeScale, lineScale, wayRefs:'delta', displayPaths, rule},  ← 解码说明书
    *   …其余字段（nodeTags / relations / truncation / totals / zoom）形状不变 }
    * 客户端在 `World.unpackPayload`（world.js）里按 `enc` 一次展开回上面那套老形状，
    * 所以 `World.mergePayload`、拾取、编辑、`completeness()` 全都看不到编码差异。
    * 关掉：`limits.compact = false`（那时就是上面那套老形状，一个字都不差）。
+   * ② 摊平单独关：`limits.compact = {on:true, displayFlat:false}`（几何退回 `coords` + `paths`）。
+   *
+   * **二进制载荷（BIN v1）**：`/api/map?fmt=bin`（或 `Accept` 声明能力）时，上面这份紧凑载荷
+   * 会被 `encodeBinaryPayload` 编码成二进制（zigzag/varint + 字符串表），解码后形状**逐字段相同**
+   * —— 格式说明见文件开头「二进制矢量载荷」，协商与逃生阀见 server/index.js 的 `wantBinaryPayload`。
    *
    * relations 的第 4 位是**关系成员裁剪**的说明（#P0）：没裁时为 null，裁了就是
    *   { cropped: true, reason: 'viewport', memberTotal, memberKept,
@@ -1514,7 +2206,7 @@ class OsmDB {
    *   truncation.crop / truncation.kinds.relations 与 payload 的 relations[id][3] 里。
    *   裁剪**不影响** complete：被裁掉的成员全部在裁剪框之外，请求框内的成员一条不少。
    */
-  queryBbox({ minLon, minLat, maxLon, maxLat, zoom = 16, limit = 12000, wayCandidates, nodeCandidates, relationLimit, relationCropPad, relationCropMinMembers, relationCropBoundaryMembers, detail, lodDetail, minFillArea, lodMinFillArea, roadSend, lodRoadSend, roadClassFloor, lodRoadClassFloor, neverSend, lodNeverSend, coalesce, lodCoalesce, compact, view }) {
+  queryBbox({ minLon, minLat, maxLon, maxLat, zoom = 16, limit = 12000, wayCandidates, nodeCandidates, relationLimit, relationCropPad, relationCropMinMembers, relationCropBoundaryMembers, detail, lodDetail, minFillArea, lodMinFillArea, roadSend, lodRoadSend, roadClassFloor, lodRoadClassFloor, neverSend, lodNeverSend, coalesce, lodCoalesce, compact, view, flatCaps }) {
     const st = this._st;
     const caps = {
       viewportLimit: Math.max(1, Math.floor(Number(limit)) || QUERY_CAPS.viewportLimit),
@@ -1562,6 +2254,12 @@ class OsmDB {
       : (viewArg && coalesceOpts.minZoom > 0 && zoom < coalesceOpts.minZoom);
     /** 紧凑载荷（见文件开头「紧凑载荷」一段）：坐标量化 + 列式/delta 编码，语义不变 */
     const pack = packOptsOf(compact);
+    /**
+     * **客户端能力开关**（见下面 ② 摊平那一段的完整说明）：这一次请求的客户端**有没有声明**
+     * 它认识扁平几何（`?caps=` 含 `flatsegs`，或 `?fmt=bin`）。没声明就一律发老形状 ——
+     * 于是部署瞬间还在跑的旧标签页/旧缓存 JS 不会被新协议打坏。
+     */
+    const capsFlat = flatCaps === true;
     /** 因为 LOD 没下发的条数（按类记账）：'building' / 'roadClass' / 'neverSend' → 条数。**不是**截断。 */
     const lodWithheld = {};
     let lodWithheldTotal = 0;
@@ -2553,56 +3251,13 @@ class OsmDB {
      *   · 条数 / 账本 / complete / dropped / coalesce 全都在上面算完了，一个数都不受影响；
      *   · truncation.payload.nodes 也在上面取过 Object.keys(nodes)（打包前），所以账还是对的。
      */
-    if (pack.on) {
-      /**
-       * 坐标精度的"编辑档"起点：**跟随合并/视图载荷的边界**（默认 15 = VIEW_ONLY_MAX_ZOOM + 1）——
-       * 从这一档起客户端能点选/编辑，几何就给全精度 1e-7°；"只看不改"的档位给 1e-6°（≈0.11 m）足够。
-       * 这样两侧只有**一条**边界：config 改了 limits.coalesce.minZoom（或 on:false）时这里跟着走，
-       * 绝不会出现"这一档可编辑、但坐标被降精度"的自相矛盾。
-       */
-      const editFloor = coalesceOpts.minZoom > 0 ? coalesceOpts.minZoom : pack.editZoom;
-      const nodeScale = zoom >= editFloor ? pack.editScale : pack.viewScale;
-      // 折线的量化位数跟着合并时的 coordDigits 走（默认 5 位）：这样打包是**无损**的
-      const lineScale = Math.pow(10, coalesceOpts.coordDigits || 5);
-      for (const key in ways) ways[key][1] = packRefDeltas(ways[key][1]);
-      const lines = coalescePlan.lines;
-      for (let i = 0; i < lines.length; i++) {
-        const l = lines[i];
-        l.coords = packPathFlat(l.coords, lineScale);
-        if (l.paths) for (let j = 0; j < l.paths.length; j++) l.paths[j] = packPathFlat(l.paths[j], lineScale);
-      }
-      // displayAreas（低缩放视图载荷的面几何）与折线同一套编码：每条环扁平差分 + 量化
-      const areas = areasPlan ? areasPlan.entries : [];
-      for (let i = 0; i < areas.length; i++) {
-        const a = areas[i];
-        a.coords = packPathFlat(a.coords, lineScale);
-        if (a.paths) for (let j = 0; j < a.paths.length; j++) a.paths[j] = packPathFlat(a.paths[j], lineScale);
-      }
-      return {
-        nodePack: packNodesColumnar(nodes, nodeScale), nodeTags, ways, relations,
-        truncated: !complete, truncation, totals, zoom,
-        viewOnly: !!viewOnly,
-        enc: {
-          v: 1,
-          nodeScale,                 // 坐标 = 整数 / nodeScale
-          lineScale,                 // 折线坐标 = 整数 / lineScale
-          wayRefs: 'delta',          // ways[id][1] 是"每条 way 内 delta"的节点 id
-          rule: 'nodes 换成列式 delta 三列 nodePack{ids,lat,lon}；ways[id][1] 与 displayLines / displayAreas 的坐标'
-            + '都是差分（首值绝对）；坐标量化到 1/nodeScale。客户端 World.unpackPayload 展开回老形状。',
-        },
-        ...(lines.length ? { displayLines: lines } : {}),
-        ...(areas.length ? { displayAreas: areas } : {}),
-      };
-    }
-    return {
-      nodes, nodeTags, ways, relations, truncated: !complete, truncation, totals, zoom,
+    return packQueryResult({
+      nodes, nodeTags, ways, relations, truncation, totals, zoom, complete,
       viewOnly: !!viewOnly,
-      // 低缩放合并折线（视图用：只有几何，没有 way id）。没有合并时整个字段不出现，
-      // 客户端拿 `payload.displayLines` 是否存在就能判断"这一档是不是只读视图"。
-      ...(coalescePlan.lines.length ? { displayLines: coalescePlan.lines } : {}),
-      // 低缩放的面几何（视图用：量化 + 简化过的环，同样没有 way id，见「低缩放视图载荷」）
-      ...(areasPlan && areasPlan.entries.length ? { displayAreas: areasPlan.entries } : {}),
-    };
+      lines: coalescePlan.lines,
+      areas: areasPlan ? areasPlan.entries : [],
+      pack, coalesceOpts, capsFlat,
+    });
   }
 
   /**
@@ -3766,4 +4421,15 @@ module.exports = {
   OsmDB, metersBetween, parseTags, stringifyTags, lodVisible, QUERY_CAPS,
   // 低缩放候选索引用到的派生值实现（dbschema.backfillWayLod / 启动抽检 / 写入维护共用同一份规则）
   wayLodKeysOf, wayLodZoomOf, WAY_LOD_INDEX_MAX_ZOOM,
+  // 二进制矢量载荷（BIN v1，见文件开头「二进制矢量载荷」的格式说明）
+  encodeBinaryPayload, packDisplayGeometry, displaySegmentsOf,
+  BIN_VERSION, BIN_KIND, BIN_SECTION_ORDER, BIN_CONTENT_TYPE, BIN_ACCEPT_TOKEN,
+  /**
+   * 分区流式（server/regions.js）复用的两个内部件：
+   *   packQueryResult —— queryBbox 的收尾打包段（**单一出处**：分片路径合并完也走它，
+   *                     这样"合并后的载荷"与"单库直出的载荷"形状必然一致）
+   *   coalesceOptsOf  —— 合并/视图载荷的规则规范化（分片路径要用它算"预算按片数摊薄"）
+   *   packOptsOf      —— 紧凑载荷的规则规范化（同上，分片路径要判断 compact 开没开）
+   */
+  packQueryResult, coalesceOptsOf, packOptsOf,
 };

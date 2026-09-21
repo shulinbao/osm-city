@@ -138,6 +138,13 @@ function makeClient(options) {
     Promise, JSON, Math, Number, String, Boolean, Object, Array, Error, TypeError, RangeError, Date,
     Map, Set, WeakMap, WeakSet, Symbol, RegExp, isNaN, isFinite, parseInt, parseFloat,
     encodeURIComponent, decodeURIComponent, Int32Array, Float64Array, Uint8Array,
+    /**
+     * ⚠ `TextDecoder` 不是 V8 的内建 primordial（`DataView`/`ArrayBuffer` 是，在 vm 的新 realm 里本来就有），
+     * 所以不注入的话，`World.decodeBinaryPayload`（BIN v1 解码器）会直接报
+     * `TextDecoder is not defined` —— 二进制载荷那条路径就量不到、也测不了。
+     * 注入宿主的那一份（不自己写 JS 版解码器，否则会把耗时测高）。
+     */
+    TextDecoder, TextEncoder,
   };
   sandbox.globalThis = sandbox;
   sandbox.self = sandbox;
