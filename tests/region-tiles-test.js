@@ -34,7 +34,23 @@ const argOf = (n) => {
   const i = argv.indexOf('--' + n);
   return i >= 0 && argv[i + 1] ? argv[i + 1] : null;
 };
-const REGISTRY = path.resolve(ROOT, argOf('registry') || 'tests/tmp-regions/registry-tiles.json');
+/**
+ * 注册表从哪来（三种情况，自动选）：
+ *   ① `--registry <路径>`：你显式指定，照用；
+ *   ② 默认快照 `tests/tmp-regions/registry-tiles.json`（存在就用它，数字可复现）；
+ *   ③ 快照**不存在**（新克隆的仓库、或有人清了临时目录）→ 退回**线上** `data/regions/registry.json`。
+ *
+ * ⚠ 为什么要这条回退：snapshot 里的 `counts` 是"生成那一刻"的库内计数。分片被
+ * `tools/tile-cut.js` 重新生成过（例如给每片复制跨片 relation）之后，快照就**过期**了 ——
+ * 那时 A2 节会判定"分片重建中"并**跳过内容断言**（本文件从 33 项缩到 23 项）。
+ * 线上注册表由 tile-cut 同步重写，所以它是权威的；用默认参数跑出 23 项时，
+ * 先确认线上那份是否与库内一致，再考虑刷新快照（`Copy-Item data\regions\registry.json tests\tmp-regions\`）。
+ */
+const REGISTRY = argOf('registry')
+  ? path.resolve(ROOT, argOf('registry'))
+  : (fs.existsSync(path.join(ROOT, 'tests/tmp-regions/registry-tiles.json'))
+    ? path.resolve(ROOT, 'tests/tmp-regions/registry-tiles.json')
+    : path.join(ROOT, 'data/regions/registry.json'));
 const FALLBACK = path.resolve(ROOT, argOf('fallback') || 'tests/tmp-regions/hebei.sqlite');
 const LIVE = path.join(ROOT, 'data/regions/registry.json');
 
