@@ -13,6 +13,8 @@
     "test:browser": "node tests/browser-osm-e2e.js",
     "test:boot": "node tests/browser-boot-e2e.js",
     "check": "node tools/check-dom.js && node tools/check-load-order.js",
+    "test:dlod": "node tests/display-lod-test.js",
+    "build:dlod": "node tools/build-display-lod.js --db data/osm/osm.sqlite",
     "test:transit": "node tests/transit-e2e.js",
     "smoke:transit": "node tools/smoke-transit.js"
   },

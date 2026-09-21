@@ -339,6 +339,15 @@ const db = openRegionDB(config, {
   wayLodIndexMaxZoom: LIMITS.wayLodIndexMaxZoom,
   wayLodSample: LIMITS.wayLodSample,
   nodePoiIndexMaxZoom: LIMITS.nodePoiIndexMaxZoom,
+  /**
+   * 预计算低缩放显示图层（见 server/displaylod.js）：把整个 `limits` 一起带进去，
+   * 因为"烘焙用的查询参数"必须与 `/api/map` 用的是同一组（否则烘出来的几何与线上对不上）。
+   * `openRegionDB` 只转发它显式列出的那几个字段，所以这里**塞进 displayLod 这一个值里**，
+   * 免得为了一个新功能去改分区开关那一层的转发清单。
+   */
+  displayLod: Object.assign({}, LIMITS.displayLod || {}, { limits: LIMITS }),
+  displayLodLog: (m) => console.log(m),
+  wayGeom: LIMITS.wayGeom,
   regions: REGIONS_SWITCH,
 });
 // 分组撤销总线：OSM 编辑（ops）与交通玩法（transit）共用同一条时间线，
@@ -754,6 +763,8 @@ async function initTransitWorld() {
   }
   setInitStage('paths');
   const t1 = Date.now();
+  // 预计算低缩放显示图层（见 server/displaylod.js）：老库补建也放在这一段里（切片跑、进度如实回显）
+  await autoBuildDisplayLod();
   // ⚠ 线路路径全量重建（transit.js 的 onRailChanged）同样是那边的整段同步循环（实测 0.3~1 s），
   // 从 index.js 没有分批入口；如实计时打印。
   const out = transit.onRailChanged();      // 铁路网建好了：全量重建一次线路路径（不是增量）
@@ -761,6 +772,86 @@ async function initTransitWorld() {
   scheduleTransitSync(true);
   console.log(`[transit] 初始化完成，用时 ${((Date.now() - t0) / 1000).toFixed(1)} s`
     + `（其中线路路径 ${out.ms} ms / ${out.rebuilt} 条 · 建网 ${t1 - t0} ms）`);
+}
+
+/**
+ * ==================== 预计算低缩放显示图层：**老库自动补建** ====================
+ *
+ * 依据与实测全在 `server/displaylod.js` 的文件头那一段。这里只回答"什么时候建、怎么不卡整机"：
+ *
+ *   · **什么时候建**：库里没有这一层（或只有一部分 band）时才建；已经有且签名一致就一行不写。
+ *     放在 `paths` 阶段里（**不新增阶段**：`/api/ready` 的 stages 形状与 percent 算法一个数都不变），
+ *     于是这段期间 `/api/ready` 一直能答、`stageMessage` 显示精确进度（按 (band, 瓦片) 数是精确的，
+ *     不是按时间估的）。
+ *   · **怎么不卡整机**：切片跑，片 = 一个 (band, 瓦片)，片间 `setImmediate` 让出事件循环。
+ *     ⚠ 诚实说明：**单片就是一个真实的瓦片合并**，实测最坏一块（z14、市中心那块）1.1~2.5 s ——
+ *     做不到 population 那种 25 ms 的粒度（那是"一次同步的合并 + 一次批量取几何"的下限）。
+ *     所以：**建完一个 band 就立刻可用**（读路径按 `bands[z].done` 判），并且 `limits.displayLod
+ *     .autoBuild = false` 可以整个关掉（改成构建期用 `tools/build-display-lod.js` 烘进种子库）。
+ *   · **关掉/失败都不影响服务**：`_dlodPlan` 任何一条判据不满足就退回实时路径（画面永远是对的）。
+ */
+async function autoBuildDisplayLod() {
+  const opts = LIMITS.displayLod || {};
+  /**
+   * `ways.geom` 的回填：**默认不在启动阶段做**（`limits.wayGeom.autoBackfill = false`）。
+   * 实测真库整表回填要 50~58 秒，塞进初始化会把启动时间顶穿 —— `transit-e2e` 的 60 秒
+   * 启动预算就是这么被打破的（那台测试实例每次都要复制真库、所以每次都要回填）。
+   * 正确的做法是**构建期烘进种子库**（见 deploy/build-seed.sh 里的 tools/build-display-lod.js），
+   * 用户那边出厂就带这一列；老库想现场补就把这个键打开（后台切片跑，期间读路径自动退回两次读表）。
+   */
+  const wg = LIMITS.wayGeom || {};
+  if (wg.autoBackfill === true && db.backfillWayGeom && db._wayGeomOpts && db._wayGeomOpts().on && db._wayGeomReady === false) {
+    try {
+      const r = await db.backfillWayGeom();
+      if (r && r.done) console.log(`[geom] ways.geom 回填：${r.done} 条 way · ${r.ms} ms（之后由写路径维护）`);
+    } catch (err) { console.warn('[geom] ways.geom 回填失败（不影响服务，读路径退回两次读表）:', err.message); }
+  } else if (db._wayGeomOpts && db._wayGeomOpts().on && db._wayGeomReady === false) {
+    console.log('[geom] 库里 ways.geom 还没回填 —— 这一档仍走 way_nodes + nodes 两次读表（正确，只是慢）。'
+      + '要它生效：`node tools/build-display-lod.js --db <库>` 现场补，或把 limits.wayGeom.autoBackfill 打开。');
+  }
+  if (opts.on === false || opts.autoBuild === false) return null;
+  const t0 = Date.now();
+  try {
+    const info = db.displayLodInfo ? db.displayLodInfo() : null;
+    const want = (db._dlodOpts ? db._dlodOpts().bands : []);
+    const have = info && info.available ? Object.keys(info.bands).map(Number) : [];
+    const missing = want.filter((z) => !have.includes(z));
+    if (!missing.length && info && info.dirty === 0) {
+      if (info.available) {
+        console.log(`[dlod] 预计算低缩放显示图层已就绪：${info.rows} 行 / ${(info.bytes / 1e6).toFixed(1)} MB`
+          + ` · band ${Object.keys(info.bands).join(',')}（一行都不用建）`);
+      }
+      return info;
+    }
+    if (!missing.length && info && info.dirty > 0 && db.dlodResume) {
+      // 上次进程被杀时留下的脏瓦片：**接着算完**（否则那几块会永远走实时路径，见 dlodResume 的说明）
+      const n = db.dlodResume();
+      console.log(`[dlod] 接过上一次留下的 ${n} 块脏瓦片，后台继续重算（这几块在算完前走实时路径）`);
+      return info;
+    }
+    console.log(`[dlod] 库里${have.length ? '缺' : '没有'}预计算低缩放显示图层 → 开始切片补建`
+      + `（band ${(missing.length ? missing : want).join(',')} · ${db._dlodOpts().tiles}×${db._dlodOpts().tiles} 块）`);
+    console.log('[dlod] 期间 /api/ready 一直能答；片 = 一个 (band, 瓦片)，片间让出事件循环；'
+      + '每个 band 建完立刻生效（未建好的档走实时路径）');
+    const prog = { total: want.length * db._dlodOpts().tiles * db._dlodOpts().tiles };
+    const stats = await db.buildDisplayLodSliced({
+      bands: missing.length ? missing : want,
+      sliceMs: db._dlodOpts().sliceMs || 25,
+      log: (m) => console.log(m),
+      onProgress: (frac, info2) => setInitProgress('paths', frac,
+        `预计算低缩放显示图层 · ${Math.round(frac * 100)}%（z${info2.z} 第 ${info2.tile} 块 · 已建 ${Math.round(frac * prog.total)}/${prog.total} 块）`),
+    });
+    console.log(`[dlod] 补建完成：${stats.done} 块成功 / ${stats.failed} 块失败 · 折线 ${stats.lines} · 面 ${stats.areas}`
+      + ` · 覆盖 way ${stats.cov} · 几何 ${(stats.bytes / 1e6).toFixed(1)} MB · 用时 ${((Date.now() - t0) / 1000).toFixed(1)} s`
+      + ` · 最长一块 ${stats.maxTileMs} ms · 让出事件循环 ${stats.slices} 次`);
+    const left = db.dlodResume ? db.dlodResume() : 0;
+    if (left) console.log(`[dlod] 还有 ${left} 块脏瓦片，后台继续重算`);
+    return db.displayLodInfo();
+  } catch (err) {
+    // 建不起来不是错误：读路径会自动退回实时路径（慢，但画面是对的）
+    console.warn('[dlod] 补建失败（不影响服务：这一档继续走实时路径）:', err.message);
+    return null;
+  }
 }
 
 /**
@@ -817,6 +908,8 @@ async function initTransitWorldLazy() {
   }
   setInitStage('paths');
   const t1 = Date.now();
+  // 预计算低缩放显示图层（见 server/displaylod.js）：老库补建也放在这一段里（切片跑、进度如实回显）
+  await autoBuildDisplayLod();
   // 先预热走廊图（**切片建图**，不锁事件循环）：跨区域的线路第一次重建路径时就不用同步建图了
   const warm = await lazyWorld.warmupCorridors();
   if (warm.built) console.log(`[regions.lazy] 走廊图预热：新建 ${warm.built} 张 / 跳过 ${warm.skipped} 条线路（切片建图）`);

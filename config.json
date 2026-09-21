@@ -22,8 +22,29 @@
     "wayCandidates": 12,
     "nodeCandidates": 8,
     "relationLimit": 10000,
-    "groupMaxDepth": 8,
-    "groupMaxSteps": 500,
+    "_noteDisplayLod": "预计算低缩放显示图层（server/displaylod.js）：把 z8~z14 的 displayLines / displayAreas **离线烘**进库，低缩放拖动时不再为合并读任何 way 几何。真实北京库实测（1400×900 视口 + pad 5%，改前→改后中位）：z10 1383→174 ms · z11 1465→176 · z12 940→143 · z13 774→175 · z14 459→189（那一档原来反而更慢，现在也快了）；z15/z16 **逐字节不变**（那一档是编辑档，永远走实时路径）。构建成本：z8~z14 共 252 块 **27~37 秒 / 几何 3.3 MB**（含候选去向表与它的 R*Tree 共约 +77 MB）。**回滚：把 on 改成 false**（一行），行为与改动前逐字节相同。",
+    "displayLod": {
+      "on": true,
+      "_noteOn": "**总开关**：false = 不建、不读，完全退回改动前（tests/display-lod-test.js 对这条回滚路径有断言：7 个档与老库逐字节相同）。",
+      "autoBuild": true,
+      "_noteAutoBuild": "库里没有这一层时，服务端启动**自动补建**（切片跑，片 = 一个 (band, 瓦片)，片间让出事件循环，进度进 /api/ready 的 stageMessage）。种子库已经在构建期烘好了（deploy/build-seed.sh），所以用户那边首次启动一行都不用建。⚠ 单片就是一个真实的瓦片合并，最坏一块（z14 市中心）实测 1.1~2.9 s —— 做不到 25 ms。想完全不建：改成 false。",
+      "tiles": 6,
+      "_noteTiles": "瓦片网格边长（6×6 = 36 块，每块约 39×48 km）。**必须明显大于一屏**：一屏级切分（2×2/4×4）会因为「框边界切断接龙 + DP 不删段首尾点」让点数涨 9%~82%，还会改变样式类选择（原型实测 z13 一屏级切分时有 1.8% 的 way 掉出折线集）。6×6 实测：一条 way 压到的瓦片数中位 1、p99 1、最大 6；失效时重算最坏一块的 7 个 band 合计约 4.2 s。调细（12×12）单块重算更便宜（最坏一块 7 档 2.68 s）但折线被切得更碎、一条 way 最多压 15 块。",
+      "bands": [8, 9, 10, 11, 12, 13, 14],
+      "_noteBands": "要烘哪些档。z≤14 是客户端「只看不改」的全部档位（VIEW_ONLY_MAX_ZOOM=14）；z≥15 走实时路径且必须逐字节不变。",
+      "sliceMs": 25,
+      "_noteSliceMs": "切片构建的让出粒度（不是单片上限）：一块做完就让出事件循环，还是接着做下一块。",
+      "autoRebuild": true,
+      "_noteAutoRebuild": "编辑后要不要后台重算脏瓦片（见 server/displaylod.js 的「失效」一段）。false = 只标脏：脏瓦片永远走实时路径（慢但正确）。"
+    },
+    "_noteWayGeom": "**ways.geom（物化几何，server/osmdb.js 的 packWayGeom 那一大段）**：把每条 way 的「节点 id 序列 + 节点坐标（1e-7 量化，与 z≥15 下发精度一致）+ 哪些节点带标签」物化成一列。为什么：用户的 VPS 实测（956 MB 内存、无 swap、容器占 297 MB、CPU 24.7%）`BLOCK I/O` 读 **41.8 GB**（库一共 530 MB）—— 页缓存装不下库，每次查询都重新读盘；而 `/api/map` 在 z15 一屏要拼 2,491 条 way 的几何，走 `way_nodes`（实测 25,956 行）+ `nodes`（22,166 行）两次读表。物化之后这些行**跟着 way 行一起读**，跨表探针 0 次，**输出逐字节不变**（这一列存的就是那两张表里同样的信息，`tests/way-geom-test.js` 用 sha256 断言）。回填：老库首次启动切片做一次（每片 ≤25 ms 让出事件循环），之后由写路径（`recomputeWayGeometry` / 删节点 / 删 way）在同一处维护。**回滚：把 on 改成 false**（不建列、不回填、读写都不碰它，行为与改动前逐字节相同）。",
+    "wayGeom": {
+      "on": true,
+      "_noteOn": "**总开关**：false = 完全退回 `way_nodes + nodes` 两次读表（改动前的行为）。",
+      "autoBackfill": false,
+      "_noteAutoBackfill": "**默认关**：老库（没有这一列 / 没回填）时，服务端**不在启动阶段**回填 —— 实测真库整表回填要 **50~58 秒**，塞进初始化会把启动时间顶穿（`transit-e2e` 的 60 秒启动预算就是这么被打破的）。回填应该发生在**构建期**：`deploy/build-seed.sh` 里的 `tools/build-display-lod.js` 会顺手把这一列烘进种子库（实测整表 21.9 MB / 平均 65 B 一条），所以用户那边出厂就带。老库要现场补：`node tools/build-display-lod.js --db <库>`，或把这里改成 true（后台切片跑，期间读路径自动退回两次读表，服务不中断）。"
+    },
+    "groupMaxDepth": 8,    "groupMaxSteps": 500,
     "groupIdleMs": 5000,
     "groupTtlMs": 120000
   },

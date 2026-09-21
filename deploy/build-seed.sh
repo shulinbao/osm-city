@@ -227,6 +227,28 @@ if [ "$SKIP_BUILD" != "1" ]; then
   IMPORT_S=$(($(secs) - T_IMPORT))
   log "导入完成：$(human "$(size_of "$OUT_ABS")")，用时 ${IMPORT_S} s"
 
+  # ── 2b. 预计算低缩放显示图层（server/displaylod.js）────────────────────
+  #  为什么在**这里**烘、而不是留给用户的机器：这一层是"把 z8~z14 的 displayLines / displayAreas
+  #  离线算好"（低缩放拖动时不再为合并读任何 way 几何；实测 z10 1263→166 ms）。
+  #  构建机上烘一次约 27~29 秒、几何 3.3 MB（含"候选 way 去向表"与它的 R*Tree 共约 +77 MB），
+  #  用户那边首次启动就**一行都不用建**（服务端发现已经是最新会直接跳过）。
+  #  放在起临时服务器**之前**：这样下面那台临时实例不会又建一遍。
+  #  ⚠ 这一步失败**不是致命**：服务端启动时会自己切片补建（只是把几十秒的活留给用户机器）；
+  #    但种子库合格判据里仍然要求"这一层至少有一行"，否则"构建期烘好"这件事就名存实亡了。
+  T_DLOD=$(secs)
+  log "── [3b/6] 预计算低缩放显示图层（display_lod）──────────────────────"
+  log "把 z8~z14 的合并折线/面离线烘进种子库（预计 27~29 s、几何约 3.3 MB）"
+  mkdir -p "$WORK"
+  if (cd "$ROOT" && node --max-old-space-size=6144 tools/build-display-lod.js --db "$OUT_ABS" --report "$WORK/dlod.json"); then
+    DLOD_S=$(($(secs) - T_DLOD))
+    log "预计算层完成，用时 ${DLOD_S} s（详情见上面 tools/build-display-lod.js 的逐档输出）"
+  else
+    DLOD_S=$(($(secs) - T_DLOD))
+    log "⚠ 预计算层这一步失败了（用时 ${DLOD_S} s）—— **不是致命**：服务端启动时会自己切片补建，"
+    log "  只是把「要到的那几十秒」留给用户机器。要看原因请重跑："
+    log "  node tools/build-display-lod.js --db $OUT_ABS"
+  fi
+
   # ── 3. 起临时服务器：迁移 + LOD 回填 + 人口网格全量推算 + 索引 ───────
   #  这一步是本脚本的**重点**：这些活正是 1 GB VPS 上干不动、会把整机卡死的那些。
   #
@@ -457,6 +479,14 @@ const out = {
     populationCells: pop.rows ?? null,
     populationCellsUsed: pop.used ?? null,
     populationSources: num('SELECT COUNT(*) AS c FROM population_sources'),
+    displayLodRows: num('SELECT COUNT(*) AS c FROM display_lod'),
+    displayLodCov: num('SELECT COUNT(*) AS c FROM display_lod_cov'),
+    displayLodGeomBytes: (() => { const r = one('SELECT SUM(LENGTH(geom)) AS c FROM display_lod'); return r && typeof r.c === 'number' ? r.c : null; })(),
+    displayLodBands: (() => {
+      const r = one("SELECT v FROM display_lod_meta WHERE k = 'state'");
+      if (!r || !r.v) return null;
+      try { const s = JSON.parse(r.v); return Object.keys(s.bands || {}).map(Number).sort((a, b) => a - b); } catch { return null; }
+    })(),
   },
   population: { pop: pop.pop ?? null, jobs: pop.jobs ?? null },
   populationBuild: {
@@ -504,6 +534,10 @@ console.log("[seed] LOD 回填：ways.lod_zoom 非空 " + c.waysWithLodZoom + " 
 console.log("[seed] 人口网格：population_cells " + c.populationCells + " 行（非空 " + c.populationCellsUsed + "）"
   + " · 合计 " + Math.round(j.population.pop||0) + " 人 / " + Math.round(j.population.jobs||0) + " 个岗位"
   + " · population_sources " + c.populationSources + " 行");
+console.log("[seed] 预计算低缩放显示图层：display_lod " + (c.displayLodRows ?? "(无)") + " 行"
+  + "（几何 " + (c.displayLodGeomBytes == null ? "?" : (c.displayLodGeomBytes/1e6).toFixed(1)) + " MB）"
+  + " · 去向 display_lod_cov " + (c.displayLodCov ?? "(无)") + " 行"
+  + " · band " + (c.displayLodBands ? c.displayLodBands.join(",") : "(无)"));
 console.log("[seed] meta.population_model = " + (j.meta.population_model ?? "(未设置)") + " · 索引 " + j.indexes.length + " 个（含 idx_ways_lod_zoom: " + j.indexes.includes("idx_ways_lod_zoom") + "）");
 const pb = j.populationBuild;
 console.log("[seed] 人口网格断点：done=" + pb.done + "（complete=" + pb.complete + "）· processed=" + pb.processed + "/" + pb.total
@@ -527,8 +561,10 @@ if (!pb.complete) bad.push("人口网格没算完：population_build_state.done=
 if (!(pb.processed >= pb.total)) bad.push("人口网格的进度对不上：processed=" + pb.processed + " < total=" + pb.total);
 if (pb.ways === 0) bad.push("一条有贡献的地块都没有（population_build_state.ways=0）");
 if (!j.indexes.includes("idx_ways_lod_zoom")) bad.push("缺部分索引 idx_ways_lod_zoom");
+if (!c.displayLodRows) bad.push("预计算低缩放显示图层是空的（display_lod 一行都没有；构建期那一步没跑成？见 [3b/6]）");
+if (!c.displayLodCov) bad.push("预计算层的候选去向表是空的（display_lod_cov 一行都没有）");
 if (bad.length) { console.error("[seed] ❌ 种子库不合格：" + bad.join("；")); process.exit(5); }
-console.log("[seed] ✅ 种子库合格：迁移/LOD 回填/人口网格（done=1）/索引都在里面了");
+console.log("[seed] ✅ 种子库合格：迁移/LOD 回填/人口网格（done=1）/预计算低缩放显示图层/索引都在里面了");
 ' "$WORK/inspect.json" || { SEED_EXIT=5; die "种子库没通过合格判据（见上）"; }
 
 # ── 报告 JSON（含生成参数，便于追溯"这份快照是哪天、哪个数据集做的"）──────

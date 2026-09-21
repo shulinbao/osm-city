@@ -113,18 +113,23 @@ jobs:
               + " · population_sources=" + c.populationSources + " 行 · meta.population_model=" + rep.verify.meta.population_model);
             console.log("人口网格断点：done=" + rep.verify.populationBuild.done
               + " · processed=" + rep.verify.populationBuild.processed + "/" + rep.verify.populationBuild.total);
+            console.log("预计算低缩放显示图层：display_lod=" + c.displayLodRows + " 行"
+              + "（几何 " + (c.displayLodGeomBytes == null ? "?" : (c.displayLodGeomBytes / 1e6).toFixed(1)) + " MB）"
+              + " · display_lod_cov=" + c.displayLodCov + " 行 · band " + (c.displayLodBands || []).join(","));
             const bad = [];
             if (!c.nodes || c.nodes < 1000) bad.push("nodes=" + c.nodes);
             if (!c.populationCells) bad.push("population_cells 是空的（人口网格没算）");
             if (!c.waysWithLodZoom) bad.push("ways.lod_zoom 一行都没回填");
             if (!rep.verify.indexes.includes("idx_ways_lod_zoom")) bad.push("缺部分索引 idx_ways_lod_zoom");
+            if (!c.displayLodRows) bad.push("预计算低缩放显示图层是空的（display_lod 一行都没有）");
+            if (!c.displayLodCov) bad.push("预计算层的候选去向表是空的（display_lod_cov 一行都没有）");
             if (rep.seed.bytes < 20971520) bad.push("库只有 " + rep.seed.bytes + " 字节，太小了");
             if (!(rep.verify.populationBuild.processed >= rep.verify.populationBuild.total)) {
               bad.push("人口网格进度对不上：processed=" + rep.verify.populationBuild.processed
                 + " < total=" + rep.verify.populationBuild.total);
             }
             if (bad.length) { console.error("种子库不合格：" + bad.join("；")); process.exit(1); }
-            console.log("✅ 种子库合格：迁移/LOD 回填/人口网格（done=1）/索引都在里面");
+            console.log("✅ 种子库合格：迁移/LOD 回填/人口网格（done=1）/预计算低缩放显示图层/索引都在里面");
           '
 
       # GHCR 的镜像名**必须全小写**，而 github.repository 会保留仓库原本的大小写

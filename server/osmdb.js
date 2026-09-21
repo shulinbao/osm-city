@@ -6,11 +6,19 @@
  * 元素采用"软删除"（deleted=1）以便历史和回滚，视口查询会过滤掉。
  */
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const {
   openDatabase, getMeta, setMeta, IdAllocator,
   backfillWayLod, ensureLodIndexes, WAY_LOD_INDEX, NODE_POI_INDEX, NODE_POI_LOW_PREDICATE,
 } = require('./dbschema');
+/**
+ * 预计算低缩放显示图层（见 server/displaylod.js 的文件头那一段）。
+ * 这里只用它的**纯函数**（瓦片网格 / 裁剪 / 稳定 id / 签名 / 表名与建表 SQL）——
+ * 几何 blob 的编解码留在本文件（`packLodPaths` / `unpackLodPaths`），因为它要复用
+ * 上面「紧凑载荷」那套量化 + 差分编码（`packPathFlat`），**不另发明一套**。
+ */
+const DLOD = require('./displaylod');
 
 /**
  * ==================== 只读打开（分片库专用，见 server/regions.js） ====================
@@ -825,6 +833,63 @@ function coalesceOptsOf(raw) {
   return o;
 }
 /**
+ * ==================== 预计算低缩放显示图层的开关（见 server/displaylod.js） ====================
+ *
+ *   on           **总开关，默认 true**：`false` 就是那一行回滚 —— 不建、不读、行为退回改动前
+ *                （`tests/display-lod-test.js` 对这个回滚路径有覆盖）。
+ *   tiles        瓦片网格边长（默认 6×6 = 36 块）。实测（logs/pc-invalidate.txt / -t12）：
+ *                6×6 每块 0.46°×0.43°（约 39×48 km），一条 way 压到的瓦片数中位 1、p99 1、最大 6；
+ *                12×12 单块重算便宜一半（最坏一块 7 个档 2.7 s vs 4.2 s），但跨瓦片重复几何更多。
+ *                取 6×6：重算最坏一块 7 个 band 合计 4.2 s，而**一次编辑通常只脏 1 块、只脏一个档**。
+ *   bands        要烘哪些档。默认 z8~z14（= 客户端"只看不改"的全部档位，z15 起走实时路径且必须逐字节不变）。
+ *   sliceMs      **切片构建的让出粒度**（不是"单片上限"）：片 = 一个 (band, 瓦片)，
+ *                而单片就是一个真实的瓦片合并 —— 实测最坏一块（z14）1.1~1.9 s，
+ *                做不到 25 ms，所以这里只用来决定"一块做完就让出、还是接着做下一块"。
+ *   autoRebuild  编辑后要不要后台重算脏瓦片（`false` = 只标脏、永远走实时路径）。
+ */
+/**
+ * **ways.geom（物化几何）的开关**（见 `packWayGeom` 上面那一大段）：默认**开**。
+ * `on: false` 是一行回滚：不建列、不回填、读写都不碰它 —— 读路径仍旧走 `way_nodes + nodes`
+ * 两次读表（行为与改动前逐字节相同）。
+ */
+function wayGeomOptsOf(raw) {
+  const o = { on: true, autoBackfill: false };
+  if (raw === false) { o.on = false; return o; }
+  if (raw && typeof raw === 'object') {
+    if (raw.on === false) o.on = false;
+    if (raw.autoBackfill === true) o.autoBackfill = true;
+  }
+  return o;
+}
+const DISPLAY_LOD_DEFAULTS = {  on: true,
+  tiles: 6,
+  bands: [8, 9, 10, 11, 12, 13, 14],
+  sliceMs: 25,
+  autoRebuild: true,
+};
+function displayLodOptsOf(raw) {
+  const o = Object.assign({}, DISPLAY_LOD_DEFAULTS);
+  if (raw === false) { o.on = false; return o; }
+  if (raw && typeof raw === 'object') {
+    if (raw.on === false) o.on = false;
+    const t = Math.floor(Number(raw.tiles));
+    if (Number.isFinite(t) && t >= 1 && t <= 40) o.tiles = t;
+    const s = Math.floor(Number(raw.sliceMs));
+    if (Number.isFinite(s) && s >= 1) o.sliceMs = s;
+    if (raw.autoRebuild === false) o.autoRebuild = false;
+    if (Array.isArray(raw.bands) && raw.bands.length) {
+      const b = raw.bands.map((x) => Math.floor(Number(x))).filter((x) => Number.isFinite(x) && x >= 0 && x <= 22);
+      if (b.length) o.bands = [...new Set(b)].sort((x, y) => x - y);
+    }
+    // 烘焙用的查询参数：与 server/index.js 的 /api/map 同一组（不给就用库里的默认口径）。
+    // `raw.limits` = 整个 config.limits —— server/index.js 传的是
+    // `Object.assign({}, LIMITS.displayLod, { limits: LIMITS })`，于是它经 openRegionDB 时
+    // 不需要多转发一个字段（分区开关那一层只认它显式列出的那几个选项）。
+    o.opts = (raw.limits && typeof raw.limits === 'object') ? raw.limits : raw;
+  }
+  return o;
+}
+/**
  * 一条 way 的**样式类**（画法的等价类）。返回 null = 不参与合并（交给"逐条下发"那条路）。
  * 键里带精确 tag 值的原因见上面第 2 条；面状值（natural=water 等）直接返回 null（它们是填充几何）。
  */
@@ -870,6 +935,51 @@ function coalesceAlways(cls) {
   if (cls === 'natural=coastline') return true;
   if (cls.startsWith('boundary@')) return true;
   return false;
+}
+/**
+ * **"这一档把哪些样式类合并成折线"的规则（唯一真值）**：`_coalesce` 与预计算层都调它。
+ *
+ * 规则：`coalesceAlways(cls) || 条数 ≥ minClassWays` 先选中；若"剩下的逐条 way"仍超过预算
+ * （`limit × budget`），再按条数从大到小继续收，直到落进预算。
+ *
+ * `opts.forceClasses`（预计算层用）：给了一个类名集合时**只用这个集合**，阈值/预算/排序一概不参与。
+ * 为什么预计算层必须这么做（原型实测，也是原型点名的那条）：合并是**按瓦片**分别跑的，
+ * 而"条数 ≥ 200"是**按这一批候选**数的 —— 于是**瓦片越小、能选中的类越少**，
+ * 本该被合并的 way 会被挤出去、变成逐条下发（z13 实测：按瓦片选类时 `coalesced` 比实时少 2.8%，
+ * 217 条 way 掉了出去）。所以烘焙时**先在整个数据范围上把类定一次**（`surveyClasses` 探针），
+ * 再把这个集合烘进每一块瓦片。
+ */
+function chooseCoalesceClasses(byClass, pickedCount, opts, limit) {
+  const ranked = [...byClass.entries()].sort((a, b) => b[1].length - a[1].length);
+  const forced = opts && opts.forceClasses instanceof Set ? opts.forceClasses : null;
+  const chosen = new Set();
+  for (const [cls, list] of ranked) {
+    if (forced) { if (forced.has(cls)) chosen.add(cls); continue; }
+    if (coalesceAlways(cls) || list.length >= opts.minClassWays) chosen.add(cls);
+  }
+  const budget = Math.max(1, Math.floor(limit * opts.budget));
+  let coalescedCount = 0;
+  for (const cls of chosen) coalescedCount += byClass.get(cls).length;
+  if (!forced && pickedCount - coalescedCount > budget) {
+    for (const [cls, list] of ranked) {
+      if (pickedCount - coalescedCount <= budget) break;
+      if (chosen.has(cls)) continue;
+      chosen.add(cls);
+      coalescedCount += list.length;
+    }
+  }
+  void forced;
+  return {
+    chosen,
+    chosenList: ranked.filter(([cls]) => chosen.has(cls)).map(([cls]) => cls),
+    budget,
+    coalescedCount,
+    remainingWays: pickedCount - coalescedCount,
+    classes: ranked.map(([cls, list]) => ({
+      class: cls, family: coalesceFamilyOf(cls), ways: list.length,
+      coalesced: chosen.has(cls) ? 1 : 0, always: coalesceAlways(cls) ? 1 : 0,
+    })),
+  };
 }
 /** 分组键：同组 = 同一条样式规则 + 同名字 + 同 bridge/tunnel/layer（+surface，路面材质会改颜色） */
 function coalesceGroupKeyOf(cls, tags) {
@@ -1133,6 +1243,179 @@ function packPathFlat(coords, scale) {
   }
   return out;
 }
+
+/**
+ * ==================== 预计算层的几何 blob ====================
+ *
+ * **复用上面这一套"量化到 1/scale + 段内差分"的紧凑编码**（`packPathFlat`），只是把整数数组
+ * 再用 BIN v1 那套 `zigzag + uvarint` 落成 BLOB：
+ *
+ * ```
+ * uvarint segCount
+ * segCount × { uvarint ptCount, ptCount × 2 × svarint(delta) }
+ * ```
+ *
+ * 为什么可以直接复用：`packPathFlat(coords, scale)` 的第一个值是**绝对值**、之后是差分，
+ * 而 `svarint` 对"小的负数"只占 1 字节 —— 与载荷里 `displayLines[i].coords` 装的东西**逐整数相同**。
+ * 于是"库里存的坐标"与"下发的坐标"是同一个量化口径（scale = 10^coordDigits，默认 1e5 ≈ 1.1 m），
+ * 解码 → 打包这条往返是**无损**的（`Math.round(x*scale)/scale` 再乘回 scale 还是同一个整数）。
+ *
+ * 实测体积（真实北京库 z8~z14 全量 36 块）：折线 + 面几何一共 12.5 MB。
+ * 段之间**差分复位**（每段首点绝对值）—— 与载荷的 `paths` 编码完全一致，理由也一样：
+ * 一个分组里接不到一起的几段之间可能隔着几十公里，不复位就白花字节。
+ */
+function packLodPaths(paths, scale) {
+  const parts = [];
+  for (const p of paths) parts.push(packPathFlat(p, scale));
+  let size = 8;
+  for (const f of parts) size += 5 + f.length * 3;
+  const bw = new ByteWriter(size);
+  bw.uvarint(parts.length);
+  for (const f of parts) {
+    bw.uvarint(f.length >> 1);
+    for (let i = 0; i < f.length; i++) bw.svarint(f[i]);
+  }
+  return Buffer.from(bw.view());
+}
+
+/** `packLodPaths` 的逆：BLOB → [[ [lat,lon], … ], …]（与 `packPathFlat` 的 scale 必须一致） */
+function unpackLodPaths(buf, scale) {
+  let o = 0;
+  const rd = () => {
+    let x = 0; let s = 1; let b;
+    do { b = buf[o]; o += 1; x += (b & 0x7f) * s; s *= 128; } while (b & 0x80);
+    return x;
+  };
+  const unzig = (v) => (v % 2 === 1 ? -(v + 1) / 2 : v / 2);
+  const segCount = rd();
+  const out = new Array(segCount);
+  for (let s = 0; s < segCount; s++) {
+    const n = rd();
+    const p = new Array(n);
+    let pla = 0; let plo = 0;
+    for (let i = 0; i < n; i++) {
+      const dLa = unzig(rd()); const dLo = unzig(rd());
+      pla += dLa; plo += dLo;
+      p[i] = [pla / scale, plo / scale];
+    }
+    out[s] = p;
+  }
+  return out;
+}
+
+/** 一个显示条目（displayLines / displayAreas 的那一种）的**所有路径**：coords 是第一段，paths 是其余段 */
+function pathsOfEntry(entry) {
+  const out = [];
+  if (entry.coords) out.push(entry.coords);
+  if (entry.paths) for (const p of entry.paths) out.push(p);
+  return out.filter((p) => Array.isArray(p) && p.length);
+}
+
+/* ==================================================================================
+ * ==================== ways.geom：把每条 way 的几何物化成一列 ====================
+ * ==================================================================================
+ * ## 为什么（用户的 VPS 实测把这一条顶到了同等优先级）
+ *
+ * 用户的机器：**956 MB 内存、无 swap**，容器占 297 MB、CPU 24.7%，而 `BLOCK I/O` 读 **41.8 GB**
+ * （库一共 530 MB）—— 页缓存装不下库，每次查询都重新读盘。他日常在 **z15** 拖动，而低缩放
+ * 预计算层只覆盖 z ≤ 14，救不了日常体验。
+ *
+ * `/api/map` 在 z15 一屏要取 2,491 条 way 的几何，走两次读表：
+ *   `wayNodesBatch`（`way_nodes`，实测 **25,956 行**）+ `_fetchNodes`（`nodes`，实测 **22,166 行**，
+ *   而 `nodes` 行里还带着大字段 `tags`）—— 在磁盘瓶颈的机器上就是几十 MB 的随机读。
+ *
+ * 物化成 `ways.geom` 之后：这些行**跟着 way 行一起读**（way 行本来就要读），
+ * 两次跨表探针变成 0 次。**输出逐字节不变**：这一列存的正是那两张表里同样的信息。
+ *
+ * ## 格式（**复用本文件已有的紧凑量化编码**：`uvarint` + `svarint` = BIN v1 那一套）
+ *
+ * ```
+ * u8      version = 1                     （将来换格式时读路径按它退避）
+ * uvarint n                               节点 id 个数（= 这条 way 的 way_nodes 行数）
+ * n ×     svarint                          id 增量（首值绝对）
+ * uvarint m                               有坐标的节点个数（m ≤ n：被软删的节点只有 id、没有坐标）
+ * m ×     { uvarint (idxDelta << 1 | hasTags); svarint dLat; svarint dLon }
+ *                                          坐标量化到 1e-7°（与 z ≥ 15 下发精度**完全一致**，
+ *                                          所以"从这一列读"与"从 nodes 表读"给的是同一个 double）
+ *                                          hasTags = 该节点 `tags IS NOT NULL AND tags <> ''`
+ *                                          （**必须记**：下发的 nodeTags 有一部分来自几何顶点，
+ *                                           不记就得把 nodes 表重新读一遍，这一列就白做了）
+ * ```
+ *
+ * ## 谁写它（**唯一写入者**，与 `way_nodes` 同一个真值来源）
+ *
+ * `_wayGeomWrite()`：由 `recomputeWayGeometry()`（几何/标签变了的唯一收口）与
+ * `_wayGeomRefreshForNode()`（删节点）调用。**`way_nodes` 仍然是唯一真值**，这一列是它的物化缓存 ——
+ * 所以不存在"两套几何来源"，只有一份真值 + 一份同事务里重写的缓存。
+ * 移动节点：`updateNode` → `recomputeWayGeometry` → 重写 ✓
+ * 删节点：`markNodeDeleted` → `idx_way_nodes_node` 找出含它的 way → `_wayGeomRefreshForNode` ✓
+ * 改/删 way：`recomputeWayGeometry` / `markWayDeleted` ✓
+ */
+const WAY_GEOM_VERSION = 1;
+const WAY_GEOM_QSCALE = 1e7;      // 与 z ≥ 15 的下发精度一致（1e-7°）
+
+/** 节点 id 序列 + 坐标 → `ways.geom` 的 BLOB */
+function packWayGeom(ids, coords, hasTags) {
+  let size = 16;
+  for (let i = 0; i < ids.length; i++) size += 5;
+  for (let i = 0; i < ids.length; i++) if (coords[i]) size += 16;
+  const bw = new ByteWriter(size);
+  bw.u8(WAY_GEOM_VERSION);
+  bw.uvarint(ids.length);
+  let prev = 0;
+  for (let i = 0; i < ids.length; i++) { bw.svarint(ids[i] - prev); prev = ids[i]; }
+  let m = 0;
+  for (let i = 0; i < ids.length; i++) if (coords[i]) m += 1;
+  bw.uvarint(m);
+  let lastIdx = 0;
+  let plat = 0; let plon = 0;
+  for (let i = 0; i < ids.length; i++) {
+    const c = coords[i];
+    if (!c) continue;
+    const la = Math.round(c[0] * WAY_GEOM_QSCALE);
+    const lo = Math.round(c[1] * WAY_GEOM_QSCALE);
+    bw.uvarint(((i - lastIdx) << 1) | (hasTags && hasTags[i] ? 1 : 0));
+    bw.svarint(la - plat);
+    bw.svarint(lo - plon);
+    lastIdx = i; plat = la; plon = lo;
+  }
+  return Buffer.from(bw.view());
+}
+
+/**
+ * `packWayGeom` 的逆：→ `{ ids, coords, hasTags }`
+ *   ids     节点 id 数组（**与 `wayNodesBatch` 的返回逐项相同**）
+ *   coords  与 ids **同下标对齐**：`coords[i] = [lat, lon] | null`
+ *   hasTags 与 ids 同下标：`1` = 那个节点带标签（下发的 nodeTags 可能要从它来）
+ */
+function unpackWayGeom(buf) {
+  let o = 0;
+  const rd = () => {
+    let x = 0; let s = 1; let b;
+    do { b = buf[o]; o += 1; x += (b & 0x7f) * s; s *= 128; } while (b & 0x80);
+    return x;
+  };
+  const unzig = (v) => (v % 2 === 1 ? -(v + 1) / 2 : v / 2);
+  const ver = buf[o]; o += 1;
+  if (ver !== WAY_GEOM_VERSION) return null;      // 将来换格式：读路径退回 way_nodes/nodes
+  const n = rd();
+  const ids = new Array(n);
+  let prev = 0;
+  for (let i = 0; i < n; i++) { prev += unzig(rd()); ids[i] = prev; }
+  const coords = new Array(n).fill(null);
+  const hasTags = new Uint8Array(n);
+  const m = rd();
+  let idx = 0; let plat = 0; let plon = 0;
+  for (let k = 0; k < m; k++) {
+    const v = rd();
+    idx += v >> 1;
+    hasTags[idx] = v & 1;
+    plat += unzig(rd()); plon += unzig(rd());
+    coords[idx] = [plat / WAY_GEOM_QSCALE, plon / WAY_GEOM_QSCALE];
+  }
+  return { ids, coords, hasTags };
+}
+
 /**
  * ==================== ② displayLines / displayAreas 的"摊平"编码 ====================
  * **纯属编码，不碰语义**。
@@ -1858,6 +2141,31 @@ class OsmDB {
     const poiMax = Number(options.nodePoiIndexMaxZoom);
     this._nodePoiMaxZoom = Number.isFinite(poiMax) ? Math.max(0, Math.min(22, Math.floor(poiMax))) : NODE_POI_INDEX_MAX_ZOOM;
     this._nodePoiReady = this._hasIndex(NODE_POI_INDEX);
+    /**
+     * 预计算低缩放显示图层（见 server/displaylod.js 的文件头）：
+     *   `_dlod`       生效参数（`limits.displayLod`；默认开）
+     *   `_dlodDirty`  脏瓦片（内存 + 库里的 display_lod_dirty，跨重启保留）
+     *   `_dlodOff`    这一次 queryBbox 调用**强制走实时路径**（烘焙时用：否则烘出来的就是上一版结果）
+     * ⚠ 这一层**只在读路径生效**，而且构造时不写库：`autoBuild` 由 server/index.js 驱动
+     *   （见 index.js 的初始化段），`tools/build-display-lod.js` 是显式入口。
+     *   所以"直接 new OsmDB()"的工具/测试在没有这一层的库上，行为与改动前逐字节相同。
+     */
+    this._dlod = displayLodOptsOf(options.displayLod);
+    this._dlod.log = typeof options.displayLodLog === 'function' ? options.displayLodLog : null;
+    this._dlodStateCache = undefined;
+    this._dlodExtentStale = false;
+    this._dlodDirty = new Map();
+    this._dlodBgRunning = false;
+    this._dlodOff = false;
+    /**
+     * **ways.geom（物化几何，见 `packWayGeom` 上面那一段）**：默认开，`limits.wayGeom.on = false`
+     * 是回滚键。构造时只建列 + 抽查，真正的回填由 `server/index.js` 的启动阶段切片跑
+     * （`backfillWayGeom()`），期间读路径对"还没有这一列的 way"自动退回 `way_nodes + nodes`。
+     */
+    this._wayGeom = wayGeomOptsOf(options.wayGeom);
+    this._wayGeomReady = false;
+    this._ensureWayGeom();
+    if (this._dlod.on && !this.readOnly) this._dlodLoadDirty();
     this._ensureViewportIndexes();
     this._prepare();
   }
@@ -2206,7 +2514,7 @@ class OsmDB {
    *   truncation.crop / truncation.kinds.relations 与 payload 的 relations[id][3] 里。
    *   裁剪**不影响** complete：被裁掉的成员全部在裁剪框之外，请求框内的成员一条不少。
    */
-  queryBbox({ minLon, minLat, maxLon, maxLat, zoom = 16, limit = 12000, wayCandidates, nodeCandidates, relationLimit, relationCropPad, relationCropMinMembers, relationCropBoundaryMembers, detail, lodDetail, minFillArea, lodMinFillArea, roadSend, lodRoadSend, roadClassFloor, lodRoadClassFloor, neverSend, lodNeverSend, coalesce, lodCoalesce, compact, view, flatCaps }) {
+  queryBbox({ minLon, minLat, maxLon, maxLat, zoom = 16, limit = 12000, wayCandidates, nodeCandidates, relationLimit, relationCropPad, relationCropMinMembers, relationCropBoundaryMembers, detail, lodDetail, minFillArea, lodMinFillArea, roadSend, lodRoadSend, roadClassFloor, lodRoadClassFloor, neverSend, lodNeverSend, coalesce, lodCoalesce, compact, view, flatCaps, _dlodOff }) {
     const st = this._st;
     const caps = {
       viewportLimit: Math.max(1, Math.floor(Number(limit)) || QUERY_CAPS.viewportLimit),
@@ -2252,6 +2560,19 @@ class OsmDB {
     const viewOnly = viewArg === null
       ? (coalescing && lod.detail >= VIEW_ONLY_MIN_DETAIL)
       : (viewArg && coalesceOpts.minZoom > 0 && zoom < coalesceOpts.minZoom);
+    /**
+     * **预计算低缩放显示图层**（见 server/displaylod.js 的文件头那一段）。
+     *
+     * `dlod` 非空 = 这次请求的 displayLines / displayAreas **直接从库里读**，
+     * `_coalesce` / `_coalesceAreas` 不再跑、也不再为合并部分取任何 way 几何；
+     * 那本 `truncation` 账改由预计算的**去向表**（display_lod_cov）如实重建。
+     *
+     * 只有当"客户端要的正好是这一层烘出来的东西"才对得上：合并生效、走的是视图载荷、
+     * 而且 LOD / 合并参数与签名完全一致；任何一条不满足都**退回实时路径**（画面永远是对的）。
+     */
+    const dlodPlan = (viewOnly && !_dlodOff && !this._dlodOff)
+      ? this._dlodPlan(zoom, { minLon, minLat, maxLon, maxLat }, lod, coalesceOpts, limit, caps.viewportLimit)
+      : null;
     /** 紧凑载荷（见文件开头「紧凑载荷」一段）：坐标量化 + 列式/delta 编码，语义不变 */
     const pack = packOptsOf(compact);
     /**
@@ -2309,7 +2630,25 @@ class OsmDB {
     // （唯一差别：被删掉的 way 不再当候选 —— 老路径里它们本来就一律被 accept() 丢掉）。
     const wayPlan = this._wayScanPlan(zoom, lod.floor);
     const wayArgs = wayPlan ? [zoom, ...args] : args;
-    const wayScan = this._scanCandidates({
+    /**
+     * **走预计算路径时这里一行 way 都不扫**：
+     * `display_lod_cov` 已经是"这块瓦片里每个候选 way 去了哪"的完整答案（见 `_dlodReadCov`），
+     * 而它逐条对齐实时路径的账（candidates / visible / coalesced / lodFiltered / dropped）。
+     * 实测这一步值多少：真实数据集 z10 扫 2.36 万行 **168 ms**、z12 2.06 万行 **214 ms**、
+     * z13 1.68 万行 **206 ms**（`logs/pc-floor.txt`）—— 走预计算路径时省掉的就是这一块，
+     * 也是"能不能压到 200 ms 以内"的关键一块。账本改成由去向表重建（见下面 `dlodCov` 的用法）。
+     */
+    const dlodCov = dlodPlan ? this._dlodReadCov(dlodPlan, { minLon, minLat, maxLon, maxLat }) : null;
+    const wayScan = dlodCov
+      ? {
+        values: [],
+        candidates: dlodCov.candidates,
+        visible: dlodCov.visible,
+        capped: false, scannedAll: true, unscanned: 0, stopReason: 'exhausted',
+        pickLimit: coalescing ? wayScanCap : caps.viewportLimit, scanCap: wayScanCap,
+        precomputed: true,
+      }
+      : this._scanCandidates({
       sql: wayPlan
         ? `SELECT w.id, w.tags, w.version, w.node_count, w.closed, w.deleted,
           w.min_lon AS bb_min_lon, w.max_lon AS bb_max_lon, w.min_lat AS bb_min_lat, w.max_lat AS bb_max_lat
@@ -2367,10 +2706,40 @@ class OsmDB {
         return { row: w, tags };
       },
     });
+    /**
+     * 预计算路径下 LOD 那本账由**去向表**重建（每个候选 way 的去向连同被扣下的类别都烘在里面了，
+     * 见 `_dlodCovRowsOf`）。口径与实时路径的 accept() 逐项对齐：`lodFiltered` 按类、
+     * `roadsWithheldByClass` 按等级、`neverSend` 按类、两个"恒为 0"的独立核账也在。
+     */
+    if (dlodCov) {
+      lodWithheldTotal = dlodCov.lodWithheldTotal;
+      for (const k of Object.keys(dlodCov.lodBy)) lodWithheld[k] = dlodCov.lodBy[k];
+      lodTrunkRoadsWithheld = dlodCov.trunkWithheld;
+      lodMinorRoadsWithheld = Math.max(0, (dlodCov.lodBy.roadClass || 0) - dlodCov.trunkWithheld);
+      lodMinorRailWithheld = dlodCov.minorRailWithheld;
+      lodRailWaterWithheld = dlodCov.railWaterWithheld;
+      lodLanduseWithheld = dlodCov.landuseWithheld;
+      for (const k of Object.keys(dlodCov.roadsByRank)) roadsByRank[k] = dlodCov.roadsByRank[k];
+      let neverWays = 0;
+      for (const k of Object.keys(dlodCov.neverSendWays)) {
+        neverSendLedger.ways[k] = (neverSendLedger.ways[k] || 0) + dlodCov.neverSendWays[k];
+        neverWays += dlodCov.neverSendWays[k];
+      }
+      neverSendLedger.total += neverWays;
+    }
 
     const ways = {};
     const nodeIds = new Set();
-    const picked = wayScan.values;
+    let picked = wayScan.values;
+    /**
+     * 预计算路径下"逐条下发"的那些 way（去向 = `way`）：按 id 把真行取回来 ——
+     * 实测 z10~z13 这一档是 **0 条**（可见的 way 全部进了折线/面），z14 约 200 条。
+     * 取行与几何的代码与实时路径**完全相同**（`_wayRowsByIds` + 下面那个循环 + `wayNodesBatch`），
+     * 所以这一小撮 way 的输出逐字段一致。
+     */
+    if (dlodCov && dlodCov.sentWay.size) {
+      picked = this._wayRowsByIds([...dlodCov.sentWay].sort((a, b) => a - b));
+    }
     /**
      * **候选顺序确定性**（只在低缩放合并生效时做）：
      * displayLines 的接龙 + 简化是**贪心**的（从度为 1 的端点起头，按输入顺序接），
@@ -2385,8 +2754,10 @@ class OsmDB {
      * （以前读的是 ways 字典的键，但几何要等合并计划定下来才知道谁进 ways，
      *  所以改成"凡是被挑出来的就算已下发" —— 语义一致：不会重复下发同一条 way）。
      */
-    const pickedIds = new Set(picked.map((p) => p.row.id));
-    let noGeometry = 0;
+    const pickedIds = dlodCov
+      ? dlodCov.pickedIds
+      : new Set(picked.map((p) => p.row.id));
+    let noGeometry = dlodCov ? dlodCov.noGfx.size : 0;
     let returnedWays = 0;
 
     // ---------- 2. 视口内带标签的独立节点（POI）----------
@@ -2686,15 +3057,12 @@ class OsmDB {
      */
     const geom = picked.length ? this.wayNodesBatch(picked.map((p) => p.row.id)) : new Map();
     /**
-     * 【低缩放视图载荷】非"面关系"的成员 way 也一起参与合并 —— 它们本来就是按**线**画的
-     * （boundary 是虚线、route 成员是路径），合并掉的成员几何在 displayLines 里一条都没少。
-     * 所以这里在定合并计划**之前**把成员 way 的行取出来（几何仍然只取一次，见下面的 coalesceGeom）。
-     * 面关系的成员走另一条路（服务端接龙成环 → displayAreas），不在这里。
-     */
-    /**
      * **永不下载的类别**（树 / 自行车道）在成员路径上也要挡掉（见文件开头那一段）：
      * 不然一条 cycleway / tree_row 只要挂进某个关系就绕过了 way 扫描那道筛子。
      * 挡掉的是"几何一条不给"：既不下发、也不参与折线与面合并；单独记在 memberWaysNeverSent。
+     *
+     * 这一段（取成员行 + 三个账）**两条路都要**：预计算路径不再需要成员的几何，
+     * 但"成员去哪了"的账（toFetch / fetched / missing / neverSent）必须照样如实。
      */
     const keepMemberRows = (rows) => {
       if (!lod.neverSendOn) return rows;
@@ -2712,6 +3080,75 @@ class OsmDB {
     ledger.memberWaysFetched = memberRowsRaw.length;       // 真的取到的（被删掉 / 不在数据集里的成员取不到）
     ledger.memberWaysMissing = Math.max(0, memberWayIds.size - memberRowsRaw.length);
     /**
+     * ==================== 预计算路径：读预计算层代替"当场合并" ====================
+     *
+     * 走这条路时 `_coalesce` / `_coalesceAreas` **一次都不跑**，也**不为合并部分取任何 way 几何**
+     * （那正是原来那 145 ms 取 way 几何 + 453 ms 取 10 万个节点坐标的来源）。
+     * `geom` 上面已经取过 —— 它是"逐条下发的那几条 way"的几何，数量极小（z10~z13 实测 0 条）。
+     */
+    let coalescePlan = null;
+    let areasPlan = null;
+    if (dlodPlan) {
+      const rd = this._dlodRead(dlodPlan, { minLon, minLat, maxLon, maxLat });
+      const cov = dlodCov;
+      const lineStats = rd.stats;
+      coalescePlan = {
+        active: true,
+        lines: rd.lines,
+        coalesced: cov.coveredLine,
+        nodeIds: [],
+        coords: null,
+        groupKeys: [], groupCls: [], groupWays: [], groupRaw: [],
+        precomputed: true,
+        stats: {
+          rule: '预计算低缩放显示图层（display_lod）：几何是离线按 (band, 瓦片) 跑真实合并烘好的，'
+            + '查询只做"取行 → 去重 → 裁到视口"',
+          minZoom: coalesceOpts.minZoom, tolPx: coalesceOpts.tolPx,
+          minClassWays: coalesceOpts.minClassWays, budgetFrac: coalesceOpts.budget,
+          coordDigits: dlodPlan.coordDigits,
+          // ⚠ 这三项是"这一次合并运行"的现场统计，预计算层复现不了（如实报 null，不报 0）
+          candidateWays: null, skippedClosed: null, skippedMember: null, skippedNoClass: null,
+          budget: null, remainingWays: null, classesAlways: [], classesPicked: [],
+          ways: cov.coveredLine.size, lines: rd.lines.length,
+          paths: lineStats.segs, points: lineStats.points, rawPoints: lineStats.rawPoints,
+          classes: lineStats.classes.lines.map((c) => ({ class: c.class, family: c.family, ways: c.ways, coalesced: 1, always: coalesceAlways(c.class) ? 1 : 0 })),
+          byFamily: lineStats.byFamily.lines,
+          precomputed: true,
+        },
+      };
+      areasPlan = {
+        active: true,
+        entries: rd.areas,
+        covered: cov.coveredArea,
+        nodeIds: [],
+        groupKeys: [], groupCls: [], groupWays: [], groupRaw: [],
+        precomputed: true,
+        stats: {
+          rule: '预计算低缩放显示图层（display_lod）：面几何同样是离线烘好的（闭合 way 的环 + 面关系接龙环）',
+          tolPx: coalesceOpts.tolPx, coordDigits: dlodPlan.coordDigits,
+          // `ways` = 真的画进 displayAreas 的环数（与实时路径的 `areasPlan.stats.ways` 同口径：
+          // 退化到画不出来的那些只是 `covered`，不进这个数）
+          ways: lineStats.areaWays, rings: lineStats.areaRings,
+          rawPoints: lineStats.areaRawPoints, points: lineStats.areaPoints,
+          openRings: null, tiny: null, tinyRings: null, relationMembersNoGeometry: null,
+          relations: rd.areas.filter((a) => a.rel !== undefined).length,
+          // 环总数已经算在 rings 里（关系环与非关系环不分开记：预计算层里它们都是同一张表的行）
+          relationWays: null, relationRings: 0,
+          classes: lineStats.classes.areas.map((c) => ({ class: c.class, family: c.family, ways: c.ways, rings: c.rings, points: c.points })),
+          byFamily: lineStats.byFamily.areas,
+          precomputed: true,
+        },
+      };
+      this._dlodLastRead = lineStats;
+      execPrecomputed(dlodPlan, coalescePlan, areasPlan);
+    } else {
+    /**
+     * 【低缩放视图载荷】非"面关系"的成员 way 也一起参与合并 —— 它们本来就是按**线**画的
+     * （boundary 是虚线、route 成员是路径），合并掉的成员几何在 displayLines 里一条都没少。
+     * 所以这里在定合并计划**之前**把成员 way 的行取出来（几何仍然只取一次，见下面的 coalesceGeom）。
+     * 面关系的成员走另一条路（服务端接龙成环 → displayAreas），不在这里。
+     */
+    /**
      * ⚠ 账本口径说明：`memberWaysReturned` 是**按出现次数**计的（同一个 way 属于多个关系就会重复计一次），
      * 而 picked / toFetch / fetched 是**按 way 去重**的（Set）。所以这两组数只在"没有重复成员"时逐项相等；
      * 有重复时差额 = 重复出现次数，不是"丢了几条"。
@@ -2723,7 +3160,7 @@ class OsmDB {
       coalesceGeom = new Map(geom);
       for (const [k, v] of memberGeom) coalesceGeom.set(k, v);
     }
-    const coalescePlan = this._coalesce(coalesceInput, coalesceGeom, {
+    coalescePlan = this._coalesce(coalesceInput, coalesceGeom, {
       zoom,
       limit: caps.viewportLimit,
       /**
@@ -2746,7 +3183,6 @@ class OsmDB {
      * 【低缩放视图载荷】面几何合并：候选里的**闭合** way + 面关系的成员 → displayAreas。
      * 盖到的 way **不再进 payload.ways**（几何已经在 displayAreas 里，且这一档客户端只看不改）。
      */
-    let areasPlan = null;
     if (viewOnly) {
       const relGeom = areaRels.length
         ? this.wayNodesBatch([...new Set(areaRels.flatMap((r) => r.members))])
@@ -2766,16 +3202,25 @@ class OsmDB {
         coords: coalescePlan.coords,     // 与折线共用同一份节点坐标缓存
       });
     }
-    for (const { row, tags } of picked) {
-      const ids = geom.get(row.id);
-      if (!ids || !ids.length) { noGeometry += 1; continue; }   // 节点全没了的路：没东西可渲染，不算"被丢掉"
-      // 被合并进 displayLines 的 way：几何已经以折线形式下发，这里不再逐条下发（也就不占条数上限）
-      if (coalescePlan.coalesced.has(row.id)) continue;
-      // 【低缩放视图载荷】几何进了 displayAreas 的面：同样不再逐条下发、也不取它的节点坐标
-      if (areasPlan && areasPlan.covered.has(row.id)) continue;
-      ways[row.id] = [row.version, ids, tags, row.closed, 0];
-      for (const id of ids) nodeIds.add(id);
-      returnedWays += 1;
+    execPrecomputed(null, coalescePlan, areasPlan);
+    }
+    /**
+     * `execPrecomputed` 只是一个"把两条路的共同尾部收在一处"的小闭包：
+     * 无论几何是当场合并的还是从预计算层读的，**下面这段（逐条下发 + 账本）只有一份代码**。
+     */
+    function execPrecomputed(plan, coalescePlan, areasPlan) {
+      for (const { row, tags } of picked) {
+        const ids = geom.get(row.id);
+        if (!ids || !ids.length) { noGeometry += 1; continue; }   // 节点全没了的路：没东西可渲染，不算"被丢掉"
+        // 被合并进 displayLines 的 way：几何已经以折线形式下发，这里不再逐条下发（也就不占条数上限）
+        if (coalescePlan.coalesced.has(row.id)) continue;
+        // 【低缩放视图载荷】几何进了 displayAreas 的面：同样不再逐条下发、也不取它的节点坐标
+        if (areasPlan && areasPlan.covered.has(row.id)) continue;
+        ways[row.id] = [row.version, ids, tags, row.closed, 0];
+        for (const id of ids) nodeIds.add(id);
+        returnedWays += 1;
+      }
+      void plan;
     }
 
     /**
@@ -2815,7 +3260,14 @@ class OsmDB {
     // ---------- 4. 一次性取出所有需要的节点坐标 ----------
     // 注意：displayLines 的坐标**不进 payload.nodes**（那是合并省下来的体积，见 _coalesce）
     const nodes = {};
-    this._fetchNodes([...nodeIds], nodes, nodeTags, zoom, lod.neverSendOn);
+    /**
+     * 物化几何的坐标缓存（`ways.geom`）：这一屏里**属于已挑 way 顶点**的那些节点，
+     * 坐标直接来自 way 行，不再去 `nodes` 表里随机读（z15 一屏实测少读 22,166 行）。
+     * 剩下要回库的只有 POI、关系成员、以及**带标签的几何顶点**（要判定 nodeTags）。
+     */
+    const geomNodeCache = this._wayGeom.on && this._wayGeomReady
+      ? this._wayGeomNodeCache(picked.map((p) => p.row.id)) : null;
+    this._fetchNodes([...nodeIds], nodes, nodeTags, zoom, lod.neverSendOn, geomNodeCache);
     const extraFromGeometry = Object.keys(nodeTags).length - returnedNodes;   // 道路顶点在高缩放下的标签
 
     /* ------------------------------ 上限 / 截断的账本 ------------------------------ */
@@ -2859,7 +3311,9 @@ class OsmDB {
         // ---- 低缩放视图载荷的账（见文件开头「低缩放视图载荷」）----
         // areaCoalesced = 被挑出来的候选里、几何进了 displayAreas 的**闭合** way 条数：
         // 同样**不是 dropped**（几何在 displayAreas 里一条没少），所以 known 里也扣掉了它们。
-        areaCoalesced: areasPlan ? picked.filter((p) => areasPlan.covered.has(p.row.id)).length : 0,
+        // 预计算路径下 `picked` 只有"逐条下发"的那几条，所以这个数直接取去向表里的面覆盖集合
+        areaCoalesced: !areasPlan ? 0
+          : (dlodCov ? dlodCov.coveredArea.size : picked.filter((p) => areasPlan.covered.has(p.row.id)).length),
         areaCoalesceActive: !!(areasPlan && areasPlan.active),
         displayAreas: areasPlan ? areasPlan.entries.length : 0,
         displayAreaRings: areasPlan ? areasPlan.stats.rings + areasPlan.stats.relationRings : 0,
@@ -3071,11 +3525,16 @@ class OsmDB {
          * 与账本的关系：**只是把 accept() 里那次 lodVisible 判断提前到索引上做**，
          * visible / lodFiltered / dropped / complete 的语义与数字都不变。
          */
-        wayScan: wayPlan
-          ? { plan: wayPlan.plan, index: wayPlan.index, maxZoom: wayPlan.maxZoom, lodZoom: wayPlan.lodZoom,
-            rule: '只扫 `lod_zoom <= ' + wayPlan.lodZoom + '` 的 way（= 这一档等级够的道路 + 铁路/水系/水域/行政边界例外）' }
-          : { plan: 'rtree', maxZoom: this._wayLodMaxZoom, ready: !!this._wayLodReady,
-            rule: 'R*Tree bbox 路径：先扫视口内所有 way，再由 accept() 按显示分级/LOD 逐行判断' },
+        wayScan: dlodPlan
+          ? { plan: 'display-lod', band: zoom, tiles: dlodPlan.tiles.length,
+            rows: dlodCov ? dlodCov.candidates : 0,
+            rule: '**不扫 way**：这一档的候选与每个候选的去向直接读预计算层（display_lod_cov），'
+              + 'candidates / visible / coalesced / lodFiltered / dropped / complete 由它如实重建' }
+          : wayPlan
+            ? { plan: wayPlan.plan, index: wayPlan.index, maxZoom: wayPlan.maxZoom, lodZoom: wayPlan.lodZoom,
+              rule: '只扫 `lod_zoom <= ' + wayPlan.lodZoom + '` 的 way（= 这一档等级够的道路 + 铁路/水系/水域/行政边界例外）' }
+            : { plan: 'rtree', maxZoom: this._wayLodMaxZoom, ready: !!this._wayLodReady,
+              rule: 'R*Tree bbox 路径：先扫视口内所有 way，再由 accept() 按显示分级/LOD 逐行判断' },
         source: lod.source,                       // 'query'（请求带的）/ 'config'（limits.lodDetail）/ 'default'
         /**
          * POI（带标签节点）候选扫描用的是哪条计划（见 _nodePoiPlan）：
@@ -3175,9 +3634,39 @@ class OsmDB {
           + '只想要大建筑：带 minFillArea=<平方米>；'
           + '想自己调分界点：config limits.roadSend = { "12": 0, "13": 1, "14": 2 }（按缩放下发到第几级）',
       },
+      /**
+       * **预计算低缩放显示图层**（见 server/displaylod.js 的文件头那一段）：
+       * 这次请求的 displayLines / displayAreas 是**从库里读的**还是**当场算的**，
+       * 以及读了多少行、裁掉了多少（一分钱花在哪，一眼看得出）。
+       *
+       * ⚠ **只在真的走了这条路时才出现这个字段** —— 于是
+       *   · z ≥ 15（编辑档，永远走实时路径）的载荷与改动前**逐字节相同**；
+       *   · `limits.displayLod.on = false`（回滚）时，所有档位的载荷也**逐字节相同**。
+       * 这两条由 `tests/display-lod-test.js` 用 sha256 逐档断言（临时库上真跑）。
+       */
+      ...(dlodPlan ? {
+        displayLod: {
+          active: true,
+          on: !!this._dlod.on,
+          band: zoom,
+          tiles: dlodPlan.tiles.length,
+          rows: (this._dlodLastRead || {}).rows || 0,
+          unique: (this._dlodLastRead || {}).unique || 0,
+          lines: (this._dlodLastRead || {}).lines || 0,
+          areas: (this._dlodLastRead || {}).areas || 0,
+          clipped: (this._dlodLastRead || {}).clipped || 0,
+          coveredWays: dlodCov ? dlodCov.coveredLine.size + dlodCov.coveredArea.size : 0,
+          sentWays: dlodCov ? dlodCov.sentWay.size : 0,
+          dirtyTiles: this._dlodDirty.size,
+          note: '这一档的折线/面几何是**离线烘**好的（按 (band, 瓦片) 跑真实合并），查询只做'
+            + '「取行 → 按 id 去重 → 裁到视口」；way 候选与每个候选的去向也一并读自预计算层，'
+            + '所以这次请求**没有为合并部分取任何 way 几何**。'
+            + '库没烘这一层 / 这个 band 没建完 / 参数签名对不上 / 压到的瓦片里有脏的 —— 任何一条都会'
+            + '**整体**退回实时路径（绝不把新旧几何混在一屏里）。',
+        },
+      } : {}),
       caps: {
-        viewportLimit: caps.viewportLimit,
-        wayCandidates: caps.wayCandidates, nodeCandidates: caps.nodeCandidates, relationLimit: caps.relationLimit,
+        viewportLimit: caps.viewportLimit,        wayCandidates: caps.wayCandidates, nodeCandidates: caps.nodeCandidates, relationLimit: caps.relationLimit,
         relationCropPad: caps.relationCropPad, relationCropMinMembers: caps.relationCropMinMembers,
         relationCropBoundaryMembers: caps.relationCropBoundaryMembers,
       },
@@ -3285,6 +3774,16 @@ class OsmDB {
       lines: [],
       coalesced: new Set(),
       nodeIds: [],
+      /**
+       * 逐条目的元数据（**与 `lines` 同一个循环、同一个下标填的**）：
+       *   groupKeys  分组键（= `coalesceGroupKeyOf(cls, tags)`）—— 预计算层用它定**稳定内容 id**
+       *   groupCls   这一组的样式类（`classes` 账本的原始键）
+       *   groupWays  被并进这一条的 way 条数
+       *   groupRaw   简化前的原始点数（= 这一条省了多少，账本 `rawPoints` 的逐条版本）
+       * 预计算低缩放显示图层（server/displaylod.js）靠它把"库里的行"与"线上那条折线"对上，
+       * 而不是自己按标签反推类（反推在兜底类 `tags:…` 上推不出来）。线上载荷不含这几个字段。
+       */
+      groupKeys: [], groupCls: [], groupWays: [], groupRaw: [],
       stats: {
         rule: 'z < minZoom 时，把"开折线的 way"按（样式类 + 名字 + bridge/tunnel/layer/surface）分组接龙，'
           + 'Douglas–Peucker ≤ tolPx 屏幕像素简化后作为 displayLines 下发；'
@@ -3320,28 +3819,24 @@ class OsmDB {
     if (!entries.length) return out;
 
     // ---------- 2. 选类：永远类 + 条数 ≥ 阈值；要是不够就按条数从大到小继续收，直到落进预算 ----------
-    const ranked = [...byClass.entries()].sort((a, b) => b[1].length - a[1].length);
-    const chosen = new Set();
-    for (const [cls, list] of ranked) {
-      if (coalesceAlways(cls) || list.length >= opts.minClassWays) chosen.add(cls);
-    }
-    const budget = Math.max(1, Math.floor(limit * opts.budget));
-    let coalescedCount = 0;
-    for (const cls of chosen) coalescedCount += byClass.get(cls).length;
-    if (picked.length - coalescedCount > budget) {
-      for (const [cls, list] of ranked) {
-        if (picked.length - coalescedCount <= budget) break;
-        if (chosen.has(cls)) continue;
-        chosen.add(cls);
-        coalescedCount += list.length;
-      }
-    }
-    out.stats.budget = budget;
-    out.stats.remainingWays = picked.length - coalescedCount;
-    out.stats.classes = ranked.map(([cls, list]) => ({
-      class: cls, family: coalesceFamilyOf(cls), ways: list.length,
-      coalesced: chosen.has(cls) ? 1 : 0, always: coalesceAlways(cls) ? 1 : 0,
-    }));
+    /**
+     * **类选择：规则只有一份**（`chooseCoalesceClasses`），`_coalesce` 与预计算层的"全局选类"
+     * 都调它 —— 于是"烘焙时选哪些类"与"实时算时选哪些类"不可能漂。详见那个函数的说明。
+     */
+    const pick = chooseCoalesceClasses(byClass, picked.length, opts, limit);
+    const chosen = pick.chosen;
+    out.stats.budget = pick.budget;
+    out.stats.remainingWays = pick.remainingWays;
+    out.stats.classes = pick.classes;
+    out.stats.classesForced = !!opts.forceClasses;
+    /**
+     * 逐条目的元数据里要带上"这一档最终选了哪些类"：预计算层把它烘进 meta，
+     * 之后**单块瓦片的重算**就能用同一份类集合（否则"重算一块"会按这块瓦片自己的条数重新选类，
+     * 把 way 挤出折线集 —— 那正是"瓦片越小、选中的类越少"这个坑）。
+     */
+    out.chosenClasses = pick.chosenList;
+    /** 「只数类，不算几何」探针（预计算层全局选类用）：算完账就返回，不接龙、不取节点坐标 */
+    if (opts.surveyClasses) return out;
 
     // ---------- 3. 分组 → 接龙 → 简化 ----------
     const groups = new Map();
@@ -3360,11 +3855,18 @@ class OsmDB {
     // coordsIn：调用方（低缩放视图载荷）可以把"面几何也要用的那份坐标缓存"传进来共用，
     // 免得同一批节点被取两遍（areas 与 lines 的节点集合大量重叠）。
     const coords = coordsIn || {};
+    /**
+     * **物化几何的坐标缓存**（`ways.geom`）：这一组合并要取的节点坐标全都来自这些 way，
+     * 所以直接按 way id 一次读出来（z10 一屏原来是 19.5 万行 `nodes` 随机读）。
+     * 返回值与逐行读 `nodes` **完全相同**（物化时就是按 `_fetchNodes` 的口径量化到 1e-7 的）。
+     */
+    const geomCache = this._wayGeom.on && this._wayGeomReady
+      ? this._wayGeomNodeCache(entries.map((e) => e.id)) : null;
     if (coordsIn) {
       const missing = out.nodeIds.filter((id) => coords[id] === undefined);
-      if (missing.length) this._fetchNodes(missing, coords, null, zoom);
+      if (missing.length) this._fetchNodes(missing, coords, null, zoom, true, geomCache);
     } else {
-      this._fetchNodes(out.nodeIds, coords, null, zoom);
+      this._fetchNodes(out.nodeIds, coords, null, zoom, true, geomCache);
     }
 
     const kx = 111320 * Math.cos((Number(lat) || 0) * D2R);
@@ -3372,11 +3874,12 @@ class OsmDB {
     const tolM = opts.tolPx * metersPerPixel(zoom, lat);
     const q = (v, d) => { const f = Math.pow(10, d); return Math.round(v * f) / f; };
     const byFamily = new Map();
-    for (const list of groups.values()) {
+    for (const [gkeyOf, list] of groups) {
       // 组内每条 way 的样式类/名字/btl 都相同（分组键保证），所以只用第一条的标签建折线
       const head = list[0];
       const trails = chainWaysToTrails(list);
       const paths = [];
+      let groupRaw = 0;      // 这一条折线简化前的原始点数（逐条版 rawPoints，见 out.groupKeys 的说明）
       for (const trail of trails) {
         const meters = [];
         const lls = [];
@@ -3394,6 +3897,7 @@ class OsmDB {
         if (line.length < 2) continue;
         out.stats.rawPoints += lls.length;
         out.stats.points += line.length;
+        groupRaw += lls.length;
         paths.push(line);
       }
       if (!paths.length) continue;
@@ -3407,6 +3911,11 @@ class OsmDB {
       // 同组里"分叉/断开"的其余路径：一条 displayLine 的几何可以是好几段（接不到一起的那些）
       if (paths.length > 1) entry.paths = paths.slice(1);
       out.lines.push(entry);
+      // 逐条目元数据（与 lines 同一个下标；见 out.groupKeys 的说明）
+      out.groupKeys.push(gkeyOf);
+      out.groupCls.push(head.cls);
+      out.groupWays.push(list.length);
+      out.groupRaw.push(groupRaw);
       out.stats.paths += paths.length;
       for (const e of list) out.coalesced.add(e.id);
       const fam = byFamily.get(entry.class) || { class: entry.class, lines: 0, paths: 0, ways: 0, points: 0 };
@@ -3451,6 +3960,14 @@ class OsmDB {
       entries: [],
       covered: new Set(),
       nodeIds: [],
+      /**
+       * 逐条目的元数据（**与 `entries` 同一个下标**；口径与 `_coalesce` 的 groupKeys 一样）：
+       *   groupKeys  稳定内容 id 的键（闭合 way 组 = `areaGroupKeyOf`，面关系 = `rel:<id>`）
+       *   groupCls   账本类（闭合 way = `areaClassOf`；面关系 = `rel:` + `areaClassOf`）
+       *   groupWays  并进这一条的 way 条数（环数 / 关系成员数）
+       *   groupRaw   简化前的原始点数
+       */
+      groupKeys: [], groupCls: [], groupWays: [], groupRaw: [],
       stats: {
         rule: '低缩放（z < coalesce.minZoom 且 detail ≥ ' + VIEW_ONLY_MIN_DETAIL + '）：画得出来的面几何'
           + '（闭合 way 的环 + 面关系的接龙环）量化到 coordDigits 位、按 Douglas–Peucker ≤ tolPx 屏幕像素'
@@ -3481,11 +3998,12 @@ class OsmDB {
     for (const r of rels) for (const wid of r.members) pushIds(relGeom.get(wid));
     // 坐标缓存可以由调用方（同一个请求的折线合并）共用：同一批节点不取两遍
     const coords = coordsIn || {};
+    const geomCache = this._wayGeom.on && this._wayGeomReady ? this._wayGeomNodeCache(list.map((w) => w.id)) : null;
     if (coordsIn) {
       const missing = ids.filter((id) => coords[id] === undefined);
-      if (missing.length) this._fetchNodes(missing, coords, null, zoom);
+      if (missing.length) this._fetchNodes(missing, coords, null, zoom, true, geomCache);
     } else {
-      this._fetchNodes(ids, coords, null, zoom);
+      this._fetchNodes(ids, coords, null, zoom, true, geomCache);
     }
     out.nodeIds = ids;
 
@@ -3554,20 +4072,26 @@ class OsmDB {
         continue;
       }
       let g = groups.get(key);
-      if (!g) { g = { cls, tags: w.tags, rings: [] }; groups.set(key, g); }
+      if (!g) { g = { cls, tags: w.tags, rings: [], raw: 0 }; groups.set(key, g); }
       g.rings.push(r.ring);
+      g.raw += r.raw || 0;
       const cs = classStat.get(cls) || { class: cls, family: areaFamilyOf(cls), ways: 0, rings: 0, points: 0, tiny: 0 };
       cs.ways += 1; cs.rings += 1; cs.points += r.ring.length;
       classStat.set(cls, cs);
       if (!isClosedRing(r.ring)) out.stats.openRings += 1;
     }
     const byFamily = new Map();
-    for (const g of groups.values()) {
+    for (const [gkeyOf, g] of groups) {
       const entry = { class: areaFamilyOf(g.cls), tags: areaDisplayTagsOf(g.tags), coords: g.rings[0] };
       const name = (g.tags && g.tags.name) || '';
       if (name) entry.name = name;
       if (g.rings.length > 1) entry.paths = g.rings.slice(1);
       out.entries.push(entry);
+      // 逐条目元数据（与 entries 同一个下标；见 out.groupKeys 的说明）
+      out.groupKeys.push(gkeyOf);
+      out.groupCls.push(g.cls);
+      out.groupWays.push(g.rings.length);
+      out.groupRaw.push(g.raw);
       out.stats.ways += g.rings.length;
       out.stats.rings += g.rings.length;
       const fam = byFamily.get(entry.class) || { class: entry.class, areas: 0, rings: 0, ways: 0, points: 0 };
@@ -3593,10 +4117,12 @@ class OsmDB {
       const trails = chainWaysToTrails(memberEntries);
       const rings = [];
       let open = 0;
+      let relRaw = 0;
       for (const trail of trails) {
         const ringRes = buildRing(trail);
         if (!ringRes.ring) { if (!ringRes.missing) out.stats.tinyRings += 1; continue; }
         rings.push(ringRes.ring);
+        relRaw += ringRes.raw || 0;
         if (!isClosedRing(ringRes.ring)) open += 1;
       }
       /**
@@ -3611,6 +4137,10 @@ class OsmDB {
       };
       if (rings.length > 1) entry.paths = rings.slice(1);
       out.entries.push(entry);
+      out.groupKeys.push('rel:' + r.id);
+      out.groupCls.push('rel:' + cls);
+      out.groupWays.push(memberEntries.length);
+      out.groupRaw.push(relRaw);
       out.stats.relations += 1;
       out.stats.relationWays += memberEntries.length;
       out.stats.relationRings += rings.length;
@@ -3765,6 +4295,22 @@ class OsmDB {
   wayNodesBatch(wayIds) {
     const out = new Map();
     if (!wayIds.length) return out;
+    /**
+     * **先读物化几何**（`ways.geom`）：一屏 2,491 条 way 实测原来要读 `way_nodes` **25,956 行**，
+     * 现在这些行跟着 way 行一起读，跨表探针 0 次。读到的 id 序列与 `way_nodes` **逐项相同**
+     * （它是从同一张表物化出来的），所以下游（折线合并、`payload.ways`、面环）一个字节都不会变。
+     * 没物化的 way（老库还没回填完、或刚被建出来）按 miss 退回下面那条 SQL。
+     */
+    const memo = this._wayGeomBatch(wayIds);
+    if (memo.size) {
+      const miss = [];
+      for (const id of wayIds) {
+        const g = memo.get(id);
+        if (g) out.set(id, g.ids); else miss.push(id);
+      }
+      if (!miss.length) return out;
+      wayIds = miss;
+    }
     const stmt = this._cachedStmt(
       'SELECT way_id, node_id FROM way_nodes WHERE way_id IN (SELECT value FROM json_each(?)) ORDER BY way_id, seq'
     );
@@ -3789,22 +4335,1201 @@ class OsmDB {
    *     再 JSON.parse —— 低于 z16 时几何顶点上的标签（门牌号之类）一律不可见，
    *     逐个 JSON.parse 纯属白花时间。
    */
-  _fetchNodes(ids, out, nodeTags, zoom, neverSendOn = true) {
+  _fetchNodes(ids, out, nodeTags, zoom, neverSendOn = true, nodeCache = null) {
     if (!ids.length) return;
     const z = zoom === undefined ? 19 : zoom;
+    /**
+     * **物化几何的坐标快路径**（见 `packWayGeom` 上面那一大段）：
+     * 一屏 2,491 条 way 原来要读 `nodes` **22,166 行**（每行还带着大字段 `tags`），
+     * 磁盘瓶颈的机器上就是几十 MB 随机读。现在这些坐标直接来自 `ways.geom`。
+     *
+     * **逐字节不变的三条纪律**（实测过 `IN (…)` 的返回顺序是 **id 升序**，不是列表顺序）：
+     *   1. **分块完全照旧**（还是 `ids` 原顺序、每 500 个一块）——块的组成不变；
+     *   2. 每一块内**按 id 升序插入**，与 SQLite 自己的返回顺序一致（合并缓存命中与库返回的行之后
+     *      再升序插，所以"缓存的那些"不会挤到前面去）；
+     *   3. 带标签的节点（`hasTags` 位）**一律照旧回库取**（它的 `tags` 要参与 `nodeTags` 的判定），
+     *      不带标签的节点库里 `tags` 本来就是 NULL，原代码在那一步就短路了 —— 结论一样。
+     * 于是 `nodes` / `nodeTags` 的键、顺序、值都与改动前相同（`tests/way-geom-test.js` 用 sha256 断言）。
+     */
+    const cache = (nodeCache && nodeCache.coords.size) ? nodeCache : null;
     for (let i = 0; i < ids.length; i += NODE_FETCH_CHUNK) {
       const chunk = ids.slice(i, i + NODE_FETCH_CHUNK);
-      const stmt = this._cachedStmt(nodeFetchSql(chunk.length));
-      for (const n of stmt.all(...chunk)) {
-        // 下发时保留 7 位小数（约 1 厘米），足够渲染与编辑，能明显减小传输体积
-        out[n.id] = [Math.round(n.lat * 1e7) / 1e7, Math.round(n.lon * 1e7) / 1e7];
-        if (nodeTags && n.tags && pointTagsMaybeVisible(n.tags, z)) {
-          const tags = parseTags(n.tags);
-          // 永不下载的类别（树 / 自行车道）连"几何顶点上带的标签"也不下发（见文件开头那一段）
-          if (tags && !(neverSendOn && neverSendClassOf(tags)) && lodVisible(tags, z, 'point')) nodeTags[n.id] = tags;
+      if (!cache) {
+        const stmt = this._cachedStmt(nodeFetchSql(chunk.length));
+        for (const n of stmt.all(...chunk)) this._putNode(out, nodeTags, n, z, neverSendOn);
+        continue;
+      }
+      /** 命中缓存、而且那个节点**没有标签**的：坐标直接用，不用回库 */
+      const hit = new Map();
+      const miss = [];
+      for (const id of chunk) {
+        const c = cache.coords.get(id);
+        if (c && !cache.hasTags.has(id)) hit.set(id, c); else miss.push(id);
+      }
+      const rows = new Map();
+      if (miss.length) {
+        const stmt = this._cachedStmt(nodeFetchSql(miss.length));
+        for (const n of stmt.all(...miss)) rows.set(n.id, n);
+      }
+      const all = [...new Set([...hit.keys(), ...rows.keys()])].sort((a, b) => a - b);
+      for (const id of all) {
+        const n = rows.get(id);
+        if (n) { this._putNode(out, nodeTags, n, z, neverSendOn); continue; }
+        const c = hit.get(id);
+        // 与 `out[n.id] = [Math.round(n.lat*1e7)/1e7, …]` 同一口径（物化时已经量化到 1e7）
+        out[id] = c;
+      }
+    }
+  }
+
+  /** 单个节点行的落库口径（`_fetchNodes` 两条路共用，保证"从哪儿读"不影响结果） */
+  _putNode(out, nodeTags, n, z, neverSendOn) {
+    out[n.id] = [Math.round(n.lat * 1e7) / 1e7, Math.round(n.lon * 1e7) / 1e7];
+    if (nodeTags && n.tags && pointTagsMaybeVisible(n.tags, z)) {
+      const tags = parseTags(n.tags);
+      if (tags && !(neverSendOn && neverSendClassOf(tags)) && lodVisible(tags, z, 'point')) nodeTags[n.id] = tags;
+    }
+  }
+
+  /**
+   * 把一批 way 的物化几何摊成**按节点 id** 的坐标缓存（`_fetchNodes` 的快路径用它）。
+   * 一次性建好，之后整屏都命中；`hasTags` 里的是"要回库看标签"的节点（很少）。
+   */
+  _wayGeomNodeCache(wayIds) {
+    const coords = new Map();
+    const hasTags = new Set();
+    if (!this._wayGeom.on || !this._wayGeomReady || !wayIds.length) return { coords, hasTags };
+    for (const g of this._wayGeomBatch(wayIds).values()) {
+      for (let i = 0; i < g.ids.length; i++) {
+        const c = g.coords[i];
+        if (c && !coords.has(g.ids[i])) coords.set(g.ids[i], c);
+        if (g.hasTags[i]) hasTags.add(g.ids[i]);
+      }
+    }
+    return { coords, hasTags };
+  }
+
+  /* ==================================================================================
+   * ==================== 预计算低缩放显示图层（display_lod） ====================
+   * ==================================================================================
+   * 规则与实测依据全在 server/displaylod.js 的文件头那一段；这里只放**入口**：
+   *   · `_dlodPlan()`    —— 这次请求能不能走预计算（开关 / band / 签名 / 脏瓦片 / 范围）
+   *   · `_dlodRead()`    —— 按瓦片读表 + 去重 + 裁剪，产出 displayLines / displayAreas / 覆盖账
+   *   · `_dlodBakeTile()`—— 烘一块瓦片（**跑库里真实的 queryBbox**，在 _coalesce 处截下结果）
+   *   · 构建与失效        —— buildDisplayLod / buildDisplayLodSliced / dlodMarkDirty / dlodRebuildDirty
+   */
+  /** 这次请求生效的 display_lod 参数（构造时给，默认开；`on:false` 是那一行回滚开关） */
+  _dlodOpts() { return this._dlod; }
+
+  /** meta 里的那一行状态（带缓存；`_dlodForget` 清掉） */
+  _dlodState() {
+    if (this._dlodStateCache !== undefined) return this._dlodStateCache;
+    let st = null;
+    try {
+      const row = this.db.prepare(`SELECT v FROM ${DLOD.DLOD_META} WHERE k = 'state'`).get();
+      if (row && row.v) {
+        const raw = JSON.parse(row.v);
+        const bands = {};
+        for (const k of Object.keys(raw.bands || {})) bands[Number(k)] = raw.bands[k];
+        st = {
+          sig: raw.sig, version: raw.version, tiles: raw.tiles,
+          extent: raw.extent, lat: raw.lat,
+          bands, builtAt: raw.builtAt,
+          bytes: raw.bytes || 0, rows: raw.rows || 0,
+        };
+      }
+    } catch { st = null; }   // 没有这张表 / 没有这一行 → 这一层不可用（老库的常态）
+    this._dlodStateCache = st;
+    return st;
+  }
+
+  _dlodForget() { this._dlodStateCache = undefined; }
+
+  /** 库里有没有这一层、且"该建的 band 都建了"（有 meta 且 rows > 0） */
+  dlodReady() { const st = this._dlodState(); return !!(st && st.rows > 0); }
+
+  /** 这一层的信息（给 /api/health 与种子报告用；不读库也能答） */
+  displayLodInfo() {
+    const st = this._dlodState();
+    if (!st) return { available: false, on: !!this._dlod.on, reason: '库里没有这一层' };
+    const bands = {};
+    for (const z of Object.keys(st.bands).sort((a, b) => a - b)) bands[z] = st.bands[z];
+    return {
+      available: true, on: !!this._dlod.on, tiles: st.tiles, lat: st.lat, extent: st.extent,
+      rows: st.rows, bytes: st.bytes, bands, dirty: this._dlodDirty.size, builtAt: st.builtAt,
+      sig: st.sig,
+    };
+  }
+
+  _dlodEnsureSchema() {
+    this.db.exec(DLOD.DLOD_SCHEMA);
+    /**
+     * 清掉一个**自己造的历史包袱**：第一版实现把"候选 way 的去向"只挂在**一张共享的** R\*Tree 上
+     * （id = cov 的 rowid），实测 z14 因为一次命中 7 个 band 的行而要 324 ms；现在改成**每个 band 一张**
+     * （见 displaylod.js 里那段说明）。老库如果被第一版建过，那张表就是纯占地方 —— 顺手删掉。
+     */
+    try { this.db.exec(`DROP TABLE IF EXISTS ${DLOD.DLOD_COV}_rtree`); } catch { /* ignore */ }
+    this._dlodStateCache = undefined;
+  }
+
+  /** 数据范围（**所有活着的 way 的 bbox 并集**）：瓦片网格就是它的等分。 */
+  _dlodDataExtent() {
+    const r = this.db.prepare(`SELECT MIN(min_lon) AS a, MAX(max_lon) AS b, MIN(min_lat) AS c, MAX(max_lat) AS d
+      FROM ways WHERE deleted = 0 AND min_lon IS NOT NULL`).get();
+    if (!r || r.a === null) return null;
+    return { minLon: r.a, maxLon: r.b, minLat: r.c, maxLat: r.d };
+  }
+
+  _dlodGrid(extent, tiles) { return DLOD.makeGrid(extent, tiles); }
+
+  /**
+   * **DP 容差用的参考纬度 = 该数据范围的【最大纬度】**（原型点名的口径）。
+   *
+   * 为什么是"最大纬度"而不是中心纬度：`metersPerPixel ∝ cos(lat)`，纬度越高 cos 越小、
+   * 一像素对应的米数越小 ⇒ **容差最细**。取最大纬度就等于"保证这一层不比今天粗"：
+   * 本数据集纬度 37.77°~40.36°，中心纬度 39.06° 的 cos 比最北端大 1.9% ——
+   * 用中心纬度会让北半部分的容差比线上现在算的**粗** 1.9%（虽然只有 2% 像素，但没理由让它粗）。
+   * 反过来，最南端的容差会比这里用的**细** 1.9%（多留几个点，只多花字节）。
+   *
+   * ⚠ 这也意味着**同一个 band 的容差是一个常数**：不会随请求中心纬度漂（线上是 `(minLat+maxLat)/2`，
+   * 视口一动容差就动，DP 保留的点集就可能变 —— 那"预计算"就无从谈起）。
+   */
+  _dlodLatRef(extent) { return extent.maxLat; }
+
+  /**
+   * 烘一块瓦片：**跑库里真实的 `queryBbox`**（不是另写一套合并逻辑），在 `_coalesce` /
+   * `_coalesceAreas` 返回处把结果截下来，然后**抛一个哨兵异常跳过打包那一段**
+   * （预计算不需要载荷；省下的正是打包 + JSON 的 40~80 ms）。
+   *
+   * 为什么要用真 queryBbox：折线/面的几何语义必须与线上**逐字段同源**，
+   * 而"哪些 way 参与合并、类怎么选、LOD 怎么扣"这些规则长在 queryBbox 里 ——
+   * 抄一份出来迟早会漂。这里只两处干预：
+   *   1. `lat`（DP 容差用的纬度）**强制成 band 固定值**（见 displaylod.js 文件头）；
+   *   2. 把 ways 扫描的 `accept` 包一层，记下"每个候选 way 的去向"（→ display_lod_cov）。
+   */
+  _dlodBakeTile(z, tile, box, ctx) {
+    const cap = {
+      lines: null, areas: null, coalesced: null, covered: null,
+      geom: new Map(), picked: [], rejects: [], scan: null,
+    };
+    const origScan = this._scanCandidates;
+    const origCoalesce = this._coalesce;
+    const origAreas = this._coalesceAreas;
+    const origBatch = this.wayNodesBatch;
+    const STOP = '__DLOD_STOP__';
+    const isWayScan = (sql) => {
+      const s = String(sql || '');
+      return s.includes('FROM ways w') || s.includes('FROM way_index');
+    };
+    this._scanCandidates = function (o) {
+      if (!isWayScan(o.sql)) return origScan.call(this, o);
+      const inner = o.accept;
+      const wrapped = Object.assign({}, o, {
+        accept: (row) => {
+          const v = inner(row);
+          if (v) cap.picked.push(v); else cap.rejects.push(row);
+          return v;
+        },
+      });
+      const r = origScan.call(this, wrapped);
+      cap.scan = r;
+      return r;
+    };
+    this._coalesce = function (picked, geom, o) {
+      const forced = ctx.forceClasses ? ctx.forceClasses.get(z) : null;
+      const opts2 = forced ? Object.assign({}, o.opts, { forceClasses: forced }) : o.opts;
+      const r = origCoalesce.call(this, picked, geom, Object.assign({}, o, { lat: ctx.lat, opts: opts2 }));
+      cap.lines = r.lines; cap.coalesced = r.coalesced; cap.coalescePlan = r;
+      return r;
+    };
+    this._coalesceAreas = function (a) {
+      const r = origAreas.call(this, Object.assign({}, a, { lat: ctx.lat }));
+      cap.areas = r.entries; cap.covered = r.covered; cap.areasPlan = r;
+      throw new Error(STOP);
+    };
+    this.wayNodesBatch = function (ids) {
+      const r = origBatch.call(this, ids);
+      for (const [k, v] of r) cap.geom.set(k, v);
+      return r;
+    };
+    /**
+     * **烘焙（低缩放预计算）的输入也读物化几何**：合并过程中要取 10 万个节点坐标
+     * （`_coalesce` 里的 `_fetchNodes`），在磁盘瓶颈的机器上那是烘焙最贵的一步。
+     * 这里按**整块瓦片**一次性建好坐标缓存，之后合并/面接龙的每一次取坐标都命中它。
+     * （读的仍然是同一份数据：`ways.geom` 是从 `way_nodes` + `nodes` 物化出来的。）
+     */
+    const origFetch = this._fetchNodes;
+    let tileCache = null;
+    this._fetchNodes = function (ids, out, nodeTags, zoom, neverSendOn, cache) {
+      if (!cache && this._wayGeom.on && this._wayGeomReady) {
+        if (tileCache === null) {
+          const wayIds = [];
+          for (const r of this.db.prepare(`SELECT id FROM ways INDEXED BY way_index
+            WHERE max_lon >= ? AND min_lon <= ? AND max_lat >= ? AND min_lat <= ?`)
+            .iterate(box.minLon, box.maxLon, box.minLat, box.maxLat)) wayIds.push(r.id);
+          tileCache = this._wayGeomNodeCache(wayIds);
+        }
+        cache = tileCache;
+      }
+      return origFetch.call(this, ids, out, nodeTags, zoom, neverSendOn, cache);
+    };
+    let err = null;
+    try { this.queryBbox(this._dlodQueryOpts(z, box, ctx)); } catch (e) { err = e; } finally {
+      this._scanCandidates = origScan;
+      this._coalesce = origCoalesce;
+      this._coalesceAreas = origAreas;
+      this._fetchNodes = origFetch;
+      this.wayNodesBatch = origBatch;
+    }
+    if (!cap.lines && !cap.areas) {
+      throw new Error('烘焙没走到 _coalesce/_coalesceAreas：' + (err ? err.message : '未知原因'));
+    }
+    return cap;
+  }
+
+  /** 烘焙用的查询参数：**与 server/index.js 的 /api/map 同一组**（否则几何会不一样） */
+  _dlodQueryOpts(z, box, ctx) {
+    const o = ctx.opts || {};
+    return {
+      ...box, zoom: z, limit: ctx.viewportLimit,
+      wayCandidates: o.wayCandidates, nodeCandidates: o.nodeCandidates,
+      relationLimit: o.relationLimit, relationCropPad: o.relationCropPad,
+      relationCropMinMembers: o.relationCropMinMembers,
+      relationCropBoundaryMembers: o.relationCropBoundaryMembers,
+      detail: o.detail === undefined ? null : o.detail,
+      lodDetail: o.lodDetail, lodRoadSend: o.roadSend,
+      lodRoadClassFloor: o.roadClassFloor || o.roadClassZoom,
+      minFillArea: o.minFillArea === undefined ? null : o.minFillArea,
+      lodMinFillArea: o.lodMinFillArea,
+      neverSend: null, lodNeverSend: o.neverSend,
+      coalesce: o.coalesce, compact: true, view: null, flatCaps: false,
+      // 预计算层自己读盘：烘焙时别让读路径又去读它（否则烘出来的就是"上一版的结果"）
+      _dlodOff: true,
+    };
+  }
+
+  /**
+   * 规则签名：`displaylod.js signature()`。读路径每次都会按"这次请求实际生效的参数"重算，
+   * 对不上就退回实时路径（改了 config 而没重建时**只会慢，绝不会画错**）。
+   */
+  _dlodSignatureFor(z, extent, tiles, lat, lod, coalesceOpts, limit, viewportLimit) {
+    return DLOD.signature({
+      bands: this._dlod.bands, tiles,
+      extent, lat,
+      detail: lod.detail, minFillArea: lod.minFillArea, sendRank: lod.sendRank,
+      floor: lod.floor, neverSendOn: lod.neverSendOn, wayLodReady: this._wayLodReady,
+      minZoom: coalesceOpts.minZoom, budget: coalesceOpts.budget, minClassWays: coalesceOpts.minClassWays,
+      tolPx: coalesceOpts.tolPx, coordDigits: coalesceOpts.coordDigits,
+      viewportLimit: viewportLimit === undefined ? limit : viewportLimit,
+    });
+  }
+
+  /* ------------------------------ 构建 ------------------------------ */
+  /**
+   * 构建（同步版，给 `tools/build-display-lod.js` 与 CI 的种子步骤用）。
+   * 带进度回调；每块瓦片是一个事务（**原子替换**：先 `DELETE WHERE z=? AND tile=?` 再插入）。
+   *
+   * `only` 给出时要建的 (z,tile) 集合（增量/失效重算都走它）。
+   */
+  buildDisplayLod({ bands, only, onProgress, log } = {}) {
+    this._dlodEnsureSchema();
+    const t0 = Date.now();
+    const extent = this._dlodDataExtent();
+    if (!extent) throw new Error('库里没有任何带 bbox 的 way，无法建预计算层');
+    const tiles = this._dlod.tiles;
+    const lat = this._dlodLatRef(extent);
+    const grid = this._dlodGrid(extent, tiles);
+    const want = (bands && bands.length ? bands : this._dlod.bands).slice().sort((a, b) => a - b);
+    const jobs = [];
+    for (const z of want) {
+      for (let tile = 1; tile <= grid.count; tile++) {
+        if (only && !only.has(z + ':' + tile)) continue;
+        jobs.push([z, tile]);
+      }
+    }
+    const report = { extent, tiles, lat, bands: want, jobs: jobs.length, done: 0, failed: 0, lines: 0, areas: 0, cov: 0, bytes: 0, maxTileMs: 0, ms: 0, perBand: {}, survey: {} };
+    const insLine = this.db.prepare(`INSERT OR REPLACE INTO ${DLOD.DLOD_TABLE}
+      (z,tile,id,owner,kind,family,cls,name,rel,ways,nseg,npts,rawnpts,min_lon,max_lon,min_lat,max_lat,tags,geom,built_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const insCov = this.db.prepare(`INSERT OR REPLACE INTO ${DLOD.DLOD_COV}
+      (z,tile,way_id,status,sub,min_lon,max_lon,min_lat,max_lat) VALUES(?,?,?,?,?,?,?,?,?)`);
+    /** 每个 band 一张去向 R*Tree + 它对应的插入/删除语句（见 displaylod.js 里为什么按 band 分表） */
+    const covRt = new Map();
+    const covRtOf = (z) => {
+      let o = covRt.get(z);
+      if (!o) {
+        this.db.exec(DLOD.covRtreeSql(z));
+        const rt = DLOD.covRtreeName(z);
+        o = {
+          ins: this.db.prepare(`INSERT OR REPLACE INTO ${rt}(id,min_lon,max_lon,min_lat,max_lat) VALUES(?,?,?,?,?)`),
+          del: this.db.prepare(`DELETE FROM ${rt} WHERE id IN (SELECT rowid FROM ${DLOD.DLOD_COV} WHERE z = ? AND tile = ?)`),
+        };
+        covRt.set(z, o);
+      }
+      return o;
+    };
+    const delTile = this.db.prepare(`DELETE FROM ${DLOD.DLOD_TABLE} WHERE z = ? AND tile = ?`);
+    const delCov = this.db.prepare(`DELETE FROM ${DLOD.DLOD_COV} WHERE z = ? AND tile = ?`);
+    const cx = this._dlodBuildCtx(extent, lat, grid);
+    // 全量构建：每个 band 在整个数据范围上把"要合并的样式类"定一次；增量重算用 meta 里存下来的那份
+    for (const z of want) {
+      const t = Date.now();
+      const r = this._dlodClassesFor(z, cx, only);
+      report.survey[z] = { ms: Date.now() - t, classes: r.classes.length, from: r.from };
+      if (log && r.from === 'survey') log(`  选类探针 z${z}：${r.classes.length} 个样式类（${Date.now() - t} ms）`);
+    }
+    const builtAt = Date.now();
+    for (const [z, tile] of jobs) {
+      const box = grid.boxOf(tile);
+      const tt0 = Date.now();
+      let cap = null;
+      let ferr = null;
+      try { cap = this._dlodBakeTile(z, tile, box, cx); } catch (e) { ferr = e; }
+      const ms = Date.now() - tt0;
+      if (ms > report.maxTileMs) report.maxTileMs = ms;
+      if (ferr) {
+        report.failed += 1;
+        if (log) log(`  ⚠ z${z} 瓦片 #${tile} 烘焙失败：${ferr.message.slice(0, 120)}`);
+        continue;
+      }
+      let rows = 0;
+      const band = report.perBand[z] || (report.perBand[z] = { lines: 0, areas: 0, cov: 0, bytes: 0, ms: 0, maxTileMs: 0, tiles: 0 });
+      this.db.exec('BEGIN');
+      try {
+        covRtOf(z).del.run(z, tile);
+        delTile.run(z, tile);
+        delCov.run(z, tile);
+        for (const r of this._dlodRowsOf(z, tile, cap, cx, builtAt)) {
+          insLine.run(...r.args);
+          rows += 1;
+          report.bytes += r.bytes;
+          band.bytes += r.bytes;
+          if (r.kind === 'area') { report.areas += 1; band.areas += 1; } else { report.lines += 1; band.lines += 1; }
+        }
+        for (const c of this._dlodCovRowsOf(z, tile, cap, cx)) {
+          const res = insCov.run(...c);
+          covRtOf(z).ins.run(res.lastInsertRowid, c[5], c[6], c[7], c[8]);
+          report.cov += 1; band.cov += 1;
+        }
+        this.db.exec('COMMIT');
+      } catch (e) {
+        try { this.db.exec('ROLLBACK'); } catch { /* ignore */ }
+        report.failed += 1;
+        if (log) log(`  ⚠ z${z} 瓦片 #${tile} 写库失败：${e.message.slice(0, 120)}`);
+        continue;
+      }
+      band.ms += ms; band.tiles += 1;
+      if (ms > band.maxTileMs) band.maxTileMs = ms;
+      report.done += 1;
+      if (onProgress) onProgress(report.done / jobs.length, { z, tile, rows, ms });
+    }
+    // band 级状态落 meta：**建到哪个档、哪个档立刻开始走快路径**（读路径按 bands[z].done 判）
+    this._dlodFlushMeta(cx, report, true);
+    report.ms = Date.now() - t0;
+    return report;
+  }
+
+  /** 烘焙上下文（LOD 规则 + 合并规则 + 配置；与 /api/map 用的同一份规范化函数） */
+  _dlodBuildCtx(extent, lat, grid) {
+    const o = this._dlod.opts || {};
+    /**
+     * ⚠ `QUERY_CAPS` 里**没有** viewportLimit 这个键（它由 config limits.viewportLimit 提供，
+     * index.js 的默认值是 15000）。第一版这里写成 `capOf(o.viewportLimit, QUERY_CAPS.viewportLimit)`，
+     * 于是"没带 limits 的调用方"（工具/测试直接 `new OsmDB(file, {displayLod:{...}})`）拿到的是
+     * `undefined` → 签名里少一个键 → 读路径永远对不上、永远退回实时路径。
+     * 现在兜底 15000：与 server/index.js 的默认口径一致（config.json 的 limits.viewportLimit 也是它）。
+     */
+    const limit = capOf(o.viewportLimit, 15000);
+    const lod = makeLod({
+      zoom: 16, detail: o.detail === undefined ? null : o.detail, lodDetail: o.lodDetail,
+      minFillArea: o.minFillArea === undefined ? null : o.minFillArea, lodMinFillArea: o.lodMinFillArea,
+      roadSend: o.roadSend, lodRoadSend: o.roadSend,
+      roadClassFloor: o.roadClassFloor || o.roadClassZoom,
+      neverSend: null, lodNeverSend: o.neverSend,
+    });
+    return {
+      extent, lat, grid, viewportLimit: limit, opts: o,
+      lodProto: lod,
+      coalesceOpts: coalesceOptsOf(o.coalesce),
+      scale: Math.pow(10, coalesceOptsOf(o.coalesce).coordDigits),
+      /** band → 全局定下来的"要合并的样式类"集合（见 `_dlodSurveyClasses`） */
+      forceClasses: new Map(),
+    };
+  }
+
+  /**
+   * **在整个数据范围上把"这一档要合并哪些样式类"定一次**（原型点名的那个坑：瓦片越小、
+   * 按本瓦片条数选中的类越少，本该合并的 way 会被挤出去）。
+   *
+   * 做法：拿**整个数据范围**当视口跑一次真实的 `queryBbox`，但让 `_coalesce` 走
+   * `surveyClasses` 探针 —— 它数完每个类的条数、按同一条规则（`chooseCoalesceClasses`）选完类
+   * 就返回，**不接龙、不取节点坐标、不算面**，所以便宜（实测每个 band 100~400 ms，见报告）。
+   * 拿到的集合烘进 meta 的 `bands[z].classes`，之后每一块瓦片（以及**单块瓦片的重算**）都用它。
+   */
+  _dlodSurveyClasses(z, cx) {    let captured = null;
+    const orig = this._coalesce;
+    const self = this;
+    this._coalesce = function (picked, geom, o) {
+      const r = orig.call(this, picked, geom, Object.assign({}, o, {
+        lat: cx.lat, opts: Object.assign({}, o.opts, { surveyClasses: true }),
+      }));
+      captured = r;
+      throw new Error('__DLOD_SURVEY_STOP__');
+    };
+    try {
+      this.queryBbox(this._dlodQueryOpts(z, cx.extent, cx));
+    } catch (e) {
+      if (!captured) throw new Error('选类探针失败（z' + z + '）：' + e.message);
+    } finally {
+      this._coalesce = orig;
+    }
+    void self;
+    const list = (captured && captured.chosenClasses) || [];
+    cx.forceClasses.set(z, new Set(list));
+    return { classes: list, scanned: captured ? captured.stats.candidateWays : 0 };
+  }
+
+  /**
+   * 这一档要用的"合并样式类集合"：**增量重算从 meta 读，全量构建才探针**。
+   * 返回 `{ classes, from }`，`from` ∈ 'survey'（这次真的算了一遍）/ 'meta'（用烘好的那份）。
+   */
+  _dlodClassesFor(z, cx, only) {
+    if (only) {
+      const st = this._dlodState();
+      const stored = st && st.bands[z] && st.bands[z].classes;
+      if (Array.isArray(stored) && stored.length) {
+        cx.forceClasses.set(z, new Set(stored));
+        return { classes: stored, from: 'meta' };
+      }
+    }
+    const r = this._dlodSurveyClasses(z, cx);
+    return { classes: r.classes, from: 'survey' };
+  }
+
+  /**
+   * 一块瓦片的捕获结果 → `display_lod` 的行。
+   *
+   * 每个条目（折线 / 面）一行：几何用**现有那套量化 + 差分的紧凑编码**（`packLodPaths`），
+   * 另附点数/段数/来源 way 条数/bbox/标签；`id` 是稳定内容 id（`DLOD.stableId`），
+   * 于是"重算同一块瓦片"写回的是同一批 id（A/B 对拍与排查都看得到）。
+   *
+   * 每行的 `cls` / `ways` / `rawnpts` 来自 `_coalesce` / `_coalesceAreas` 输出的
+   * `groupCls` / `groupWays` / `groupRaw`（与 `lines` / `entries` **同一个循环、同一个下标**填的，
+   * 所以不可能是"另算一遍"的近似值），分组键 `groupKeys[i]` 用来定稳定 id。
+   */
+  *_dlodRowsOf(z, tile, cap, cx, builtAt) {
+    const scale = cx.scale;
+    const lines = cap.lines || [];
+    const lKeys = (cap.coalescePlan && cap.coalescePlan.groupKeys) || [];
+    const lCls = (cap.coalescePlan && cap.coalescePlan.groupCls) || [];
+    const lWays = (cap.coalescePlan && cap.coalescePlan.groupWays) || [];
+    const lRaw = (cap.coalescePlan && cap.coalescePlan.groupRaw) || [];
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i];
+      const paths = pathsOfEntry(l);
+      if (!paths.length) continue;
+      const box = DLOD.bboxOfPaths(paths);
+      const id = DLOD.stableId(crypto, 'line', z, tile, lKeys[i] === undefined ? ('idx:' + i) : lKeys[i]);
+      const npts = paths.reduce((s, p) => s + p.length, 0);
+      const geom = packLodPaths(paths, scale);
+      yield {
+        kind: 'line', id, bytes: geom.length,
+        args: [z, tile, id, tile, 'line', l.class || 'other', lCls[i] || null, (l.tags && l.tags.name) || null, null,
+          lWays[i] || 0, paths.length, npts, lRaw[i] || 0,
+          box.minLon, box.maxLon, box.minLat, box.maxLat, JSON.stringify(l.tags || {}), geom, builtAt],
+      };
+    }
+    const areas = cap.areas || [];
+    const aKeys = (cap.areasPlan && cap.areasPlan.groupKeys) || [];
+    const aCls = (cap.areasPlan && cap.areasPlan.groupCls) || [];
+    const aWays = (cap.areasPlan && cap.areasPlan.groupWays) || [];
+    const aRaw = (cap.areasPlan && cap.areasPlan.groupRaw) || [];
+    for (let i = 0; i < areas.length; i++) {
+      const a = areas[i];
+      const paths = pathsOfEntry(a);
+      if (!paths.length) continue;
+      const box = DLOD.bboxOfPaths(paths);
+      const id = DLOD.stableId(crypto, 'area', z, tile, aKeys[i] === undefined ? ('idx:' + i) : aKeys[i]);
+      const npts = paths.reduce((s, p) => s + p.length, 0);
+      const geom = packLodPaths(paths, scale);
+      yield {
+        kind: 'area', id, bytes: geom.length,
+        args: [z, tile, id, tile, 'area', a.class || 'other', aCls[i] || null, (a.tags && a.tags.name) || null,
+          a.rel === undefined ? null : a.rel, aWays[i] || 0, paths.length, npts, aRaw[i] || 0,
+          box.minLon, box.maxLon, box.minLat, box.maxLat, JSON.stringify(a.tags || {}), geom, builtAt],
+      };
+    }
+  }
+
+  /**
+   * 一块瓦片的捕获结果 → `display_lod_cov` 的行（**这块瓦片里每一个候选 way 的去向**）。
+   *
+   * 这张表是查询侧重建 `truncation.kinds.ways` 那本账的**唯一依据** —— 于是走预计算路径时
+   * 服务端**再也不需要为了"数一数有几个候选 way"去扫 2.3 万行 way、逐行 JSON.parse 标签**
+   * （那一步实测 z10 168 ms / z12 214 ms，是这条路上最后一块大头）。
+   * 每条 way 的去向与实时路径**逐个对齐**（`line` = coalesced、`area` = areas.covered、
+   * `way` = 逐条下发、`nogfx` = 没几何、`invisible` = 分级看不见、`lod` = LOD 扣下）。
+   *
+   * bbox 存成 1e-5 度的整数（约 1.1 m）：查询侧用它判"这条 way 与视口相不相交"，
+   * 而实时路径那个判据本来也是 bbox 级的（R*Tree 还是 float32），精度远够。
+   */
+  _dlodCovRowsOf(z, tile, cap, cx) {
+    const S = 1e5;
+    const qi = (v) => Math.round(v * S);
+    const out = [];
+    const seen = new Set();
+    const push = (row, status, sub) => {
+      const id = Number(row.id);
+      if (seen.has(id)) return;
+      seen.add(id);
+      out.push([z, tile, id, status, sub || null,
+        qi(row.bb_min_lon) - 1, qi(row.bb_max_lon) + 1, qi(row.bb_min_lat) - 1, qi(row.bb_max_lat) + 1]);
+    };
+    const lod = cx.lodProto;
+    const zoom = z;
+    for (const row of cap.rejects) {
+      const tags = parseTags(row.tags);
+      if (!tags || !lodVisible(tags, zoom, 'line', lod.floor)) { push(row, 'invisible', null); continue; }
+      const cls = lodWithholdClass(tags, zoom, lod, row, !!row.closed);
+      if (!cls) { push(row, 'invisible', null); continue; }   // 防御：不该发生
+      let sub = cls;
+      if (cls === 'neverSend') sub = 'neverSend:' + (neverSendClassOf(tags) || 'other');
+      else if (cls === 'roadClass') sub = 'roadClass:' + roadRankOf(tags);
+      else if (cls === 'railMinor') sub = tags.usage === 'main' ? 'railMinor:main' : 'railMinor';
+      push(row, 'lod', sub);
+    }
+    const coalesced = cap.coalesced || new Set();
+    const covered = cap.covered || new Set();
+    const geom = cap.geom;
+    for (const p of cap.picked) {
+      const id = Number(p.row.id);
+      const ids = geom.get(id);
+      if (!ids || !ids.length) { push(p.row, 'nogfx', null); continue; }
+      if (coalesced.has(id)) { push(p.row, 'line', coalesceClassOf(p.tags)); continue; }
+      if (covered.has(id)) { push(p.row, 'area', areaClassOf(p.tags)); continue; }
+      push(p.row, 'way', null);
+    }
+    return out;
+  }
+
+  /**
+   * **切片构建**（服务端启动时对老库自动补建 / 失效后后台重算走它）。
+   *
+   * 切片单位 = 一个 (band, 瓦片)。每片之间 `setImmediate` 让出事件循环，`/api/ready` 一直能答；
+   * 每个 band 全部建完就写一次 meta（**建到哪一档、哪一档立刻开始走快路径**）。
+   * ⚠ 单片就是一个真实的瓦片合并，实测最坏一块（z14）1.1~1.9 s —— 做不到 25 ms，
+   * 这是"一次同步合并 + 一次批量取几何"的下限（要更快只能把瓦片切得更细，代价是跨瓦片重复几何更多）。
+   */
+  async buildDisplayLodSliced({ bands, only, sliceMs = 25, onProgress, log } = {}) {
+    const t0 = Date.now();
+    this._dlodEnsureSchema();
+    const extent = this._dlodDataExtent();
+    if (!extent) return { skipped: '库里没有 way', ms: 0 };
+    const tiles = this._dlod.tiles;
+    const lat = (extent.minLat + extent.maxLat) / 2;
+    const grid = this._dlodGrid(extent, tiles);
+    const want = (bands && bands.length ? bands : this._dlod.bands).slice().sort((a, b) => a - b);
+    const jobs = [];
+    for (const z of want) for (let tile = 1; tile <= grid.count; tile++) {
+      if (only && !only.has(z + ':' + tile)) continue;
+      jobs.push([z, tile]);
+    }
+    const cx = this._dlodBuildCtx(extent, lat, grid);
+    /**
+     * 全量/首次构建：每个 band 在整个数据范围上把"要合并的样式类"定一次（`_dlodSurveyClasses`）。
+     * **增量重算（`only`）绝不重新探针**：一是贵，二是"重算一块瓦片"必须用**与其它瓦片同一份**类集合，
+     * 否则同一档里不同瓦片的折线集就会不一致（那正是"瓦片越小选中的类越少"这个坑的另一种形态）。
+     * 所以类集合烘进 meta（`bands[z].classes`），重算时从 meta 读。
+     */
+    const stats = { done: 0, failed: 0, total: jobs.length, perBand: {}, maxTileMs: 0, slices: 0, lines: 0, areas: 0, cov: 0, bytes: 0, survey: {} };
+    for (const z of want) {
+      const t = Date.now();
+      const r = this._dlodClassesFor(z, cx, only);
+      stats.survey[z] = { ms: Date.now() - t, classes: r.classes.length, from: r.from };
+    }
+    const out = await this._dlodWriteJobs(jobs, cx, stats, { sliceMs, onProgress, log });
+    Object.assign(stats, out);
+    stats.ms = Date.now() - t0;
+    return stats;
+  }
+
+  /** 真正写库的那一段（同步构建与切片构建共用；每片之间让出事件循环） */
+  async _dlodWriteJobs(jobs, cx, stats, { sliceMs = 25, onProgress, log } = {}) {
+    const z = this._dlod;
+    const insLine = this.db.prepare(`INSERT OR REPLACE INTO ${DLOD.DLOD_TABLE}
+      (z,tile,id,owner,kind,family,cls,name,rel,ways,nseg,npts,rawnpts,min_lon,max_lon,min_lat,max_lat,tags,geom,built_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const insCov = this.db.prepare(`INSERT OR REPLACE INTO ${DLOD.DLOD_COV}
+      (z,tile,way_id,status,sub,min_lon,max_lon,min_lat,max_lat) VALUES(?,?,?,?,?,?,?,?,?)`);
+    /** 每个 band 一张去向 R*Tree + 它对应的插入/删除语句（见 displaylod.js 里为什么按 band 分表） */
+    const covRt = new Map();
+    const covRtOf = (z) => {
+      let o = covRt.get(z);
+      if (!o) {
+        this.db.exec(DLOD.covRtreeSql(z));
+        const rt = DLOD.covRtreeName(z);
+        o = {
+          ins: this.db.prepare(`INSERT OR REPLACE INTO ${rt}(id,min_lon,max_lon,min_lat,max_lat) VALUES(?,?,?,?,?)`),
+          del: this.db.prepare(`DELETE FROM ${rt} WHERE id IN (SELECT rowid FROM ${DLOD.DLOD_COV} WHERE z = ? AND tile = ?)`),
+        };
+        covRt.set(z, o);
+      }
+      return o;
+    };
+    const delTile = this.db.prepare(`DELETE FROM ${DLOD.DLOD_TABLE} WHERE z = ? AND tile = ?`);
+    const delCov = this.db.prepare(`DELETE FROM ${DLOD.DLOD_COV} WHERE z = ? AND tile = ?`);
+    const builtAt = Date.now();
+    let i = 0;
+    while (i < jobs.length) {
+      const sliceStart = Date.now();
+      while (i < jobs.length && (i === 0 || Date.now() - sliceStart < sliceMs)) {
+        const [bz, tile] = jobs[i];
+        i += 1;
+        const box = cx.grid.boxOf(tile);
+        const tt0 = Date.now();
+        let cap = null;
+        let ferr = null;
+        try { cap = this._dlodBakeTile(bz, tile, box, cx); } catch (e) { ferr = e; }
+        const ms = Date.now() - tt0;
+        if (ms > stats.maxTileMs) stats.maxTileMs = ms;
+        const band = stats.perBand[bz] || (stats.perBand[bz] = { lines: 0, areas: 0, cov: 0, bytes: 0, tiles: 0, maxTileMs: 0 });
+        band.tiles += 1;
+        if (ms > band.maxTileMs) band.maxTileMs = ms;
+        if (ferr) {
+          stats.failed += 1;
+          if (log) log(`[dlod] ⚠ z${bz} 瓦片 #${tile} 烘焙失败：${ferr.message.slice(0, 120)}`);
+          continue;
+        }
+        if (!stats.hasOwnProperty('_' + bz)) { stats['_' + bz] = 1; }   // 标记这个 band 被动过
+        this.db.exec('BEGIN');
+        try {
+          covRtOf(bz).del.run(bz, tile);
+          delTile.run(bz, tile);
+          delCov.run(bz, tile);
+          for (const r of this._dlodRowsOf(bz, tile, cap, cx, builtAt)) {
+            insLine.run(...r.args);
+            stats.bytes += r.bytes; band.bytes += r.bytes;
+            if (r.kind === 'area') { stats.areas += 1; band.areas += 1; } else { stats.lines += 1; band.lines += 1; }
+          }
+          for (const c of this._dlodCovRowsOf(bz, tile, cap, cx)) {
+            const res = insCov.run(...c);
+            covRtOf(bz).ins.run(res.lastInsertRowid, c[5], c[6], c[7], c[8]);
+            stats.cov += 1; band.cov += 1;
+          }
+          this.db.exec('COMMIT');
+        } catch (e) {
+          try { this.db.exec('ROLLBACK'); } catch { /* ignore */ }
+          stats.failed += 1;
+          if (log) log(`[dlod] ⚠ z${bz} 瓦片 #${tile} 写库失败：${e.message.slice(0, 120)}`);
+          continue;
+        }
+        stats.done += 1;
+        if (onProgress) onProgress(stats.done / Math.max(1, stats.total), { z: bz, tile, ms });
+      }
+      stats.slices += 1;
+      this._dlodFlushMeta(cx, stats);
+      await new Promise((r) => setImmediate(r));
+    }
+    this._dlodFlushMeta(cx, stats, true);
+    return stats;
+  }
+
+  /**
+   * 把这一层的状态写进 meta（读路径据此决定"哪一档可以走快路径"）。
+   *
+   * ⚠ 两个必须写对的地方（都踩过）：
+   *   1. **`done` 在增量重算时必须保持 true**：失效重算只重建**脏的那一块瓦片**（`--only` 语义），
+   *      要是拿"这一轮建了几块"去比"总共几块"，一个 band 会因为一次编辑就被标成"没建完"，
+   *      于是读路径**永远**退回实时路径（本用例第一版就是这样：编辑之后再也没走回快路径）。
+   *   2. **条数与体积从库里数，不用这一轮的统计**：增量重算的 stats 只覆盖脏瓦片，
+   *      拿它去覆盖 meta 会让 band 的行数/体积凭空缩水（`rows` 甚至可能变成 0 → 整层不可用）。
+   *      这两条 `SELECT` 都走索引，几毫秒。
+   */
+  _dlodFlushMeta(cx, stats, final = false) {
+    const prev = this._dlodState();
+    const bands = {};
+    if (prev) Object.assign(bands, prev.bands);
+    const stBand = this.db.prepare(`SELECT COUNT(*) AS n, SUM(LENGTH(geom)) AS bytes,
+      SUM(kind = 'line') AS lines, SUM(kind = 'area') AS areas FROM ${DLOD.DLOD_TABLE} WHERE z = ?`);
+    const stCov = this.db.prepare(`SELECT COUNT(*) AS n FROM ${DLOD.DLOD_COV} WHERE z = ?`);
+    const stTile = this.db.prepare(`SELECT COUNT(DISTINCT tile) AS n FROM ${DLOD.DLOD_TABLE} WHERE z = ?`);
+    for (const k of Object.keys(stats.perBand)) {
+      const z = Number(k);
+      const b = stats.perBand[k];
+      const fromDb = stBand.get(z);
+      const prevBand = bands[k];
+      const doneBefore = !!(prevBand && prevBand.done);
+      // "这一档一共建过几块瓦片"：已经建完的照旧算建完；否则把上一轮的块数加上这一轮的
+      const tiles = doneBefore ? cx.grid.count
+        : Math.min(cx.grid.count, (prevBand ? prevBand.tiles || 0 : 0) + b.tiles);
+      bands[k] = {
+        tiles, lines: fromDb.lines || 0, areas: fromDb.areas || 0,
+        rows: fromDb.n || 0, cov: stCov.get(z).n || 0, bytes: fromDb.bytes || 0,
+        maxTileMs: Math.max((prevBand && prevBand.maxTileMs) || 0, b.maxTileMs || 0),
+        builtTiles: stTile.get(z).n || 0,
+        // 这一档"要合并的样式类"集合：重算单块瓦片时必须用**同一份**（见 _dlodClassesFor）
+        classes: cx.forceClasses.has(z) ? [...cx.forceClasses.get(z)]
+          : ((prevBand && prevBand.classes) || []),
+        done: tiles >= cx.grid.count || (final && doneBefore && fromDb.n > 0),
+        at: Date.now(),
+        // 签名按 band 单独存（`sendRank` 随 zoom 变，所以不能一个签名管七个档）
+        sig: this._dlodSigForBand(z, cx),
+      };
+    }
+    let rows = 0; let bytes = 0;
+    for (const k of Object.keys(bands)) { rows += (bands[k].lines || 0) + (bands[k].areas || 0); bytes += bands[k].bytes || 0; }
+    const state = {
+      version: DLOD.DLOD_VERSION, tiles: cx.grid.n, extent: cx.extent, lat: cx.lat,
+      bands, rows, bytes, builtAt: (prev && prev.builtAt) || Date.now(),
+    };
+    this.db.prepare(`INSERT OR REPLACE INTO ${DLOD.DLOD_META}(k, v) VALUES('state', ?)`).run(JSON.stringify(state));
+    this._dlodStateCache = undefined;
+  }
+
+  /** 某个 band 的规则签名（读路径按同一份算法重算并要求完全一致） */
+  _dlodSigForBand(z, cx) {
+    const o = cx.opts;
+    const lod = makeLod({
+      zoom: z, detail: o.detail === undefined ? null : o.detail, lodDetail: o.lodDetail,
+      minFillArea: o.minFillArea === undefined ? null : o.minFillArea, lodMinFillArea: o.lodMinFillArea,
+      roadSend: o.roadSend, lodRoadSend: o.roadSend,
+      roadClassFloor: o.roadClassFloor || o.roadClassZoom,
+      neverSend: null, lodNeverSend: o.neverSend,
+    });
+    return this._dlodSignatureFor(z, cx.extent, cx.grid.n, cx.lat, lod, cx.coalesceOpts, cx.viewportLimit, cx.viewportLimit);
+  }
+
+  /* ------------------------------ 失效（编辑） ------------------------------ */
+  /**
+   * **标记脏瓦片**（写路径唯一的钩子）。规则（见 `dlodMarkDirty` 的调用点）：
+   *   · 一条 way 的几何变了 → 它**新旧 bbox** 压到的所有瓦片都脏（在两个 band 段内）；
+   *   · 只标"这条 way 真的可见的那些档"（`ways.lod_zoom ~ 14`），不是无脑 7 个档 ——
+   *     实测（logs/pc-invalidate.txt）12×12 网格下"每条 way 压到的瓦片数"中位 1、p99 2，
+   *     而一条 residential（lod_zoom=14）只需重算 z14 那一档。
+   *
+   * 脏瓦片在重算完成**之前**一律走实时路径（`_dlodPlan` 直接返回 null），
+   * 所以"绝不显示旧几何"是结构性的，不靠重算及时。
+   */
+  dlodMarkDirty(box, minZoom, maxZoom) {
+    if (!this._dlod.on || !box || !Number.isFinite(box.minLon)) return 0;
+    const st = this._dlodState();
+    if (!st) return 0;
+    const grid = DLOD.makeGrid(st.extent, st.tiles);
+    const tiles = grid.tilesOfBox(box);
+    if (!DLOD.boxInside(box, st.extent)) {
+      /**
+       * 改动落在数据范围之外（有人在网格外新建了一条路/拖出一个点）：整层作废 ——
+       * 把所有 (band, 瓦片) 标脏，后台那次重建会**重算范围**再逐块重烘；
+       * 在那之前读路径整体退回实时路径（`_dlodExtentStale`）。
+       */
+      this._dlodExtentStale = true;
+      for (const z of this._dlod.bands) for (let t = 1; t <= grid.count; t++) this._dlodAddDirty(z, t);
+      return 0;
+    }
+    if (!tiles.length) return 0;
+    const lo = Math.max(0, Math.floor(Number(minZoom) || 0));
+    const hi = Math.max(lo, Math.floor(Number(maxZoom) || 0));
+    let n = 0;
+    for (const z of this._dlod.bands) {
+      if (z < lo || z > hi) continue;
+      for (const t of tiles) if (this._dlodAddDirty(z, t)) n += 1;
+    }
+    return n;
+  }
+
+  _dlodAddDirty(z, tile) {
+    const key = z + ':' + tile;
+    if (this._dlodDirty.has(key)) return false;
+    this._dlodDirty.set(key, { z, tile, at: Date.now() });
+    try {
+      this.db.prepare(`INSERT OR REPLACE INTO ${DLOD.DLOD_DIRTY}(z, tile, at) VALUES(?,?,?)`).run(z, tile, Date.now());
+    } catch { /* 库是只读/表不存在：内存里记住就够 */ }
+    this._dlodKick();
+    return true;
+  }
+
+  _dlodClearDirty(z, tile) {
+    this._dlodDirty.delete(z + ':' + tile);
+    try { this.db.prepare(`DELETE FROM ${DLOD.DLOD_DIRTY} WHERE z = ? AND tile = ?`).run(z, tile); } catch { /* ignore */ }
+  }
+
+  _dlodLoadDirty() {
+    this._dlodDirty = new Map();
+    try {
+      for (const r of this.db.prepare(`SELECT z, tile, at FROM ${DLOD.DLOD_DIRTY}`).iterate()) {
+        this._dlodDirty.set(r.z + ':' + r.tile, { z: r.z, tile: r.tile, at: r.at });
+      }
+    } catch { /* 没有这张表：一切照旧 */ }
+  }
+
+  /** 后台重算：串行、每块之间让出事件循环；一次只跑一个循环（重复调用直接返回） */
+  _dlodKick() {
+    if (this._dlodBgRunning || !this._dlod.autoRebuild) return;
+    if (!this._dlodDirty.size) return;
+    this._dlodBgRunning = true;
+    setTimeout(() => this._dlodDrain().catch(() => { this._dlodBgRunning = false; }), 50);
+  }
+
+  /**
+   * **把上一次进程留下的脏瓦片接着算完**（服务端启动时调用，见 index.js 的 autoBuildDisplayLod）。
+   *
+   * 为什么必须有这一条：脏集合是**跨重启保留**的（写在 `display_lod_dirty` 表里，这是对的 ——
+   * 进程被杀时那些瓦片确实还没重算）。但"标脏"那条路（`_dlodAddDirty`）才会 `_dlodKick()`，
+   * 而启动时是 `_dlodLoadDirty()` 从表里读回来的 —— 第一版没在这里补一次 kick，
+   * 结果**被 Ctrl+C / 被 kill 打断过一次之后，那几块瓦片就永远走实时路径了**
+   *（本套件第二次运行时抓到的就是这个：基线请求 ms=699 = 实时路径）。
+   * 返回这次"接手"了多少块脏瓦片，调用方如实打日志。
+   */
+  dlodResume() {
+    if (!this._dlod.on) return 0;
+    const n = this._dlodDirty.size;
+    if (n) this._dlodKick();
+    return n;
+  }
+
+  async _dlodDrain() {
+    try {
+      while (this._dlodDirty.size) {
+        const keys = [...this._dlodDirty.values()].slice(0, 64);
+        const only = new Set(keys.map((k) => k.z + ':' + k.tile));
+        const bands = [...new Set(keys.map((k) => k.z))];
+        const t0 = Date.now();
+        const stats = await this.buildDisplayLodSliced({ bands, only, sliceMs: this._dlod.sliceMs, log: this._dlod.log });
+        for (const k of keys) this._dlodClearDirty(k.z, k.tile);
+        this._dlodExtentStale = false;
+        if (this._dlod.log) {
+          this._dlod.log(`[dlod] 失效重算完成：${keys.length} 块（band ${bands.join(',')}）· ${stats.done} 块成功 / ${stats.failed} 失败`
+            + ` · 最长一块 ${stats.maxTileMs} ms · 合计 ${Date.now() - t0} ms`);
+        }
+        await new Promise((r) => setImmediate(r));
+      }
+    } finally {
+      this._dlodBgRunning = false;
+    }
+  }
+
+  /** 同步重算脏瓦片（测试/工具用；服务端走 _dlodDrain 的后台循环） */
+  dlodRebuildDirtyNow() {    if (!this._dlodDirty.size) return { done: 0 };
+    const keys = [...this._dlodDirty.values()];
+    const only = new Set(keys.map((k) => k.z + ':' + k.tile));
+    const bands = [...new Set(keys.map((k) => k.z))];
+    const stats = this.buildDisplayLod({ bands, only });
+    for (const k of keys) this._dlodClearDirty(k.z, k.tile);
+    return stats;
+  }
+
+  /* ------------------------------ 读路径 ------------------------------ */
+  /**
+   * 这次请求能不能走预计算？逐条判据（任何一条不满足都**退回实时路径**，画面永远是对的）：
+   *   1. 开关开着（config limits.displayLod.on）；
+   *   2. 库里这一层在，而且**这个 band 建完了**（`bands[z].done`）；
+   *   3. 请求框完全落在这一层的数据范围内（在外面就没有可用的行）；
+   *   4. 规则签名一致（config 的 LOD / 合并参数、视口上限、way 索引是否可用……）；
+   *   5. 请求框压到的瓦片里**没有脏的**（编辑过还没重算 → 整包走实时，绝不混合新旧几何）。
+   */
+  _dlodPlan(zoom, box, lod, coalesceOpts, limit, viewportLimit) {
+    if (!this._dlod.on || this._dlodOff) return null;
+    const st = this._dlodState();
+    if (!st || !st.rows) return null;
+    const band = st.bands[zoom];
+    if (!band || !band.done) return null;
+    if (!box || !Number.isFinite(box.minLon)) return null;
+    if (!DLOD.boxIntersects(box, st.extent)) return null;
+    if (this._dlodExtentStale) return null;
+    const sig = this._dlodSignatureFor(zoom, st.extent, st.tiles, st.lat, lod, coalesceOpts, limit, viewportLimit);
+    if (sig !== band.sig) return null;
+    const grid = DLOD.makeGrid(st.extent, st.tiles);
+    const tiles = grid.tilesOfBox(box);
+    if (!tiles.length) return null;
+    for (const t of tiles) if (this._dlodDirty.has(zoom + ':' + t)) return null;
+    const coordDigits = coalesceOpts.coordDigits;
+    return { band: band, zoom: Number(zoom), grid, tiles, state: st, sig, coordDigits, scale: Math.pow(10, coordDigits) };
+  }
+
+  /**
+   * 按瓦片读预计算层：R*Tree 不需要 —— 取行是**主键范围**（`z = ? AND tile IN (…)`），
+   * 而"跨瓦片的那部分几何"由"每个瓦片自己的行覆盖它自己的范围"这条性质保证（证明见 displaylod.js）。
+   *
+   * 为什么要裁剪：一条折线的 bbox 常常比视口大得多（z13 视口只占一块瓦片的 1/4），
+   * 不裁会把 33% 的点花在框外（实测 z13 49,979 点 → 裁完 16,859 点，与实时路径的 17,776 点持平）。
+   * 线用逐段裁（裁断就是断），面用 Sutherland–Hodgman（**必须保住闭合**，否则客户端只描边不填充）。
+   */
+  _dlodRead(plan, box) {
+    const z = plan.zoom;
+    const scale = plan.scale;
+    const sel = this._cachedStmt(`SELECT id, kind, family, cls, name, rel, ways, nseg, npts, rawnpts,
+      min_lon, max_lon, min_lat, max_lat, tags, geom FROM ${DLOD.DLOD_TABLE}
+      WHERE z = ? AND tile IN (${DLOD.tilePlaceholders(plan.tiles.length)})`);
+    const rows = sel.all(z, ...plan.tiles);
+    const byId = new Map();
+    for (const r of rows) if (!byId.has(r.id)) byId.set(r.id, r);
+    const lines = []; const areas = [];
+    // 折线与面的账**分开记**（实时路径的 `truncation.coalesce` 与 `truncation.viewOnly.areas`
+    // 是两本账，混在一起会给出"面的点数是折线的点数"这种假数）
+    const cnt = {
+      line: { points: 0, rawPoints: 0, segs: 0, ways: 0 },
+      area: { points: 0, rawPoints: 0, rings: 0, ways: 0 },
+    };
+    let clipped = 0;
+    const clsLines = new Map(); const clsAreas = new Map();
+    const famLines = new Map(); const famAreas = new Map();
+    for (const r of byId.values()) {
+      if (!(r.max_lon >= box.minLon && r.min_lon <= box.maxLon && r.max_lat >= box.minLat && r.min_lat <= box.maxLat)) continue;
+      let paths = unpackLodPaths(r.geom, scale);
+      const before = paths.reduce((s, p) => s + p.length, 0);
+      if (r.kind === 'area') {
+        const out = [];
+        for (const p of paths) { const q = DLOD.clipRing(p, box); if (q) out.push(q); }
+        paths = out;
+      } else {
+        paths = DLOD.clipPaths(paths, box);
+      }
+      const after = paths.reduce((s, p) => s + p.length, 0);
+      if (!paths.length) continue;
+      if (after !== before) clipped += 1;
+      const tags = r.tags ? JSON.parse(r.tags) : {};
+      const entry = { class: r.family || 'other', tags, coords: paths[0] };
+      if (r.name) entry.name = r.name;
+      if (paths.length > 1) entry.paths = paths.slice(1);
+      if (r.rel !== null && r.rel !== undefined) entry.rel = r.rel;
+      if (r.kind === 'area') areas.push(entry); else lines.push(entry);
+      const c0 = r.kind === 'area' ? cnt.area : cnt.line;
+      c0.points += after; c0.rawPoints += r.rawnpts || 0;
+      if (r.kind === 'area') { c0.rings += paths.length; c0.ways += paths.length; } else { c0.segs += paths.length; c0.ways += r.ways || 0; }
+      const byClass = r.kind === 'area' ? clsAreas : clsLines;
+      const byFam = r.kind === 'area' ? famAreas : famLines;
+      const ck = r.cls || ('#' + (r.family || 'other'));
+      const cs = byClass.get(ck) || { class: ck, family: r.family || 'other', ways: 0, lines: 0, areas: 0, rings: 0, points: 0, tiny: 0 };
+      cs.ways += (r.kind === 'area' ? paths.length : (r.ways || 0)); cs.points += after;
+      if (r.kind === 'area') { cs.areas += 1; cs.rings += paths.length; } else { cs.lines += 1; }
+      byClass.set(ck, cs);
+      const fs = byFam.get(r.family || 'other') || { class: r.family || 'other', lines: 0, areas: 0, paths: 0, rings: 0, ways: 0, points: 0 };
+      fs.ways += (r.kind === 'area' ? paths.length : (r.ways || 0)); fs.points += after;
+      if (r.kind === 'area') { fs.areas += 1; fs.rings += paths.length; } else { fs.lines += 1; fs.paths += paths.length; }
+      byFam.set(r.family || 'other', fs);
+    }
+    return {
+      lines, areas,
+      stats: {
+        rows: rows.length, unique: byId.size, tiles: plan.tiles.length,
+        lines: lines.length, areas: areas.length,
+        segs: cnt.line.segs, points: cnt.line.points, rawPoints: cnt.line.rawPoints, ways: cnt.line.ways,
+        areaRings: cnt.area.rings, areaPoints: cnt.area.points, areaRawPoints: cnt.area.rawPoints, areaWays: cnt.area.ways,
+        clipped, clippedOut: clipped,
+        classes: { lines: [...clsLines.values()].sort((a, b) => b.ways - a.ways), areas: [...clsAreas.values()].sort((a, b) => b.ways - a.ways) },
+        byFamily: { lines: [...famLines.values()].sort((a, b) => b.ways - a.ways), areas: [...famAreas.values()].sort((a, b) => b.ways - a.ways) },
+      },
+    };
+  }
+
+  /**
+   * 读**与视口相交的候选 way 的去向**（`display_lod_cov`），产出实时路径那本账要的所有东西。
+   *
+   * 取数方式是 **R\*Tree 驱动**（`display_lod_cov_rtree`）：`c.rowid IN (SELECT id FROM rtree WHERE bbox 与视口相交)`。
+   * 为什么不能按 `(z, tile)` 主键把"整块瓦片的候选"读出来：z14 的候选扫描走 R*Tree 路径（没有
+   * lod_zoom 过滤），市中心一块瓦片压着十几万条 way，而视口只占这块瓦片的三十分之一 ——
+   * 实测按主键读 **630 ms**（`logs/pc-dlod-breakdown.txt`），比实时路径还慢。
+   * 按 bbox 驱动读到的就是"与实时路径同一个判据"的那批候选（z14 3.6 万条），而且**一条标签都不用解析**。
+   *
+   * 同一个 way 可能出现在多块瓦片的去向表里（而且去向可能不同）→ 取"最好的"那个：
+   * `line > area > way > nogfx`（几何进了折线就不再逐条下发）。这与实时路径"一条 way 只算一次"一致。
+   */
+  _dlodReadCov(plan, box) {
+    const z = plan.zoom;
+    const S = 1e5;
+    const q = (v) => Math.round(v * S);
+    const sel = this._cachedStmt(`SELECT c.way_id, c.status, c.sub
+      FROM ${DLOD.covRtreeName(z)} r JOIN ${DLOD.DLOD_COV} c ON c.rowid = r.id
+      WHERE r.max_lon >= ? AND r.min_lon <= ? AND r.max_lat >= ? AND r.min_lat <= ?`);
+    const status = new Map();     // way_id → 去向（同一个 way 在多块瓦片里可能不同 → 取"最好的"那个：
+    const sub = new Map();        //   line > area > way > nogfx —— 几何进了折线就不再逐条下发）
+    const clsWays = new Map();    // 样式类 → Set(way_id)（**去重**：跨瓦片重复的 way 只算一次，
+    const rank = { line: 0, area: 1, way: 2, nogfx: 3 };   // 这本账要与实时路径「按 way 去重」的口径一致）
+    const better = (a, b) => (rank[a] === undefined ? 9 : rank[a]) < (rank[b] === undefined ? 9 : rank[b]);
+    let candidates = 0;
+    const lodBy = {};
+    const roadsByRank = {};
+    const neverSendWays = {};
+    let lodWithheldTotal = 0;
+    let trunkWithheld = 0; let minorRailWithheld = 0; let railWaterWithheld = 0; let landuseWithheld = 0;
+    const bump = (cls, id) => {
+      let s = clsWays.get(cls);
+      if (!s) { s = new Set(); clsWays.set(cls, s); }
+      s.add(id);
+    };
+    for (const r of sel.all(q(box.minLon), q(box.maxLon), q(box.minLat), q(box.maxLat))) {
+      candidates += 1;
+      const cur = status.get(r.way_id);
+      if (cur === undefined || better(r.status, cur)) { status.set(r.way_id, r.status); sub.set(r.way_id, r.sub); }
+      if ((r.status === 'line' || r.status === 'area') && r.sub) bump(r.sub, r.way_id);
+      if (r.status === 'lod') {
+        lodWithheldTotal += 1;
+        const kind = String(r.sub || '').split(':')[0];
+        lodBy[kind] = (lodBy[kind] || 0) + 1;
+        if (kind === 'neverSend') {
+          const cls = String(r.sub).split(':')[1] || 'other';
+          neverSendWays[cls] = (neverSendWays[cls] || 0) + 1;
+        } else if (kind === 'roadClass') {
+          const rk = Number(String(r.sub).split(':')[1]);
+          if (rk === 0) trunkWithheld += 1;
+          else { const nm = roadRankName(rk); roadsByRank[nm] = (roadsByRank[nm] || 0) + 1; }
+        } else if (kind === 'railMinor') {
+          minorRailWithheld += 1;
+          if (String(r.sub).endsWith(':main')) railWaterWithheld += 1;
+        } else if (kind === 'landuse') {
+          landuseWithheld += 1;
         }
       }
     }
+    // 按（去重后的）way 集合分类：picked = 通过了显示分级且没被 LOD 扣下（= 实时路径 accept() 非空）
+    const coveredLine = new Set();
+    const coveredArea = new Set();
+    const sentWay = new Set();
+    const noGfx = new Set();
+    for (const [id, stv] of status) {
+      if (stv === 'line') coveredLine.add(id);
+      else if (stv === 'area') coveredArea.add(id);
+      else if (stv === 'way') sentWay.add(id);
+      else if (stv === 'nogfx') noGfx.add(id);
+    }
+    for (const id of coveredLine) { if (sentWay.has(id)) sentWay.delete(id); }
+    for (const id of coveredArea) { if (sentWay.has(id)) sentWay.delete(id); }
+    const pickedIds = new Set([...coveredLine, ...coveredArea, ...sentWay, ...noGfx]);
+    return {
+      candidates, status, sub, clsWays, coveredLine, coveredArea, sentWay, noGfx, pickedIds,
+      visible: pickedIds.size,
+      lodBy, roadsByRank, neverSendWays,
+      lodWithheldTotal, trunkWithheld, minorRailWithheld, railWaterWithheld, landuseWithheld,
+    };
+  }
+
+  /* ------------------------------ ways.geom：物化几何 ------------------------------ */
+  /** 开关（config limits.wayGeom；`on:false` 就是这一条的回滚键） */
+  _wayGeomOpts() { return this._wayGeom; }
+
+  /** 建列 + 回填（幂等，与 wayLod 的回填同一套做法：先抽查，不对就整表重填） */
+  _ensureWayGeom() {
+    if (!this._wayGeom.on) return;
+    if (this.readOnly) {
+      this._wayGeomReady = this._hasColumn('ways', 'geom') && this._wayGeomFilled();
+      return;
+    }
+    try {
+      if (!this._hasColumn('ways', 'geom')) {
+        const t0 = Date.now();
+        this.db.exec('ALTER TABLE ways ADD COLUMN geom BLOB');
+        console.log(`[db] ways 表加列 geom（物化几何，${Date.now() - t0} ms）`);
+      }
+    } catch (err) {
+      console.warn('[db] ways.geom 列不可用（退回 way_nodes + nodes 两次读表）:', err.message);
+      this._wayGeom.on = false;
+      return;
+    }
+    this._wayGeomReady = this._wayGeomFilled();
+    if (!this._wayGeomReady) this._wayGeomBackfillTodo = true;   // 真正的回填在 init 里切片跑
+  }
+
+  _hasColumn(table, col) {
+    try { return this.db.prepare(`PRAGMA table_info(${table})`).all().some((r) => r.name === col); } catch { return false; }
+  }
+
+  /** 抽查 3000 行看这一列填过没有 */
+  _wayGeomFilled() {
+    try {
+      const r = this.db.prepare('SELECT COUNT(*) AS c FROM (SELECT geom FROM ways WHERE deleted = 0 LIMIT 3000) WHERE geom IS NULL').get();
+      return !!r && r.c === 0;
+    } catch { return false; }
+  }
+
+  /** **回填**（切片：每片 ≤25 ms 让出事件循环）。老库启动时跑一次，之后靠写路径维护。 */
+  async backfillWayGeom() {
+    if (!this._wayGeom.on || this.readOnly) return { skipped: 'off' };
+    const t0 = Date.now();
+    const rows = this.db.prepare('SELECT id FROM ways WHERE deleted = 0 AND geom IS NULL').all();
+    if (!rows.length) { this._wayGeomReady = true; return { done: 0, ms: 0 }; }
+    console.log(`[db] 回填 ways.geom：${rows.length} 条 way（切片跑，期间让出事件循环）`);
+    const upd = this.db.prepare('UPDATE ways SET geom = ? WHERE id = ?');
+    let n = 0;
+    let sliceStart = Date.now();
+    for (const r of rows) {
+      this._wayGeomWrite(r.id, upd);
+      n += 1;
+      if (Date.now() - sliceStart >= 25) { sliceStart = Date.now(); await new Promise((res) => setImmediate(res)); }
+    }
+    this._wayGeomReady = true;
+    console.log(`[db] ways.geom 回填完成：${n} 条 · ${Date.now() - t0} ms`);
+    return { done: n, ms: Date.now() - t0 };
+  }
+
+  /** 同步回填（工具/测试用；服务端走上面那个切片版，每片 ≤25 ms 让出事件循环） */
+  backfillWayGeomSync() {
+    if (!this._wayGeom.on || this.readOnly) return { skipped: 'off' };
+    const t0 = Date.now();
+    const rows = this.db.prepare('SELECT id FROM ways WHERE deleted = 0 AND geom IS NULL').all();
+    const upd = this._cachedStmt('UPDATE ways SET geom = ? WHERE id = ?');
+    for (const r of rows) this._wayGeomWrite(r.id, upd);
+    this._wayGeomReady = true;
+    return { done: rows.length, ms: Date.now() - t0 };
+  }
+
+  /**
+   * **重写一条 way 的物化几何**（唯一写入口，与 `way_nodes` 同一个真值来源、同一次调用完成）。
+   * 所以"移动/删除节点 → 立刻 `/api/map` 就是新几何"不需要任何后台任务。
+   */
+  _wayGeomWrite(wayId, updStmt) {
+    if (!this._wayGeom.on) return;
+    try {
+      const ids = this._st.wayNodeIds.all(wayId).map((r) => r.node_id);
+      const stmt = updStmt || this._cachedStmt('UPDATE ways SET geom = ? WHERE id = ?');
+      if (!ids.length) { this._cachedStmt('UPDATE ways SET geom = NULL WHERE id = ?').run(wayId); return; }
+      const ph = ids.map(() => '?').join(',');
+      /**
+       * ⚠ `deleted = 0` **必须有**：`_fetchNodes` 取坐标时就是这条口径（软删的节点不给坐标、
+       * 但 `way_nodes` 的行还在 → `ways[id][1]` 照旧带着它的 id）。漏了这一条，
+       * "删节点"之后物化几何里还会留着那个坐标，两边就对不上了（本套件第一版就抓到了这个）。
+       */
+      const byId = new Map(this._cachedStmt(`SELECT id, lat, lon, tags FROM nodes WHERE deleted = 0 AND id IN (${ph})`)
+        .all(...ids).map((r) => [r.id, r]));
+      const coords = new Array(ids.length).fill(null);
+      const hasTags = new Uint8Array(ids.length);
+      for (let i = 0; i < ids.length; i++) {
+        const r = byId.get(ids[i]);
+        if (!r) continue;   // 被删/缺节点：只留 id，不给坐标（与 _fetchNodes 的 deleted = 0 口径一致）
+        coords[i] = [Math.round(r.lat * 1e7) / 1e7, Math.round(r.lon * 1e7) / 1e7];
+        if (r.tags) hasTags[i] = 1;
+      }
+      stmt.run(packWayGeom(ids, coords, hasTags), wayId);
+    } catch (err) {
+      // 物化失败绝不影响正确性：读路径会自动退回 way_nodes + nodes
+      this._wayGeom.on = false;
+      console.warn('[db] ways.geom 写入失败，整条路退回 way_nodes + nodes:', err.message);
+    }
+  }
+
+  /** 删了一个节点：用 `idx_way_nodes_node` 找出**含它的那些 way**，把物化几何在同一处重写 */
+  _wayGeomRefreshForNode(nodeId) {
+    if (!this._wayGeom.on) return 0;
+    let n = 0;
+    for (const r of this._st.wayRefsForNode.all(nodeId)) { this._wayGeomWrite(r.way_id); n += 1; }
+    return n;
+  }
+
+  /**
+   * 批量取物化几何：`Map(wayId → { ids, coords, hasTags })`（只含真的有这一列的 way；
+   * 没有的调用方按 miss 退回 SQL —— 于是"回填还没到的老库"也永远是对的画面）。
+   */
+  _wayGeomBatch(wayIds) {
+    const out = new Map();
+    if (!this._wayGeom.on || !this._wayGeomReady || !wayIds.length) return out;
+    const stmt = this._cachedStmt('SELECT id, geom FROM ways WHERE id IN (SELECT value FROM json_each(?)) AND geom IS NOT NULL');
+    for (let i = 0; i < wayIds.length; i += 400) {
+      const chunk = wayIds.slice(i, i + 400);
+      for (const r of stmt.all(JSON.stringify(chunk))) {
+        const g = unpackWayGeom(r.geom);
+        if (g) out.set(r.id, g);
+      }
+    }
+    return out;
   }
 
   /* ------------------------------ 元素读取 ------------------------------ */
@@ -3965,6 +5690,26 @@ class OsmDB {
     this._st.updateNode.run(cur.lat, cur.lon, cur.version + 1, this._st.nodeById.get(id).tags, user.id, user.name, this._now(), 1, id);
     this._st.deleteNodeIndex.run(id);
     this.invalidateCounts();
+    /**
+     * 删节点会让引用它的 way 少一个顶点：`recomputeWayGeometry` **不会**被这条路径调用
+     * （它只由 updateNode 触发），所以这里自己把那些 way 的 bbox 标脏 —— 几何只会**变小**，
+     * 于是"按旧 bbox 标脏"就覆盖了新旧两边（新 bbox ⊆ 旧 bbox）。
+     */
+    if (this._dlod.on) {
+      for (const wid of this._st.wayRefsForNode.all(id).map((r) => r.way_id)) {
+        const w = this._st.wayById.get(wid);
+        if (!w || w.min_lon === null || w.min_lon === undefined) continue;
+        this._dlodDirtyWay({ minLon: w.min_lon, maxLon: w.max_lon, minLat: w.min_lat, maxLat: w.max_lat }, null,
+          wayLodZoomOf(parseTags(w.tags)));
+      }
+    }
+    /**
+     * **删节点也要重写物化几何**（用 `idx_way_nodes_node` 找出含它的 way）：被删的节点
+     * 在 `_fetchNodes` 里是不存在的（`deleted = 0`），所以它的坐标必须从物化几何里消失，
+     * 但 **id 要留着**（`way_nodes` 的行没动，`ways[id][1]` 照旧带着它）—— 这两件事分开处理，
+     * 才与"从 way_nodes + nodes 两次读表"的口径逐字节一致。
+     */
+    this._wayGeomRefreshForNode(id);
     return { ...cur, version: cur.version + 1, deleted: true };
   }
 
@@ -3992,6 +5737,10 @@ class OsmDB {
   markWayDeleted(id, user) {
     const cur = this.getWay(id);
     if (!cur) return null;
+    // 旧 bbox 从 `_st.wayById` 取（`getWay` 不回 bbox 列）；下面 deleteWayIndex 之后就没得取了
+    const raw = this._st.wayById.get(id);
+    const oldBox = (raw && raw.min_lon !== null && raw.min_lon !== undefined)
+      ? { minLon: raw.min_lon, maxLon: raw.max_lon, minLat: raw.min_lat, maxLat: raw.max_lat } : null;
     const json = stringifyTags(cur.tags);
     const keys = wayLodKeysOf(json);
     this._st.updateWay.run(cur.version + 1, json, user.id, user.name, this._now(), 1, 0, 0, keys.roadClass, keys.lodZoom, id);
@@ -3999,6 +5748,8 @@ class OsmDB {
     this._st.deleteWayNodes.run(id);
     this.recomputeRelationsOfWay(id);
     this.invalidateCounts();
+    this._dlodDirtyWay(oldBox, null, keys.lodZoom);
+    this._cachedStmt('UPDATE ways SET geom = NULL WHERE id = ?').run(id);   // 删掉的 way 不留物化几何
     return { ...cur, version: cur.version + 1, deleted: true };
   }
 
@@ -4026,6 +5777,7 @@ class OsmDB {
     this.recomputeRelationBbox(id);
     this.recomputeRelationMembers(id);
     this.invalidateCounts();
+    this._dlodDirtyRelation(this._dlodRelBox(id));
     return this.getRelation(id);
   }
 
@@ -4033,6 +5785,7 @@ class OsmDB {
     const cur = this.getRelation(id);
     if (!cur) return null;
     const finalMembers = members || cur.members;
+    const oldBox = this._dlodRelBox(id);      // 改之前的范围（下面 deleteRelMembers 之后就没得取了）
     this._st.updateRelation.run(version, stringifyTags(tags), user.id, user.name, this._now(), 0, finalMembers.length, id);
     if (members) {
       this._st.deleteRelMembers.run(id);
@@ -4040,25 +5793,48 @@ class OsmDB {
       this.recomputeRelationBbox(id);
       this.recomputeRelationMembers(id);
     }
+    const newBox = this._dlodRelBox(id);
+    this._dlodDirtyRelation(oldBox);
+    this._dlodDirtyRelation(newBox);
     return this.getRelation(id);
   }
 
   markRelationDeleted(id, user) {
     const cur = this.getRelation(id);
     if (!cur) return null;
+    const oldBox = this._dlodRelBox(id);
     this._st.updateRelation.run(cur.version + 1, stringifyTags(cur.tags), user.id, user.name, this._now(), 1, 0, id);
     this._st.deleteRelIndex.run(id);
     this._st.deleteRelMembers.run(id);
     this.invalidateCounts();
+    this._dlodDirtyRelation(oldBox);
     return { ...cur, version: cur.version + 1, deleted: true };
+  }
+
+  /** 关系在 `relation_index` 里的 bbox（面关系的失效范围用它）；没有就是 null */
+  _dlodRelBox(id) {
+    try {
+      const r = this.db.prepare('SELECT min_lon, max_lon, min_lat, max_lat FROM relation_index WHERE id = ?').get(id);
+      if (!r) return null;
+      return { minLon: r.min_lon, maxLon: r.max_lon, minLat: r.min_lat, maxLat: r.max_lat };
+    } catch { return null; }
   }
 
   /** 重算 way 的 bbox / 长度 / 节点数 / 闭合标记，并更新空间索引 */
   recomputeWayGeometry(wayId) {
     const row = this._st.wayById.get(wayId);
-    if (!row || row.deleted) { this._st.deleteWayIndex.run(wayId); return; }
+    /**
+     * **预计算层的失效钩子**（见 displaylod.js 的「失效」一段）：几何/标签一变，这条 way
+     * 新旧 bbox 压到的瓦片就要重算。放在这里是因为**所有**改 way 的写路径最后都走它
+     * （insertWay / updateWayGeometry / updateWayTags / updateNode→wayRefsForNode）。
+     * `row` 里的 bbox 是**改之前**的值（setWayGeom 还没跑），新 bbox 稍后算出来 → 两边一起标。
+     */
+    const oldBox = (row && row.min_lon !== null && row.min_lon !== undefined)
+      ? { minLon: row.min_lon, maxLon: row.max_lon, minLat: row.min_lat, maxLat: row.max_lat } : null;
+    const lodZoom = row ? wayLodZoomOf(parseTags(row.tags)) : 0;
+    if (!row || row.deleted) { this._st.deleteWayIndex.run(wayId); this._dlodDirtyWay(oldBox, null, lodZoom); return; }
     const ids = this._st.wayNodeIds.all(wayId).map((r) => r.node_id);
-    if (!ids.length) { this._st.deleteWayIndex.run(wayId); return; }
+    if (!ids.length) { this._st.deleteWayIndex.run(wayId); this._dlodDirtyWay(oldBox, null, lodZoom); return; }
     let minLat = Infinity;
     let maxLat = -Infinity;
     let minLon = Infinity;
@@ -4078,10 +5854,46 @@ class OsmDB {
       if (prev) length += metersBetween(prev.lat, prev.lon, n.lat, n.lon);
       prev = n;
     }
-    if (!Number.isFinite(minLat)) { this._st.deleteWayIndex.run(wayId); return; }
+    if (!Number.isFinite(minLat)) { this._st.deleteWayIndex.run(wayId); this._dlodDirtyWay(oldBox, null, lodZoom); return; }
     const closed = ids.length > 2 && ids[0] === ids[ids.length - 1] ? 1 : 0;
     this._st.setWayGeom.run(minLat, maxLat, minLon, maxLon, Math.round(length * 10) / 10, ids.length, closed, wayId);
     this._st.upsertWayIndex.run(wayId, minLon, maxLon, minLat, maxLat);
+    /**
+     * **物化几何在同一处重写**（`ids` 与节点坐标刚刚都读过了，这里不多花一次 I/O）。
+     * 于是"移动一个节点 → 立刻请求"拿到的就是新几何：见 `tests/way-geom-test.js`。
+     */
+    this._wayGeomWrite(wayId);
+    this._dlodDirtyWay(oldBox, { minLon, maxLon, minLat, maxLat }, lodZoom);
+  }
+
+  /**
+   * 预计算层的写路径钩子（**见 displaylod.js 的「失效」一段**）：
+   * 一条 way 的**新旧 bbox 并集**压到的瓦片，在"这条 way 真的可见的那些档"上标脏。
+   *   · 为什么要并集：way 的 bbox 可能变大（拖了一个节点到远处）也可能变小（删了一段），
+   *     而旧几何在旧瓦片上、新几何可能在新瓦片上，两边都得重算；
+   *   · 为什么按 lod_zoom 收窄档位：`lod_zoom` 就是"这条 way 最早在哪个缩放可见"的物化列
+   *     （见 wayLodKeysOf），它**之后**的档才画得出这条 way。实测一条 residential（lod_zoom=14）
+   *     只需要重算 z14 那一档，而不是七个档一起（logs/pc-invalidate.txt）。
+   */
+  _dlodDirtyWay(oldBox, newBox, lodZoom) {
+    if (!this._dlod.on) return;
+    const a = oldBox && Number.isFinite(oldBox.minLon) ? oldBox : null;
+    const b = newBox && Number.isFinite(newBox.minLon) ? newBox : null;
+    if (!a && !b) return;
+    const box = (!a || !b) ? (a || b) : {
+      minLon: Math.min(a.minLon, b.minLon), maxLon: Math.max(a.maxLon, b.maxLon),
+      minLat: Math.min(a.minLat, b.minLat), maxLat: Math.max(a.maxLat, b.maxLat),
+    };
+    const bands = this._dlod.bands;
+    this.dlodMarkDirty(box, Math.floor(Number(lodZoom) || 0), bands[bands.length - 1] || 14);
+  }
+
+  /** 关系变了（新增/成员变化/删除）：它的面几何会变 → 按它自己的 bbox 标脏（与 way 同一口径） */
+  _dlodDirtyRelation(box, lodZoom = 0) {
+    if (!this._dlod.on) return;
+    if (!box || !Number.isFinite(box.minLon)) return;
+    const bands = this._dlod.bands;
+    this.dlodMarkDirty(box, Math.floor(Number(lodZoom) || 0), bands[bands.length - 1] || 14);
   }
 
   recomputeRelationsOfWay(wayId) {
