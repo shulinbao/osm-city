@@ -1,6 +1,7 @@
 # 我是市委书记（OSM 城市在线）—— Docker Compose 部署
 #
-#   docker compose up -d --build      # 首次（会下载数据包并导入，约 1~2 分钟）
+#   docker compose up -d              # 首次（镜像里**已经带着数据集**，首次启动只把种子拷进数据卷）
+#   docker compose pull && docker compose up -d   # 更新到新镜像（数据卷里的库优先，不会被覆盖）
 #   docker compose logs -f            # 看日志
 #   docker compose down               # 停掉（数据卷保留）
 #
@@ -24,6 +25,9 @@ services:
 
     environment:
       DATA_DIR: /app/data
+      # 镜像里预建好的数据集（种子库）——数据卷是空的时候，entrypoint 把它拷进卷里（实测 492 MB / 约 0.2 秒）。
+      # 想强制走回"下载 + 导入 + 推算人口网格"的老路径：把下面这行改成 "0"（不推荐，1 GB 机器上很慢）。
+      OSM_SEED: "auto"
       # 想临时放开游客登录（本地测试用）就放开下面这行；
       # 正式服建议保持关闭：任何能访问的人都能注册，而按玩法设计玩家之间可以互相改删资产。
       # DSH_ALLOW_GUESTS: "1"

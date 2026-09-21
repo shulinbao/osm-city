@@ -428,7 +428,43 @@ function ensureBusGraph() {
   console.log(`[bus] 道路网构建完成（同步惰性路径，期间事件循环被占住）：${stats.ways} 条道路 / ${stats.edges} 段 / ${stats.nodes} 个节点（${stats.ms} ms）`);
   return road;
 }
-const population = new Population(db);
+/**
+ * **人口网格的配置块（config.json 的 `population`）** —— 全文件只读这一个常量。
+ *
+ *   computeJobs                   默认 **false = 完全不算岗位**（用户口径：NR 里没有这个系统）。
+ *                                 jobs 列保留（表结构不动），新算出来的网格里恒 0。
+ *   jobsBuildingsCountAsPopulation 默认 false：不算岗位时商业/办公/工业建筑**也不产生人口**
+ *                                 （口径 v2 原样保留 ⇒ 人口/客流一个数都不变）。改成 true 是**主动改玩法**
+ *                                 （切旧口径 v1），必须全量重建网格。
+ *   sliceMs / commitMs / commitEveryWays   全量重建的切片与分批提交参数（见 Population#buildAll）。
+ *
+ * 这些默认值在 population.js 里也各有一份同名常量（`COMPUTE_JOBS_DEFAULT` 等），
+ * 两处**必须一致**；这里只做"config.json 里没写时的兜底"。
+ */
+const POP_OPTS = Object.assign({
+  computeJobs: false,
+  jobsBuildingsCountAsPopulation: false,
+  sliceMs: 25,
+  commitMs: 300,
+  commitEveryWays: 4000,
+}, config.population || {});
+if (POP_OPTS.computeJobs === true) {
+  console.log('[pop] 岗位：**已打开**（config.json population.computeJobs=true）——'
+    + '会算商业/办公/工业建筑的岗位并写进 population_cells.jobs（仅供展示，不参与客流）');
+} else {
+  console.log('[pop] 岗位：**不算**（config.json population.computeJobs=false，默认）——'
+    + '不聚合商业/办公/工业建筑的岗位，population_cells.jobs 恒 0（列保留、表结构未动；岗位本来就不进客流）'
+    + (POP_OPTS.jobsBuildingsCountAsPopulation === true
+      ? ' · ⚠ jobsBuildingsCountAsPopulation=true：商业/办公/工业建筑**按人口算**（旧口径 v1，全市人口会变大）'
+      : ''));
+}
+const population = new Population(db, {
+  computeJobs: POP_OPTS.computeJobs === true,
+  jobsBuildingsCountAsPopulation: POP_OPTS.jobsBuildingsCountAsPopulation === true,
+  sliceMs: POP_OPTS.sliceMs,
+  commitMs: POP_OPTS.commitMs,
+  commitEveryWays: POP_OPTS.commitEveryWays,
+});
 if (LAZY) {
   lazyWorld.population = population;          // 人口网格也按区域建（见 initTransitWorldLazy）
 }
@@ -680,17 +716,41 @@ async function initTransitWorld() {
   setInitStage('population');
   const cellCount = db.prepare('SELECT COUNT(*) AS c FROM population_cells').get().c;
   let popStats = null;
-  if (cellCount === 0) {
-    // ⚠ 首次启动的人口推算（Population.buildAll）是 population.js 里一次性的整段同步循环，
-    // 从外面没有分批入口 —— 真实数据集上它是分钟级的，这一段会**整段**占着事件循环（端口开着、
-    // 请求排在后面）。所以这里明确打一行日志：进度停在"人口网格"就是它。
-    console.log('[pop] 首次启动：正在从 OSM 建筑/用地推算人口与岗位…'
-      + '（population.js 的整段同步循环，这一段切不开，页面会在这期间停在"人口网格"）');
-    popStats = population.buildAll();
-    console.log(`[pop] 完成：${popStats.ways} 个地块 → ${popStats.population} 人 / ${popStats.jobs} 个岗位 / ${popStats.cells} 个网格（${(popStats.ms / 1000).toFixed(1)} s）`);
+  /**
+   * ⚠ **人口网格的全量推算现在是切片跑的**（`await population.buildAll(...)`）：
+   * 每片最多 `population.sliceMs`（config.json 里是 25 ms）就让出事件循环一次，所以这一段期间
+   * **`/api/ready` 一直能应答**，而且进度是**精确**的（processed / total 条地块，
+   * 不是按时间估的）—— `stageMessage` 会显示"人口网格计算中 · 42%（18,204/47,546 地块）"。
+   *
+   * 还支持**断点续算**：上一轮被打断（Ctrl+C / 容器被 kill / OOM）时，库里 meta 的
+   * `population_build_state.done` 是 0，而 `population_sources` 里已经有"算过的 way"——
+   * 这时**不删表**、跳过那些 way，从断点接着算（见 Population#buildAll 的说明）。
+   * 老库（改造前建的网格）没有这个 meta 键，所以照旧走"已经有人口网格 ⇒ 不重算"那条路。
+   */
+  const popState = population.buildState();
+  const popResume = population.buildStateResumable(popState);
+  if (cellCount === 0 || popResume) {
+    console.log(popResume
+      ? `[pop] 检测到**未算完**的断点（第 ${popState.processed || 0}/${popState.total || '?'} 条 way，`
+        + `数据里有 ${cellCount} 个格子）：从断点继续，不从头再来`
+      : '[pop] 首次启动：正在从 OSM 建筑/用地推算人口网格…'
+        + `（切片跑，每片 ≤ ${POP_OPTS.sliceMs} ms 就让出事件循环，期间 /api/ready 一直能答；进度是精确的）`);
+    popStats = await population.buildAll({
+      resume: popResume,
+      sliceMs: POP_OPTS.sliceMs,
+      commitMs: POP_OPTS.commitMs,
+      commitEveryWays: POP_OPTS.commitEveryWays,
+      onProgress: (frac, info) => setInitProgress('population', frac, popProgressMessage(info)),
+    });
+    console.log(`[pop] 完成：扫过 ${popStats.scanned}/${popStats.total} 条 way，其中 ${popStats.ways} 个地块有贡献`
+      + ` → ${popStats.population} 人 / ${popStats.jobs} 个岗位（${popStats.computeJobs ? '算' : '不算'}岗位）`
+      + ` / ${popStats.cells} 个网格条目 · 分 ${popStats.batches} 批提交 · ${(popStats.ms / 1000).toFixed(1)} s`
+      + ` · 让出事件循环 ${popStats.slices || 0} 次、最长一次占住 ${popStats.maxSliceMs || 0} ms`
+      + `${popStats.resumed ? '（本次是从断点续算）' : ''}`);
   } else {
     popStats = population.totals();
-    console.log(`[pop] 已有人口网格：${popStats.population} 人 / ${popStats.jobs} 个岗位 / ${popStats.cells} 格`);
+    console.log(`[pop] 已有人口网格：${popStats.population} 人 / ${popStats.jobs} 个岗位`
+      + `（本实例${popStats.jobsComputed ? '算' : '不算'}岗位） / ${popStats.cells} 格`);
   }
   setInitStage('paths');
   const t1 = Date.now();
@@ -2229,9 +2289,10 @@ pruneTimer.unref();
  *      所以端口开着的时候服务器是真的能应答的；
  *   5. 就绪后 `initState.done = true`，挂上 WebSocket 服务器，正常流量照旧。
  *
- * 进度百分比：阶段边界是**精确**的（每个阶段有固定权重），阶段内部按"已用时间 / 该阶段的
- * 实测估计"给一个估计值（`limits.graphEstimateMs` 可调）—— 首次启动的人口推算（population.js
- * 的整段同步循环）与线路路径重建（transit.js）没有分批入口，它们的内部进度只能靠时间估计。
+ * 进度百分比：阶段边界是**精确**的（每个阶段有固定权重）。阶段内部：
+ *   · **人口网格现在是精确进度**（`processed / total` 条地块，见 popProgressMessage），
+ *     并且这一段是**切片**跑的 —— 每片 ≤ `population.sliceMs` 就让出事件循环；
+ *   · 线路路径重建（transit.js）与惰性模式的按区域建图仍按"已用时间 / 该阶段的实测估计"给估计值。
  */
 const INIT_STAGES = [
   { key: 'rail', label: '铁路网', weight: 5, message: '正在构建铁路网' },
@@ -2290,6 +2351,12 @@ function initPayload() {
       total: INIT_STAGES.length,
       stageMessage: initState.message,
       stagePercent: Math.round(initState.stageFrac * 100),
+      /**
+       * 阶段内部进度**是不是精确值**（不是按时间估的）。人口网格那一步是精确的
+       * （processed / total 条地块，见 popProgressMessage 与 Population#buildAll），
+       * 其余阶段仍是估计（与改动前同一个口径）。只加字段，不改任何既有字段的形状。
+       */
+      stageExact: initState.stage === 'population',
     },
     phase: initState.stage,                 // 兼容老字段（旧客户端/工具读的是 phase）
     detail: initState.message,
@@ -2326,6 +2393,9 @@ function readyPayload() {
 
 /** 进入某个阶段（阶段边界精确 → percent 立刻跳到该阶段的起点） */
 function setInitStage(key) {
+  // ⚠ 先记账：换阶段时"还欠着的那次停顿"属于**刚结束的那个阶段**（阶段边界是精确的，
+  //   在这里把它记到旧阶段名下才是如实的；不然一次 19 秒的人口推算会被记成"阶段 paths"）。
+  initWatchdogTick();
   const idx = INIT_STAGE_INDEX.has(key) ? INIT_STAGE_INDEX.get(key) : -1;
   const stage = idx >= 0 ? INIT_STAGES[idx] : null;
   initState.stage = key;
@@ -2345,28 +2415,68 @@ function setInitProgress(key, frac) {
   const own = Number(frac);
   initState.stageFrac = Number.isFinite(own) ? Math.max(0, Math.min(1, own)) : 0;
   initState.percent = Math.round(((base + INIT_STAGES[idx].weight * initState.stageFrac) / INIT_STAGE_TOTAL) * 100);
+  /**
+   * 可选第 3 个参数：**如实**的阶段说明（原文进 `/api/ready` 的 `progress.stageMessage`，
+   * 客户端 main.js 直接显示它）。人口网格那一步现在给的是精确进度：
+   * "人口网格计算中 · 42%（18,204/47,546 地块）"。不传就沿用阶段默认说明。
+   */
+  if (typeof arguments[2] === 'string' && arguments[2]) initState.message = arguments[2];
+}
+
+/** 千分位（确定性的，不依赖 locale）：47546 → "47,546" */
+function fmtCount(n) {
+  const v = Math.max(0, Math.round(Number(n) || 0));
+  return String(v).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+/**
+ * 人口网格那一步的**如实**进度文案（进 stageMessage / 服务端日志）。
+ * 例：`人口网格计算中 · 42%（18,204/47,546 地块）`。
+ * 分母 total 是"库里带标签的 way 总条数"（精确值，见 Population#_countTaggedWays），
+ * 不是按时间估的 —— 所以这个百分比可以当验收数字用。
+ */
+function popProgressMessage(info) {
+  const total = Number(info && info.total) || 0;
+  const done = Number(info && info.processed) || 0;
+  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  return `人口网格计算中 · ${pct}%（${fmtCount(done)}/${fmtCount(total)} 地块）`;
 }
 
 /**
  * **初始化期间的事件循环看门狗**：每 5 ms 打一次卡，把"两次打卡之间多等了多久"记下来。
  * 这是"有没有 >20 ms 同步停顿"的**服务端自证**（客户端那侧的证据是 /api/ready 的往返时间，
  * 见 tmp-verify/lateinit/timeline.js）。切片做得好，它就应该一直在个位数毫秒。
+ *
+ * ⚠ **一个必须补的细节（本次改造实测发现的）**：看门狗是 `setInterval`，**它自己也会被同步块饿死** ——
+ * 一整段 22 秒的同步循环里它一次都跑不到，而 `finishInit()` 又会在那个"早该跑的回调"落地之前
+ * `clearInterval`，于是**最长的那次停顿反而永远量不到**（改造前的实例自报"最长停顿 179 ms（阶段 rail）"，
+ * 而实际上人口那一步整整占住了 22.6 秒 —— 外部证据是 /api/ready 连续 4 次 5 秒超时）。
+ * 所以 stopInitWatchdog() 会先把"还欠着的那一次 lag"记下来再停表：这样 maxStallMs 才是**如实**的。
  */
 let initWatchdog = null;
+/**
+ * 看门狗**记一次账**：把"距离上一次打卡过了多久"记到**当前阶段**名下，并把打卡时刻推进到现在。
+ * `setInterval` 的回调、`setInitStage()` 的开头、`stopInitWatchdog()` 都走这**同一条**路径 ——
+ * 所以同一次"欠账"只会被记一次，不会在换阶段/停表时被重复记成更长的值
+ * （否则那一次 19 秒的停顿会被记到最后一个阶段名下，那同样是假话）。
+ */
+function initWatchdogTick() {
+  if (!initWatchdog) return;
+  const now = Date.now();
+  const lag = now - initWatchdog.next;
+  initWatchdog.next = now + 5;
+  if (lag > initState.maxStallMs) { initState.maxStallMs = lag; initState.maxStallStage = initState.stage; }
+}
 function startInitWatchdog() {
   if (initWatchdog) return;
-  let next = Date.now() + 5;
-  initWatchdog = setInterval(() => {
-    const now = Date.now();
-    const lag = now - next;
-    next = now + 5;
-    if (lag > initState.maxStallMs) { initState.maxStallMs = lag; initState.maxStallStage = initState.stage; }
-  }, 5);
-  initWatchdog.unref();
+  initWatchdog = { next: Date.now() + 5, timer: null };
+  initWatchdog.timer = setInterval(initWatchdogTick, 5);
+  initWatchdog.timer.unref();
 }
 function stopInitWatchdog() {
   if (!initWatchdog) return;
-  clearInterval(initWatchdog);
+  initWatchdogTick();                    // 先记账再停表，否则最长的那次停顿会被漏掉
+  clearInterval(initWatchdog.timer);
   initWatchdog = null;
 }
 
@@ -2394,10 +2504,16 @@ function finishInit() {
   initState.readyAt = Date.now();
   initState.readyMs = initState.readyAt - initState.startedAt;
   initState.ms = initState.readyMs;
+  /**
+   * ⚠ 顺序有讲究：**先停看门狗、再切到 ready 阶段**。
+   * 停表时会把"事件循环里还欠着的那一次停顿"记下来（见 stopInitWatchdog），
+   * 那一次属于**上一个真正干活的阶段**（通常是 population）—— 要是先 setInitStage('ready')，
+   * 最长的停顿就会被记成"阶段 ready"，那是假话。
+   */
+  stopInitWatchdog();
   setInitStage('ready');
   initState.message = initState.error ? `初始化失败：${initState.error}` : '就绪';
   initState.percent = 100;
-  stopInitWatchdog();
   attachWsServer();
   const listenMs = initState.listenMs;
   // 端口没绑上时**不许**打"端口 0 ms 就开了"（那是假话）：绑定失败由 httpServer.on('error') 负责退出

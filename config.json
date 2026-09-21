@@ -27,6 +27,19 @@
     "groupIdleMs": 5000,
     "groupTtlMs": 120000
   },
+  "population": {
+    "_note": "人口网格口径（server/population.js 的「岗位开关」那一段）。",
+    "computeJobs": false,
+    "_noteComputeJobs": "**默认 false = 完全不算岗位**：不把商业/办公/工业建筑再分类聚合成岗位，population_cells.jobs 列保留但恒为 0（表结构不动、老库的 jobs 值照旧能读）。理由：这个系统在 NIMBY Rails 里根本不存在（代码里也一直写着\"岗位仅供界面展示、不参与客流\"），算它是纯浪费，1 GB 机器上更是负担。想恢复算岗位：改成 true（**然后必须全量重建网格**：node tools/rebuild-population.js 后重启；口径变了 buildAll 会自动从头重建）。",
+    "jobsBuildingsCountAsPopulation": false,
+    "_noteJobsBuildingsCountAsPopulation": "**默认 false**：不算岗位时，商业/办公/工业建筑**也不产生人口**（口径 v2 原样保留）。这是\"不改变玩法\"的选择——这些楼今天对人口/客流的贡献本来就是 0（客流只看人口），所以关掉岗位之后人口总数一个数不变。改成 true 就是切到旧口径 v1（商业楼也按人口算），全市人口与客流会一起跳一大截：那是**主动改玩法**，必须全量重建网格。",
+    "_slice": "全量重建切成片跑的参数（见 Population#buildAll）。",
+    "sliceMs": 25,
+    "_noteSliceMs": "单片最长占用事件循环的毫秒数（目标 ≤ ~50 ms：期间 /api/ready 一直能答）。实测调的：40 → 最长一次占住 50~102 ms；25 → 37~38 ms（稳）；20 → 34 ms。调小更顺滑、让出更频繁。",
+    "commitMs": 300,
+    "commitEveryWays": 4000,
+    "_noteCommit": "分批提交（可续算）的粒度：每积累 commitMs 毫秒**或** commitEveryWays 条有贡献的 way 就 COMMIT 一次，并把断点写进 meta 的 population_build_state（与数据同一个事务）。崩了最多重算这么多。"
+  },
   "regions": {
     "_note": "分区流式（deploy/REGIONS.md）第一阶段：只读查询走分片。**默认 off** —— 关闭时服务端连注册表都不读、一个分片库都不打开，行为与改动前逐字节相同（既有测试套件全部照旧）。打开：把 mode 改成 on，或者起实例时加 --regions（显式给了 --osm 时会被强制关，除非同时显式 --regions）。写路径不受影响：新增元素与所有写操作仍然只走 config.osmDb 那一个库。",
     "mode": "off",

@@ -147,13 +147,17 @@
  *
  *   人口 ≈ Σ 住宅建筑占地面积 × 楼层数 × 人均楼面面积倒数（只有住宅算人口）
  *   岗位 ≈ Σ 商业 / 办公 / 工业类建筑的楼面面积 × 岗位密度
- *          ← **只用于界面展示（"这里有多少上班的地方"），不参与任何客流计算**
+ *          ← **默认不算**（config.json 的 population.computeJobs，默认 false，见下面「岗位开关」）：
+ *            这个系统在 NR 里根本不存在，算它只花钱不产生任何玩法差异，1 GB 机器上更是纯负担。
  *   活跃度 = 每个 250 米格子的建成度系数（1.0 = 这一格没有任何地块信息）
  *   车站需求 demand = 覆盖人口（距离加权）× 活跃度          ← 只看人口，与 NR 一致
  *   车站日上车人数 dailyTrips = demand × 出行率 tripRatePerDay
  *   某一秒的上车速率 = Σ_距离档[ 该档日人数 ÷ (运营小时数 × 3600) × 时段曲线(运营小时) × 周末系数 ]
  *     · 权重（覆盖人口的非线性 + 线路条数 + 距离需求曲线）、档位分界都放在 PAX 里
  *     · O/D 表的构建在 transit.js 的 _ensureOdDemand（需要"线路"才知道谁连得通）
+ *
+ * 全量重建（Population#buildAll）是 **async**：切片让出事件循环 + 分批提交 + 可续算 + 有精确进度。
+ * 调用方必须 `await`（index.js 的 initTransitWorld 就是）；参数与口径见 buildAll 的注释。
  *
  * 性能：本文件只负责"人口 → 车站需求"这一层，具体查表在 transit.js；O/D 表按
  * 人口网格版本 + 游戏日 + 线路签名做缓存，热路径只做 Map 查表和一个乘数。
@@ -178,6 +182,46 @@ const PEOPLE_PER_M2_FLOOR = 0.03;
  *    NR 的 demand 只看覆盖人口（见文件头第 1 条），没有岗位模型，所以岗位于本作只是参考值。
  */
 const JOBS_PER_M2_BUILDING = 0.02;
+
+/* ============================ 岗位开关（config.population） ============================
+ * 用户口径："岗位"这个系统他的游戏（NIMBY Rails 式）里**根本没有** —— 代码里也是这么写的：
+ *   · 本文件头第 1 条：NR 原文 "population is the only factor considered"，没有岗位模型；
+ *   · transit.js 的需求公式：需求 = 覆盖人口 × 活跃度，没有岗位项；
+ *   · 岗位**仅供界面展示**，不参与任何客流计算（stationDemand 里连读都不读它）。
+ * 所以默认**完全不算岗位**：既不做"商业/办公/工业建筑再分类聚合一遍"这件事
+ * （那些中间对象就是纯内存开销），也默认让 population_cells.jobs 恒为 0。
+ *
+ * ⚠ **`jobs` 列保留**（表结构不动、向后兼容）：老库里的 jobs 值照旧能读、能显示（前端已不显示），
+ *   关掉岗位之后新算出来的网格里该列恒 0。想恢复"算岗位"：config.json 里
+ *   `"population": { "computeJobs": true }`。
+ *
+ * ⚠⚠ **关掉岗位时，商业/办公/工业建筑该不该算人口？——默认：不算（口径 v2 保持不变）。**
+ *   这是本开关最需要说清楚的一个口径选择，理由是**"不改变玩法"**：
+ *     · 现状（v2）已经是"商业楼只算岗位、**不算人口**"（见 contributionOf 的 isJobBuilding 分支），
+ *       也就是**这些楼今天对人口 / 客流的贡献本来就是 0**（客流只看人口）。
+ *       所以"不算岗位"之后它们继续是 0 ⇒ **人口、车站覆盖、需求、客流一个数都不变**，
+ *       既不会"凭空少一块"，也没有"凭空多一块"。
+ *     · 反过来，如果关掉岗位时改成"商业楼按旧口径 v1 也算人口"，那是**往客流里凭空加人**
+ *       （全市人口与客流一起跳一大截）—— 那才是改玩法。
+ *   实测（北京区域库 `data/regions/beijing.sqlite` 的**副本**：514,612 条带标签 way、
+ *   133,920 个有贡献的地块，三个口径各跑一遍全量重建）：
+ *     · 默认（不算岗位）          人口 = 12,304,460.15 人（22,853 格）—— 与改造前**逐格逐值相同**
+ *     · jobsBuildingsCountAsPopulation=1（商业楼也算人口，旧口径 v1）
+ *                                 人口 = 15,364,957.95 人（24,650 格）= **+3,060,497.80 人（+24.87%）**
+ *   也就是说：默认口径下人口**一个数都不会变**；真要"商业楼也算人口"，那是往客流里凭空加 24.87%。
+ *   想主动切到那个口径（**必须先全量重建网格**）：config.json 里
+ *   `"population": { "jobsBuildingsCountAsPopulation": true }`（默认 false）。
+ *   想主动切到那个口径（**必须先全量重建网格**）：config.json 里
+ *   `"population": { "jobsBuildingsCountAsPopulation": true }`（默认 false）。
+ *
+ * 两个开关都进 `population_build_state`（meta 表）：不一致就**从头重建**，不会把两种口径的格子混在一起。
+ */
+const COMPUTE_JOBS_DEFAULT = false;
+const JOBS_BUILDINGS_COUNT_AS_POP_DEFAULT = false;
+/** 两个开关打包成一位数（进 meta / 判"要不要重建"用）：bit0 = 算岗位，bit1 = 商业楼也算人口 */
+function jobsModeCode(computeJobs, jobsAsPop) {
+  return (computeJobs ? 1 : 0) | (jobsAsPop ? 2 : 0);
+}
 
 /**
  * 人口网格口径版本：1 = 所有建筑都算人口（旧口径）；2 = 住宅算人口、商业/办公/工业算岗位。
@@ -519,6 +563,34 @@ const round = (v, n = 2) => {
   return Math.round(v * p) / p;
 };
 
+/* --------------------- 全量重建的切片参数（见 Population#buildAll） --------------------- */
+/**
+ * 单片最长占用事件循环的时间（毫秒）。**实测口径**：它是"每片工作量"的上界，
+ * 也就是"两次让出之间"的最长停顿 —— 目标 ≤ ~50 ms（/api/ready 与 SSH 都能活）。
+ * 调小 = 更顺滑但让出更频繁（总时间略涨）；调大 = 更快但停顿更久。
+ *
+ * ⚠ 实测调过（北京区域库副本：514,612 条带标签 way / 22,853 个格子，同一台机器、交替重复跑）：
+ *   sliceMs=40 → 最长一次占住事件循环 **50 / 102 ms**（有一次 102 ms 的尖峰）
+ *   sliceMs=30 → 41 ms · sliceMs=25 → **37 / 38 ms（稳，留了余量）** · sliceMs=20 → 34 ms
+ *   总耗时在同一套参数下逐次抖动 ±20%（这台机器本身不安静），三个档位都落在噪声带内，
+ *   所以取 **25**：既稳稳低于 50 ms，又不显著拖长总时间。
+ *   （注意"最长一次"必然略大于 sliceMs：每处理完一条 way 才检查一次，一条特别大的
+ *     way 本身就能占十几毫秒。）
+ */
+const BUILD_SLICE_MS = 25;
+/** 至少每积累这么久的工作量就 COMMIT 一次（可续算的粒度：崩了最多重算这么久） */
+const BUILD_COMMIT_MS = 300;
+/** 或者每处理这么多"有贡献的 way"就 COMMIT 一次（先到为准） */
+const BUILD_COMMIT_WAYS = 4000;
+
+/**
+ * 把控制权交回事件循环。用 `setImmediate`：它排在 poll 阶段之后，
+ * 所以每一轮都会先给 I/O（HTTP 请求、WS、stdin）一次机会 —— 这正是"/api/ready 必须能答"的实现。
+ */
+function yieldToLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 /**
  * 车站需求（NIMBY Rails 的 demand，人/日）——**只看人口**。
  *
@@ -582,6 +654,29 @@ class Population {
   constructor(db, options = {}) {
     this.db = db;
     this.cellM = options.cellM || CELL_M;
+    /**
+     * **岗位开关（默认 false = 完全不算岗位）**：见文件上方「岗位开关」那一段。
+     * 关着的时候 contributionOf 里连 jobs 那一支都不走：商业/办公/工业建筑既不产生人口
+     * 也不产生岗位（它们今天本来就不产生人口，所以人口总数一个数不变）。
+     */
+    this.computeJobs = options.computeJobs === undefined
+      ? COMPUTE_JOBS_DEFAULT : options.computeJobs === true;
+    /**
+     * **"商业/办公/工业建筑也按人口算"（默认 false）**：只有想切到旧口径 v1 时才打开，
+     * 打开后**必须全量重建网格**（buildAll 会用 meta 里的 jobsMode 识别并自动从头重建）。
+     */
+    this.jobsAsPop = options.jobsBuildingsCountAsPopulation === undefined
+      ? JOBS_BUILDINGS_COUNT_AS_POP_DEFAULT : options.jobsBuildingsCountAsPopulation === true;
+    /** 当前口径的编码（进 meta / 判"要不要重建"）：bit0 算岗位 · bit1 商业楼也算人口 */
+    this.jobsMode = jobsModeCode(this.computeJobs, this.jobsAsPop);
+    /**
+     * **全量重建的切片 / 分批参数**（见 buildAll）：构造时给一份默认，buildAll 可以用它自己的
+     * options 覆盖。index.js 两处都传（构造 + buildAll），这里存下来是为了不出现
+     * "构造时传了却静默不生效"这种陷阱。
+     */
+    this.sliceMs = Math.max(1, Number(options.sliceMs) || BUILD_SLICE_MS);
+    this.commitMs = Math.max(1, Number(options.commitMs) || BUILD_COMMIT_MS);
+    this.commitEveryWays = Math.max(1, Number(options.commitEveryWays) || BUILD_COMMIT_WAYS);
     /** 人口/岗位网格的版本号：网格一变就 +1，交通那边的车站需求 / O/D 缓存据此失效 */
     this.version = 1;
     /** 当前游戏日（交通那边的时钟跨天时调用 setDay），影响时段曲线与周末系数 */
@@ -654,6 +749,11 @@ class Population {
   /**
    * 网格口径检查：老库里的网格可能是旧口径（版本 1：商业楼也算了人口）建的。
    * 这里只提示、不自动重建 —— 重建一次要几分钟，交给运维（tools/rebuild-population.js）。
+   *
+   * 除了 MODEL_VERSION，还会顺带核对**岗位口径**（meta 的 `population_jobs_mode`）：
+   * 库里的网格是按"算岗位/商业楼算人口"哪一套建的，与当前 config 不一致时也提示一句
+   * （比如老库 jobs 列里有值、而这次起实例是默认的"不算岗位"）——那只是**显示口径**的差异，
+   * 不参与客流计算，所以不改 staleModel 的语义（staleModel 仍然只表示"人口口径旧了"）。
    */
   _checkModelVersion() {
     if (this._modelChecked) return this._modelStale;
@@ -665,6 +765,16 @@ class Population {
       if (this._modelStale) {
         console.warn(`[pop] 库里的网格是旧口径（v${v || '?'}，当前 v${MODEL_VERSION}）：`
           + '商业/办公建筑如今只算岗位、不再算人口。需要重算时运行 node tools/rebuild-population.js 后重启。');
+      } else {
+        const jm = this._st.getMeta.get('population_jobs_mode');
+        const jv = jm ? Number(jm.value) : null;
+        const jnz = (this._st.sumTotals.get().jobs || 0) > 0;
+        if (jnz && !this.computeJobs && jv !== this.jobsMode) {
+          console.warn(`[pop] 库里的 jobs 列还有值（合计 ${Math.round(this._st.sumTotals.get().jobs)} 个岗位，`
+            + `按口径 ${jv == null ? '未记录' : jv} 建的），当前配置是**不算岗位**（jobsMode=${this.jobsMode}）：`
+            + '岗位本来就不参与客流计算，这里只是如实说明网格里留着历史岗位值；'
+            + '想要一份 jobs 恒 0 的网格就跑 node tools/rebuild-population.js 后重启。');
+        }
       }
     } catch {
       this._modelStale = false;
@@ -687,10 +797,16 @@ class Population {
     let jobs = 0;
     // 人口与岗位只在"建筑"上产生，而且分开口径（NIMBY Rails 那种"住户 vs 岗位"）：
     //   住宅类建筑（含看不出用途的 building=yes）→ 人口
-    //   商业 / 办公 / 工业类建筑              → 岗位
-    //   住宅楼底层带店面（building=apartments + shop=*）→ 人口 + 底层一点岗位
+    //   商业 / 办公 / 工业类建筑              → 岗位（**只有在 computeJobs 打开时**，默认关 ⇒ 什么都不给）
+    //   住宅楼底层带店面（building=apartments + shop=*）→ 人口 + 底层一点岗位（同样只在算岗位时）
     //   棚子、车库、围墙这类非居住非岗位建筑 → 两边都不算
     // 用地区块（landuse）不再直接贡献人口或岗位 —— 它们改而影响"活跃度"（见 ACTIVITY_* 常量）。
+    //
+    // ⚠ **默认（computeJobs=false）的精确口径**（见文件上方「岗位开关」那一段）：
+    //   · 商业/办公/工业建筑：pop = 0、jobs = 0 ⇒ 整个 way 直接返回空贡献（不写格子、不写 source 行）。
+    //     这样的人口总数与改造前**逐格逐值相同** —— 因为改造前这些建筑本来就不产生人口（v2 口径）。
+    //   · 住宅建筑：只产生人口（不再往 jobs 上记"底层店面"那一点点）。
+    //   · jobsBuildingsCountAsPopulation=true（非默认）时，商业/办公/工业建筑改按人口算（旧口径 v1）。
     const building = tags.building && tags.building !== 'no'
       ? tags.building
       : (tags['building:part'] && tags['building:part'] !== 'no' ? tags['building:part'] : null);
@@ -706,12 +822,16 @@ class Population {
         (tags.amenity !== undefined && JOB_AMENITY.has(tags.amenity));
       const isJobBuilding = JOB_BUILDINGS.has(building) || (unknownType && jobTags);
       const isLiving = !isJobBuilding && !NON_LIVING_BUILDINGS.has(building);
+      const wantJobs = this.computeJobs === true;
       if (isJobBuilding) {
-        jobs += floorArea * JOBS_PER_M2_BUILDING;
+        // 算岗位（config 里显式打开）→ 照旧给岗位；不算岗位（默认）→ 什么都不给。
+        // 例外：jobsBuildingsCountAsPopulation（旧口径 v1，默认关）时改按人口算。
+        if (wantJobs) jobs += floorArea * JOBS_PER_M2_BUILDING;
+        else if (this.jobsAsPop) pop += floorArea * PEOPLE_PER_M2_FLOOR;
       } else if (isLiving) {
         pop += floorArea * PEOPLE_PER_M2_FLOOR;
         // 住宅楼底层常有店面/办公：只按底层那点面积再算一点岗位（不重复计入整栋）
-        if (jobTags) jobs += Math.min(area, 400) * JOBS_PER_M2_BUILDING;
+        if (wantJobs && jobTags) jobs += Math.min(area, 400) * JOBS_PER_M2_BUILDING;
       }
     }
     if (pop <= 0 && jobs <= 0) return out;
@@ -860,45 +980,226 @@ class Population {
     return out;
   }
 
-  /** 全量重算（导入数据后第一次启动、或手动触发） */
-  buildAll(options = {}) {
-    const t0 = Date.now();
-    let ways = 0;
-    let cells = 0;
-    this.db.exec('BEGIN');
+  /* --------------------- 断点续算的记账（meta 表） --------------------- */
+
+  /**
+   * 读库里的"全量重建断点"（meta 表 key = `population_build_state`）。
+   *
+   * 形状（**一个 JSON 字符串**，meta 表结构不动）：
+   *   {
+   *     v: 2,            // MODEL_VERSION（网格口径版本）
+   *     mode: 0,         // jobsMode：bit0 算岗位 · bit1 商业楼也算人口（口径变了就不许续算）
+   *     total: 47546,    // 这一轮要扫多少个"带标签的 way"（进度分母）
+   *     processed: 18204,// 已经扫过多少个（进度分子）
+   *     ways: 12003,     // 其中真的有贡献（写进网格）的个数
+   *     cells: 39041,    // 累计写进格子的条目数（与旧实现的 ways/cells 口径一致）
+   *     done: 0,         // 0 = 还没算完（可续算）· 1 = 算完了（下次 buildAll 是**重新全量**）
+   *     startedAt / doneAt / ms
+   *   }
+   *
+   * 读不出来（老库没有 meta 表 / JSON 坏了）→ null：当作"没有断点"，走全量重建。
+   * 这就是"算完 / 未算完"的**唯一**判据：`done === 1` 才算完。
+   */
+  buildState() {
     try {
-      this.db.exec('DELETE FROM population_cells');
-      this.db.exec('DELETE FROM population_sources');
-      for (const row of this._st.taggedWays.all()) {
-        let tags = null;
-        try { tags = JSON.parse(row.tags); } catch { tags = null; }
-        if (!tags) continue;
-        const ids = this._st.wayNodes.all(row.id).map((r) => r.node_id);
-        if (ids.length < 3) continue;
-        const coords = [];
-        for (const nid of ids) {
-          const n = this._st.nodeById.get(nid);
-          if (n) coords.push([n.lat, n.lon]);
-        }
-        const contrib = this.contributionOf(tags, coords);
-        if (!contrib.size) continue;
-        const json = {};
-        for (const [key, v] of contrib) {
-          this._st.upsertCell.run(v.x, v.y, v.pop, v.jobs);
-          json[key] = [Math.round(v.pop * 100) / 100, Math.round(v.jobs * 100) / 100];
-          cells += 1;
-        }
-        this._st.putSource.run(row.id, JSON.stringify(json), Date.now());
-        ways += 1;
-        if (ways % 20000 === 0 && options.onProgress) options.onProgress(ways);
-      }
+      const row = this._st.getMeta.get('population_build_state');
+      if (!row || !row.value) return null;
+      const st = JSON.parse(row.value);
+      return st && typeof st === 'object' ? st : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 库里的断点能不能用来续算？三个条件全中才行：
+   *   1. 上一轮**没算完**（`done !== 1`）；
+   *   2. 口径没变（`v === MODEL_VERSION` 且 `mode === this.jobsMode`）—— 口径变了必须从头重建，
+   *      否则两种口径的格子会混在一起；
+   *   3. 进度分母是有效正整数。
+   * 续算的**粒度判据**是 `population_sources` 表：已经有 source 行的 way 就是"已经算过"的
+   * （每条 way 处理完都会在同一批 COMMIT 里写 source 行，见 buildAll），直接跳过。
+   */
+  buildStateResumable(st) {
+    if (!st || st.done === 1 || st.done === true) return false;
+    if (Number(st.v) !== MODEL_VERSION) return false;
+    if (Number(st.mode) !== this.jobsMode) return false;
+    return (Number(st.total) || 0) > 0;
+  }
+
+  /**
+   * 全量重建人口网格（导入数据后第一次启动、或手动触发）。
+   *
+   * ═══════════════════════════════════════════════════════════════════════════
+   * **为什么是 async / 为什么要切片**（1 GB VPS 上发生过"整机卡死、只能重启"）：
+   * 老实现是**整整一大段同步循环**（`for (row of taggedWays.all())`）+ **一个巨型事务**：
+   *   · 同步循环期间事件循环被占满，连 `/api/ready` 都不回（页面/SSH 都像死机）；
+   *   · 一个巨型事务（先把整个 population_cells 删掉再逐条加回来）会把脏页与回滚日志
+   *     全压在内存里，小内存机器上打满 → swap → 整机失去响应。
+   *
+   * 现在改成：
+   *   1. **切片**：每片最多干 `sliceMs`（config.json 里是 25 ms；不传参数时兜底 BUILD_SLICE_MS = 25 ms）就让出事件循环
+   *      一次（`setImmediate`，I/O 回调有机会跑）⇒ 期间 `/api/ready` 一直能应答；
+   *   2. **分批提交**：每片结束时 `COMMIT`（或按 `commitMs` / `commitEveryWays` 攒批），
+   *      事务不再无限膨胀；每批把断点写进 meta（**与数据同一个事务**，所以断点永远和数据一致）；
+   *   3. **可续算**：被 Ctrl+C / kill / OOM 打断后重启，`resume:true` + 库里断点匹配 ⇒
+   *      不删表、跳过已有 `population_sources` 行的 way，从断点继续，不从头再来。
+   *
+   * ⚠ **正常路径的结果与改造前逐格相同**：仍然按 `taggedWays` 的自然行序逐条处理、
+   * 同一个格子里的贡献仍然按**同一个先后顺序**相加（SQLite 的 `pop = pop + excluded.pop`
+   * 是浮点加法，顺序一致 ⇒ 结果逐位一致）；切片只是"中间歇一歇"，分批提交只是"中间存个盘"。
+   * 唯一会变的是 ① 里那个岗位开关默认关掉之后的 `jobs` 列（恒 0）。
+   *
+   * 参数（都有默认值，调用方一般只传 onProgress）：
+   *   onProgress(frac, info)   frac 0~1（**精确**：processed/total），info 见下面 return 的形状
+   *   resume                   true = 允许从断点续算（库里断点要匹配，见 buildStateResumable）
+   *   sliceMs / commitMs / commitEveryWays   见上面的注释
+   */
+  async buildAll(options = {}) {
+    const t0 = Date.now();
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const sliceMs = Math.max(1, Number(options.sliceMs) || this.sliceMs || BUILD_SLICE_MS);
+    const commitMs = Math.max(1, Number(options.commitMs) || this.commitMs || BUILD_COMMIT_MS);
+    const commitEveryWays = Math.max(1, Number(options.commitEveryWays) || this.commitEveryWays || BUILD_COMMIT_WAYS);
+
+    const prev = this.buildState();
+    const resumable = options.resume === true && this.buildStateResumable(prev);
+    /**
+     * 进度分母：这一轮要扫多少条"带标签的 way"。**精确值**（不是估计）—— 见 _countTaggedWays。
+     * 续算时优先用断点里记着的 total（同一批数据，不必为一个数字再扫一遍）—— 但也顺手核对一次，
+     * 不一致（说明数据变了）就以现场数出来的为准。
+     */
+    let total = resumable ? Number(prev.total) || 0 : 0;
+    const liveTotal = await this._countTaggedWays(options);
+    if (liveTotal !== total) total = liveTotal;
+
+    /**
+     * 续算时"已经算过"的 way 集合，来自 `population_sources`（每条 way 处理完就写一行，
+     * 与格子写在同一个事务里 ⇒ 有 source 行 ⇔ 它的贡献已经在格子里，跳过它不会少算也不会多算）。
+     * 全新重建时这张表刚被清空，集合是空的（一次查询的成本，换取"重复算"的零风险）。
+     */
+    let doneIds = new Set();
+    if (resumable) {
+      try {
+        for (const r of this.db.prepare('SELECT way_id FROM population_sources').iterate()) doneIds.add(Number(r.way_id));
+      } catch { doneIds = new Set(); }
+    }
+
+    let processed = 0;      // 这一轮扫过的 way 条数（含没贡献的）
+    let ways = 0;           // 其中真的写进网格的条数（与旧实现的 ways 口径相同）
+    let cells = 0;          // 累计写进格子的条目数（与旧实现的 cells 口径相同）
+    let batches = 0;        // 提交了几批
+    let slices = 0;         // 让出了几次事件循环
+    let maxSliceMs = 0;     // **最长的一次"占着事件循环不撒手"**（精确：两次 yieldToLoop 之间的墙钟）
+
+    const state = (done) => ({
+      v: MODEL_VERSION, mode: this.jobsMode, total, processed, ways, cells,
+      done: done ? 1 : 0,
+      startedAt: resumable ? (prev.startedAt || t0) : t0,
+      ...(done ? { doneAt: Date.now(), ms: Date.now() - t0 } : {}),
+      resumed: resumable ? 1 : 0,
+    });
+
+    this.db.exec('BEGIN');
+    let inTx = true;
+    /**
+     * 提交一批：**断点与数据在同一个事务里落盘** —— 这是"续算判据可信"的全部理由
+     * （不可能出现"格子写进去了、断点没记"或反过来）。
+     *   openNext = true  → 交完立刻 `BEGIN` 下一批（循环里用）
+     *   openNext = false → 循环外收尾，交完就真的不在事务里了
+     */
+    const commit = (openNext) => {
+      try { this._st.setMeta.run('population_build_state', JSON.stringify(state(false))); } catch { /* 老库没 meta 表就算了 */ }
       this.db.exec('COMMIT');
+      if (openNext) this.db.exec('BEGIN');
+      else inTx = false;
+      batches += 1;
+    };
+    try {
+      if (!resumable) {
+        // 全新重建：把整张表推倒重来（这一步与下面的写入在**同一个事务**里，
+        // 所以"删了还没写"的中间状态永远不会被别的进程看到）
+        this.db.exec('DELETE FROM population_cells');
+        this.db.exec('DELETE FROM population_sources');
+      }
+      let sliceStart = Date.now();
+      let commitStart = Date.now();
+      let waysSinceCommit = 0;
+      /**
+       * ⚠ 这里用**逐行迭代**（`iterate()`）而不是 `all()`：老实现的 `.all()` 会把几十万行
+       * （每行还带着一整段 tags JSON）一次性materialize 到内存里，小内存机器上这一步本身就很危险。
+       */
+      for (const row of this._st.taggedWays.iterate()) {
+        processed += 1;
+        if (doneIds.size && doneIds.has(Number(row.id))) {
+          // 上一轮已经算过（在 population_sources 里）→ 跳过，不重复加
+        } else {
+          let tags = null;
+          try { tags = JSON.parse(row.tags); } catch { tags = null; }
+          if (tags) {
+            const ids = this._st.wayNodes.all(row.id).map((r) => r.node_id);
+            if (ids.length >= 3) {
+              const coords = [];
+              for (const nid of ids) {
+                const n = this._st.nodeById.get(nid);
+                if (n) coords.push([n.lat, n.lon]);
+              }
+              const contrib = this.contributionOf(tags, coords);
+              if (contrib.size) {
+                const json = {};
+                for (const [key, v] of contrib) {
+                  this._st.upsertCell.run(v.x, v.y, v.pop, v.jobs);
+                  json[key] = [Math.round(v.pop * 100) / 100, Math.round(v.jobs * 100) / 100];
+                  cells += 1;
+                }
+                this._st.putSource.run(row.id, JSON.stringify(json), Date.now());
+                ways += 1;
+                waysSinceCommit += 1;
+              }
+            }
+          }
+        }
+        /**
+         * 该让出事件循环了吗？（每片 ≤ sliceMs）该提交了吗？（commitMs / commitEveryWays 先到为准）
+         * 提交**只发生在片的边界**上：一次停顿 = 单片工作量，不会"片 + 一次 fsync"叠在一次里。
+         */
+        const now = Date.now();
+        if (now - sliceStart >= sliceMs) {
+          if (now - commitStart >= commitMs || waysSinceCommit >= commitEveryWays) {
+            commit(true);                              // 写断点 + COMMIT + BEGIN（下一批）
+            commitStart = now;
+            waysSinceCommit = 0;
+          }
+          if (onProgress) onProgress(total > 0 ? Math.min(1, processed / total) : 0, {
+            processed, total, ways, cells, batches, ms: Date.now() - t0, resumed: resumable,
+          });
+          await yieldToLoop();
+          const held = Date.now() - sliceStart;          // 这一片到底占住了多久（精确，不是估计）
+          if (held > maxSliceMs) maxSliceMs = held;
+          slices += 1;
+          sliceStart = Date.now();
+        }
+      }
+      commit(false);
+      /**
+       * 收尾时补一次 100% 的进度回调：小库（几百条 way）根本撞不到片边界，
+       * 不补这一下的话进度条会一直停在 0%（"算完了但还显示 0%"是假话）。
+       */
+      if (onProgress) onProgress(1, {
+        processed, total, ways, cells, batches, ms: Date.now() - t0, resumed: resumable,
+      });
     } catch (err) {
-      this.db.exec('ROLLBACK');
+      if (inTx) { try { this.db.exec('ROLLBACK'); } catch { /* 已经不在事务里 */ } }
       throw err;
     }
-    // 记下这次网格是按哪个模型版本建的，下次启动就知道要不要重建
-    try { this._st.setMeta.run('population_model', String(MODEL_VERSION)); } catch { /* 老库没有 meta 表就算了 */ }
+    // 记下这次网格是按哪个模型版本 / 哪个岗位口径建的，下次启动就知道要不要重建
+    try {
+      this.db.exec('BEGIN');
+      this._st.setMeta.run('population_model', String(MODEL_VERSION));
+      this._st.setMeta.run('population_jobs_mode', String(this.jobsMode));
+      this._st.setMeta.run('population_build_state', JSON.stringify(state(true)));
+      this.db.exec('COMMIT');
+    } catch { /* 老库没有 meta 表就算了 */ }
     this._modelChecked = true;
     this._modelStale = false;
     this._bumpVersion();       // 网格变了：车站需求 / O/D 需求下次用到时重算
@@ -907,7 +1208,36 @@ class Population {
       ways, cells, ms: Date.now() - t0,
       population: Math.round(totals.pop || 0),
       jobs: Math.round(totals.jobs || 0),
+      // ── 切片 / 续算的如实记账（日志与验收用）──
+      scanned: processed, total, batches, resumed: resumable, sliceMs, commitMs, commitEveryWays,
+      slices, maxSliceMs,
+      jobsMode: this.jobsMode, computeJobs: this.computeJobs, jobsBuildingsCountAsPopulation: this.jobsAsPop,
     };
+  }
+
+  /**
+   * "带标签的 way"一共多少条（进度分母）。与 taggedWays 的 WHERE 完全一致。
+   *
+   * 它是唯一一处**为进度而多花的**一次同步扫描，所以做成**分块**的（按主键 id 切段），
+   * 每块之间让出事件循环 —— 一条 COUNT 扫几十万行本身就会是一次几十毫秒级的停顿，
+   * 而那正是本次改造要消灭的东西。块的大小用 sliceMs 控（见 buildAll 的切片口径）。
+   */
+  async _countTaggedWays(options = {}) {
+    const sliceMs = Math.max(1, Number(options.sliceMs) || BUILD_SLICE_MS);
+    let n = 0;
+    try {
+      const maxRow = this.db.prepare('SELECT MAX(id) AS m FROM ways').get();
+      const maxId = Number(maxRow && maxRow.m) || 0;
+      if (!(maxId > 0)) return 0;
+      const step = Math.max(1000, Number(options.countStep) || 50000);
+      const c = this.db.prepare('SELECT COUNT(*) AS c FROM ways WHERE id > ? AND id <= ? AND deleted = 0 AND tags IS NOT NULL');
+      for (let lo = 0; lo < maxId; lo += step) {
+        n += Number(c.get(lo, Math.min(maxId, lo + step)).c) || 0;
+        if (lo % (step * 4) === 0) await yieldToLoop();
+        else if (Date.now() - (this._countSliceAt || 0) > sliceMs) { this._countSliceAt = Date.now(); await yieldToLoop(); }
+      }
+    } catch { /* 数不出来就用 0（进度退化成"只报条数、百分比按已完成算） */ }
+    return n;
   }
 
   /**
@@ -1120,8 +1450,12 @@ class Population {
     const act = this.activityStats();
     return {
       population: Math.round(t.pop || 0),
-      // 岗位：只用于界面展示，不参与客流计算（NIMBY Rails 没有岗位模型，见文件头）
+      // 岗位：**默认不算**（config.population.computeJobs，默认 false），字段保留只是为了向后兼容
+      // 与老网格的展示；它从来不参与客流计算（NIMBY Rails 没有岗位模型，见文件头）。
       jobs: Math.round(t.jobs || 0),
+      /** 这一次实例**算不算岗位**（默认 false）+ 它现在按哪套口径（bit0 算岗位 · bit1 商业楼也算人口） */
+      jobsComputed: this.computeJobs === true,
+      jobsMode: this.jobsMode,
       jobsAffectDemand: JOBS_AFFECT_DEMAND,
       cells: this._st.countCells.get().c,
       cellM: this.cellM,
@@ -1182,6 +1516,9 @@ module.exports = {
   Population, cellOf, cellCenter, CELL_M,
   ACTIVITY_BASE, ACTIVITY_NEAR_M, ACTIVITY_POLYGON_MIN, activityFactorOf, isAreaPolygon,
   stationDemand, dailyFactorOf, paxRateFactor, MODEL_VERSION,
+  // 岗位开关的默认值 / 口径编码 / 全量重建的切片参数（config.json 的 population 块读它们）
+  COMPUTE_JOBS_DEFAULT, JOBS_BUILDINGS_COUNT_AS_POP_DEFAULT, jobsModeCode,
+  BUILD_SLICE_MS, BUILD_COMMIT_MS, BUILD_COMMIT_WAYS,
   // NIMBY Rails 式乘客模型：距离档 / 时段曲线 / 目的地权重（transit.js 的 O/D 表用这些）
   PAX, PAX_BANDS, bandOfMeters, bandRangeOf, bandSharesOf,
   hourlyShapeOf, weekendFactorOf, distanceCurveOf, destinationWeightOf,

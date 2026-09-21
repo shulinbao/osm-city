@@ -1,14 +1,20 @@
 # 部署到自己的服务器（Docker）
 
-按你的选择写的：**Linux + Docker**、**数据在服务器上重新导入**（默认只下北京 47 MB，
-也可以一行换成 Geofabrik 的分省包 / 全国包 —— 见 [2C](#2c-选哪个数据集容量耗时内存实测优先) 的容量表）、
+按你的选择写的：**Linux + Docker**、**数据集在构建期就算好、烘进镜像**（服务器上首次启动只做一次
+拷贝，**几秒~1 分钟**；也可以一行换成分省包 / 全国包 —— 见 [2C](#2c-选哪个数据集容量耗时内存实测优先) 的容量表）、
 **直接开放 `IP:8787`**。
+
+> **这一版最大的变化**：以前"镜像里没有数据"，容器首次启动要**下载 47 MB → 导入 → 服务器再推算人口网格**，
+> 在 1 GB 内存的小机器上实测导入就要 **497.9 秒**，之后那段人口推算还会把整机压到无法登录。
+> 现在这些"一次性计算"全部搬到了**构建期**（`deploy/build-seed.sh`），镜像里带着一份已经算好的
+> `osm.sqlite`（已含人口网格与索引）；容器首次启动**只拷贝、不计算**。
+> 想回到旧行为：`OSM_SEED=0`（见 [2 节](#2-起服务首次是拷贝即用不再下载不再导入不再算人口)）。
 
 两种部署方式，选一种就行：
 
 | 方式 | 服务器上需要什么 | 命令 | 章节 |
 | --- | --- | --- | --- |
-| **A. 就地构建**（下面 1~3 节） | 源码 + 构建（约 1 分钟） | `docker compose up -d --build` | [1](#1-把代码传上服务器) 起 |
+| **A. 就地构建**（下面 1~3 节） | 源码 + 构建（**约 4~6 分钟**：构建期要下数据、导入、算人口网格） | `docker compose up -d --build` | [1](#1-把代码传上服务器) 起 |
 | **B. 预构建镜像**（2B 节） | 只要镜像，不要源码 | `docker run -d … <镜像>` | [2B](#2b-方式-b先把镜像推到仓库服务器一行命令) |
 
 想"装的时候一行命令"就用 **方式 B**：本机或 CI 构建一次推到镜像仓库（Docker Hub / GHCR / 阿里云 ACR），
@@ -22,8 +28,8 @@
 | --- | --- | --- |
 | 系统 | Linux x86_64 / arm64 | 任何主流发行版；镜像基于 `node:22-slim`（Debian） |
 | Docker | 20.10+ 且带 compose v2 | `docker compose version` 能打出来就行 |
-| 内存 | **建议 4 GB**（最低 2 GB） | 运行中 RSS 约 0.55~0.85 GB（路网 + 人口网格 + 车队都在内存里）；**导入的额外峰值**实测：北京 93 MB、北京分省包 194 MB（流式解析，与文件大小无关） |
-| 磁盘 | **看城市**：北京 ≥ 2 GB · 分省 ≥ 6 GB · **全国 ≥ 45 GB** | 数据集 + 源文件 + 镜像约 200 MB。全国那份库按实测外推 **25~40 GB**（见下面 2C 的容量表），**不是** 4~6 GB —— 这一点请务必先看表再选数据集 |
+| 内存 | **建议 4 GB**（最低 2 GB） | 运行中 RSS 约 0.55~0.85 GB（路网 + 人口网格 + 车队都在内存里）。**新方案下首次启动不再需要导入/推算的额外内存**（那些在构建机上做完了）；只有你显式用 `OSM_SEED=0` 走旧路径时才有导入峰值（实测北京 93 MB、北京分省包 194 MB） |
+| 磁盘 | **看城市**：北京 ≥ 2 GB · 分省 ≥ 6 GB · **全国 ≥ 45 GB** | 数据卷里是数据集（北京实测 **492 MB**）+ 玩家存档；**镜像本身现在也大了一圈**：多带了那份预建库，本机实测 `gzip -6` 后 **158.7 MB**（= 原始大小的 32.3%）⇒ 镜像大约增加 **~160 MB**（估算，见 2B 末尾）。全国那份库按实测外推 **25~40 GB**（见 2C 的容量表） |
 | 端口 | 8787/tcp 放开 | 云服务器记得在**安全组**里也放行，不只是 `ufw` |
 
 **不需要**装 Node、npm、数据库、编译工具链：这个项目零第三方依赖，全部跑在容器里的 Node 上。
@@ -49,7 +55,7 @@ git clone <你的仓库地址> /opt/osm-city && cd /opt/osm-city
 
 ---
 
-## 2. 起服务（首次会自动下载 + 导入）
+## 2. 起服务（首次是「拷贝即用」：不再下载、不再导入、不再算人口）
 
 ```bash
 cd /opt/osm-city
@@ -57,16 +63,54 @@ docker compose up -d --build
 docker compose logs -f          # 看它干活；看到「[init] 就绪」就是好了
 ```
 
-首次启动会依次做三件事（`deploy/docker-entrypoint.sh` 里的逻辑）：
+**镜像里已经带了一份"算好的"数据集**（`/opt/osm-seed/osm.sqlite`）：它是**构建期**在构建机上跑完
+「导入 → 数据库迁移 → LOD 回填 → 首次人口网格全量推算 → 建索引」之后的成品（`deploy/build-seed.sh`）。
+数据卷里没有库时，容器只做一件事：**把它拷进卷里**（北京实测 492 MB）。之后服务器照旧启动，
+但它**不会再推算人口网格**（库里已经有了），端口开出来就能连。
 
-1. 数据卷里没有数据集 → 从数据源下载（默认 BBBike 的 `Beijing.osm.gz`，约 47 MB）
-2. 调用 `tools/import-osm.js` 导入成 `data/osm/osm.sqlite` —— **默认北京约 1~2 分钟**
-3. 启动服务器：**端口 200 ms 内就开**，页面会显示进度条，后台重建路网/人口/线路路径（**约 15~20 秒**）
+首次启动实际会看到什么（默认数据集：北京 BBBike 包）：
 
-> **⚠ 导入期间容器不监听 8787：** 第 1、2 步在 `ENTRYPOINT` 里、服务器（`CMD`）还没起来，
-> 所以这期间 `curl http://IP:8787/` 会**连接被拒**——这是正常的，不是启动失败。
-> 看进度用 `docker compose logs -f`（下载每 3 秒一行进度，导入每 3 秒一行元素计数）。
-> 想要"下载期间就能打开页面"是做不到的：数据集是服务器启动的输入，没有它 `/api/*` 只能 503。
+| 步骤 | 新方案（默认：用镜像内预建库） | 旧方案（`OSM_SEED=0`：下载 + 导入） |
+| --- | --- | --- |
+| 下载来源包（47 MB） | **不做** | 联网下载，几十秒~几分钟（看带宽） |
+| `tools/import-osm.js` 导入 | **不做** | 实测 **497.9 秒**（1 GB VPS）／本机实测 54 秒（另一次 63 秒） |
+| 数据库迁移 + LOD 回填（`ways.road_class/lod_zoom` + 部分索引） | **库里已经做好** | 服务器启动时做（本机实测 1.8 秒：回填 319,818 行 1.4 s + 两个索引 0.3 s） |
+| **首次人口/岗位网格全量推算** | **库里已经算完**（`done=1`：17,065 个格子 / 10,805,312 人 / 102,955 条有贡献的地块） | 服务器启动时做（本机 20 核实测 9.9 秒；**1 GB 的机器上这一段最吃力**） |
+| 把库拷进数据卷 | **492 MB**，本机实测 **0.2 秒**（D: 盘、热缓存）；容器里（overlayfs → 卷）通常几秒 | —— |
+| 建铁路网 / 道路网 / 线路路径 | 本机实测 1.0 秒（内存结构，每次启动都要重建） | 同左 |
+| 期间是否监听 8787 | 拷贝阶段不监听（几秒），之后**立刻就开** | 导入全程（几分钟~几小时）**不监听** |
+
+> **⚠ 拷贝期间容器不监听 8787：** 拷贝在 `ENTRYPOINT` 里、服务器（`CMD`）还没起来，
+> 所以这几秒 `curl http://IP:8787/` 会**连接被拒绝**——正常现象，不是启动失败。
+> 日志会明说这次走的是哪条路（「用镜像内预建库（已含人口网格与索引）」还是「下载 + 导入」）。
+> 想要"拷贝期间就能打开页面"是做不到的：数据集是服务器启动的输入，没有它 `/api/*` 只能 503。
+
+### 这次到底走了哪条路：几个开关
+
+`deploy/docker-entrypoint.sh` 会自己判断并打印中文说明。判据与开关：
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `OSM_SEED` | `auto` | `auto`：卷里没有库时用镜像内预建库（但**卷里已经有来源包**时让位给你放的文件）。<br>`1`：只要城市匹配就用预建库（连"卷里已有来源包"也让位）。<br>`0`：**完全不用**预建库，走原来的下载 + 导入 |
+| `OSM_SEED_DB` | `/opt/osm-seed/osm.sqlite` | 预建库在镜像里的路径（一般不用改） |
+| `OSM_SEED_CITY` | `beijing` | 预建库是哪个城市的数据集（构建时烘进去的）。**`OSM_CITY` 与它不一致时不会用预建库**，而是退回下载 + 导入 |
+| `OSM_FORCE_REIMPORT` | `0` | `1` = 卷里已有库也强制**重新导入**（等于不用预建库）。换城市/换数据集时用它 |
+| `OSM_AUTO_DOWNLOAD` | `1` | `0` = 缺数据时**绝不联网**、直接报错退出（只影响"下载 + 导入"那条路） |
+
+几条容易踩的组合：
+
+```bash
+OSM_SEED=0 docker compose up -d                            # 退回旧行为：下载 47 MB + 现场导入 + 现场算人口
+OSM_CITY=hebei docker compose up -d                        # 换城市：城市不匹配 ⇒ 自动走下载 + 导入（日志会说明原因）
+OSM_CITY=hebei OSM_FORCE_REIMPORT=1 docker compose up -d    # 换城市时显式说明"我知道要重新导入"
+```
+
+> **卷优先（这一点最重要）**：卷里**已经有** `osm.sqlite` 时，容器**什么都不做**（除非
+> `OSM_FORCE_REIMPORT=1`）——玩家的账号、编辑、存档都在这个库里，`docker compose pull && docker compose up -d`
+> 更新镜像不会覆盖它。想改成用镜像里的快照：删掉卷里的库（或改名），再重启容器即可。
+>
+> 顺带一提：`OSM_SEED_DB` 那份预建库在**镜像里**（`/opt/osm-seed/`），不是挂载出来的卷；
+> 它只读、不会被容器写坏，容器重启也不需要重新解压。
 
 ### 换数据集（一行动作）
 
@@ -80,6 +124,14 @@ OSM_CITY=china        # 全国：1.5 GB 源文件，库 25~40 GB，导入 1~2 �
 OSM_CITY=beijing-pbf  # 北京（Geofabrik 分省包，36 MB，含铁路/边界）：同城更全的来源
 OSM_CITY=monaco       # 676 KB 的小样本：用来验证整条链路（几秒钟，不占磁盘）
 ```
+
+> **注意**：镜像里的预建库只有**一个城市**（默认 beijing）。`OSM_CITY` 一旦与它不一致，
+> 入口就会**自动退回「下载 + 导入」**并在日志里说明原因（"城市不匹配：你要的是 hebei，
+> 镜像里的预建库是 beijing"）—— 也就是说换城市意味着你又要付一次导入的代价。
+> 想让镜像直接带另一座城的预建库：重新构建（CI 里把 `seed_city` 填成 hebei，见 2B ①）。
+>
+> 想换**同一座城的新鲜数据**（比如 BBBike 更新了包）：`OSM_CITY=beijing OSM_FORCE_REIMPORT=1`
+> 会强制重新下载 + 导入（快照是"构建那一刻"的，不会自己变新）。
 
 换到**另一座城**时，如果卷里已经有旧城市的库，要显式重建：
 
@@ -102,6 +154,10 @@ OSM_CITY=hebei OSM_FORCE_REIMPORT=1 docker compose up -d
 > "下载"，卷里已经有来源包时照样会导入它；导入过程中**完全不联网**。）
 
 ### 磁盘预检（空间不够时不会写到一半才失败）
+
+> 这一节只对「下载 + 导入」那条路有意义（`OSM_SEED=0`，或者城市与镜像里的预建库不一致）。
+> 走「拷贝预建库」时也会先算一次：预建库 492 MB + 64 MB 余量不够就直接用中文报错退出，
+> 不会拷到一半 `ENOSPC` 留下一个坏库。
 
 下载与导入之前会算一笔账并用中文说明：
 
@@ -128,6 +184,12 @@ OSM_CITY=hebei OSM_FORCE_REIMPORT=1 docker compose up -d
 **这张表里的数字是怎么来的**（不是猜的）：
 
 - 北京分省包是**真跑过一遍**的：`35.1 MB → 928 MB`、`110 秒`、`峰值 RSS 194 MB`。
+- **（新方案补充实测）** 用 `deploy/build-seed.sh` 从同一个 `Beijing.osm.gz` **重新导了一遍**：
+  导入 **53.9 秒 → 479.0 MB**，再让服务器把人口网格算完 → **492.1 MB**
+  （2,071,057 节点 / 319,818 way / 10,004 relation）。表里北京那行的 555 MB / 2.18M 节点 / 336K way
+  是**老库**的数字（含此前玩出来的编辑与变更日志）；**镜像里的预建库按这份新建口径是 492 MB**。
+  这张表讲的是"导入"的成本，而新方案下**这些成本都发生在构建机上**、不在你的服务器上；
+  首次启动耗时见 [2 节](#2-起服务首次是拷贝即用不再下载不再导入不再算人口) 的对照表。
 - 全国那份是**只下了前 24 MiB**（HTTP Range）实测出来的：这段里 **3,136,000 个节点、0 个 way**
   （PBF 是 `Sort.Type_then_ID`，节点块全在前），即 **13.1 万节点 / MiB**；全国 1.49 GB → **约 1.5~2.0 亿节点**。
   再按北京那份实测的 **约 201 字节 / 节点**（含 R\*Tree 与索引）外推 → **库 25~40 GB**；
@@ -170,8 +232,27 @@ OSM_CITY=hebei OSM_FORCE_REIMPORT=1 docker compose up -d
   它会构建 **amd64 + arm64 两个架构**并推到 GHCR。
   首次使用要在仓库 **Settings → Actions → General → Workflow permissions** 里选
   **Read and write permissions**，否则 `GITHUB_TOKEN` 没有推包权限。
+  > **这条流水线现在分两步**（见文件里的中文注释）：
+  > ① 先在 runner 上用**原生 Node 22** 跑 `deploy/build-seed.sh`：下载 47 MB → 导入 → 起一次临时服务器
+  > 把「迁移 + LOD 回填 + 人口网格全量推算」跑完 → 停掉 → 校验（**要求 `population_build_state.done=1`**），
+  > 产物是 `deploy/seed/osm.sqlite`（几百 MB）；② 再 `docker build`，Dockerfile 的种子阶段发现这份产物
+  > 就直接拷进镜像，**amd64 与 arm64 共用同一份快照**。
+  > 为什么不把生成过程放进 Dockerfile 让两个架构各自算：arm64 那条腿要在 amd64 runner 上走 **QEMU 模拟**，
+  > 把"导入 + 人口推算"塞进模拟环境会慢好几倍、还更容易 OOM/超时。
+  > 想换种子对应的数据集：Run workflow 时把 `seed_city` 填成 `beijing-pbf` / `hebei` / `monaco` 之类
+  > （默认 `beijing`），它会透传给 `--city` 与 `build-args: OSM_SEED_CITY`。
+  > 预计耗时：下载几十秒（首次）+ 导入本机实测 53.9 秒 + 初始化 10.3 秒 + 两个架构的构建与推送。
+  > **内存与超时**（构建期"起服务器再停掉"这件事在 CI 里可行吗？—— 本机实测可行）：
+  > 临时实例**峰值 RSS 286 MB**（导入 479 MB 的库 + 建 2.07M 节点的路网 + 算 17,065 个格子），
+  > runner 有 16 GB，流水线里另外给了 `NODE_OPTIONS=--max-old-space-size=4096` 当上限；
+  > 等待初始化完成的上限是 30 分钟（`--timeout 1800`，判据是"就绪 + 人口网格 done=1"），
+  > 这个 step 的硬超时 45 分钟、整个 job 120 分钟。
 - **本机有 Docker**：`./deploy/build-push.sh docker.io/你的用户名/osm-city:2.0`
   （只推本机架构用 `PLATFORMS=linux/amd64 ./deploy/build-push.sh <tag>`，快得多）
+  > 本机构建时上下文里一般**没有** `deploy/seed/osm.sqlite`，所以 Dockerfile 的种子阶段会**自己**下载 +
+  > 导入 + 跑完一次性初始化（同架构构建，速度与上表实测同量级；构建时间因此从"约 1 分钟"变成 3~6 分钟）。
+  > 想让本机构建也快：先 `sh deploy/build-seed.sh --out deploy/seed/osm.sqlite`（Git Bash / WSL / Linux 都行），
+  > 再构建；或者干脆用 CI。
 - **任意镜像仓库都行**：Docker Hub、阿里云 ACR、腾讯云 TCR、`ghcr.io` 都只是把上面的 tag 换掉。
 
 > arm64 值得一起推：便宜 VPS（Oracle/Ampere、鲲鹏）很多是 arm64，
@@ -203,11 +284,22 @@ services:
 
 ### ③ 升级与回滚
 
+用 compose 的（把 `build: .` 换成 `image:` 之后）：
+
+```bash
+docker compose pull && docker compose up -d     # 拉新镜像并重启容器
+```
+
+用 `docker run` 的：
+
 ```bash
 docker pull ghcr.io/你的用户名/你的仓库:latest
 docker stop osm-city && docker rm osm-city
 # 再跑一遍 ② 那条 run；数据在 osm-data 卷里，删容器不丢档
 ```
+
+**卷优先**：新镜像里的预建库**不会**覆盖你卷里已有的 `osm.sqlite`（玩家账号/编辑/存档都在里面），
+所以升级只是换代码 + 换 `/opt/osm-seed/` 那份只读快照，启动路径与原来完全一样（几秒）。
 
 用 `:2.0` / `:sha-xxxxxxx` 这类固定 tag 部署，就随时能 `docker run` 回上一个版本。
 **升级前先备份**（`docker compose exec osm-city node tools/backup-osm.js …`），因为启动时数据库会自动迁移。
@@ -218,13 +310,18 @@ docker stop osm-city && docker rm osm-city
 
 1. **必须挂持久卷到 `/app/data`**。多数平台默认文件系统是**临时的**：重新部署/重启一次，
    数据集和玩家存档（公司/线路/车辆/车站）就全没了。没有持久卷就别在这类平台开长期存档。
-2. **内存给足 1 GB 以上**：实测运行中 RSS 0.55~0.85 GB（路网 + 人口网格 + 车队都在内存里），首次导入还要额外内存。
-3. **首次启动要下载数据并导入**（北京 47 MB / 1~2 分钟；分省 ~10 分钟；全国 1.5 GB / 1~2 小时），
-   期间容器**不监听端口**；有些平台的启动探针等不了这么久。稳妥做法：先在你自己的机器上把库导好，
-   直接放进持久卷（`/app/data/osm/<城市>.sqlite`），容器启动时就会跳过导入。
+2. **内存给足 1 GB 以上**：实测运行中 RSS 0.55~0.85 GB（路网 + 人口网格 + 车队都在内存里）。
+   新方案下首次启动**不再需要导入与人口推算的额外内存**，比老版本对 1 GB 的小实例友好得多。
+3. **首次启动不再联网下载、也不再现场导入**（镜像里带的是构建期算好的库），
+   所以启动探针只需要等"拷一次 + 建路网"（秒级~几十秒）；老版本要等下载 + 导入几分钟~几小时，
+   探针经常等不了。想更稳：把库直接放进持久卷（`/app/data/osm/osm.sqlite`），容器连拷贝都跳过。
 
-> 镜像里**不含数据集与玩法存档**（它们在数据卷里），所以镜像本身很小（≈100 MB），
-> 推拉都很快；但也意味着"换一台服务器"时别忘了把数据卷一起搬过去。
+> ⚠ **镜像现在带着数据集**：里面有一份构建期算好的预建库（北京实测 492 MB，`gzip -6` 后 158.7 MB），
+> 所以镜像**不再是** ≈100 MB 的"纯代码镜像"，而是 ≈260 MB 上下（基础镜像约 90 MB + 预建库约 160 MB，
+> 估算，未在真 Docker 里构建过 —— 见附录 C）。推拉要多花一点时间，换来的是**首次启动几秒可用**。
+> 玩法存档与玩家账号仍然**只在数据卷里**，镜像里那份是只读的初始快照："换一台服务器"时别忘了把卷一起搬过去。
+> 不想要这份快照：`OSM_SEED=0`（运行时不使用）—— 但它仍然在镜像里占体积，要彻底去掉得自己构建时删掉
+> `COPY --from=seed` 那两行。
 
 ---
 
@@ -233,7 +330,7 @@ docker stop osm-city && docker rm osm-city
 ```bash
 # ① 进程活着、数据集载入了（这个接口不需要登录）
 curl -s http://127.0.0.1:8787/api/health
-# → {"ok":true,... "data":{"nodes":2181032,"ways":335686,"source":"Beijing.osm.gz","sizeBytes":555581440,...}}
+# → {"ok":true,... "data":{"nodes":2071057,"ways":319818,"source":"Beijing.osm.gz","sizeBytes":516018176,...}}
 #    data.source 就是"这份库是从哪个源文件导入的"（例如 china-latest.osm.pbf / hebei-latest.osm.pbf），
 #    配合启动日志那行「数据集： data/osm/xxx.sqlite（节点/道路/关系）」就能确认现在跑的是哪座城。
 
@@ -242,6 +339,19 @@ curl -s http://127.0.0.1:8787/api/ready
 
 # ③ 容器健康状态
 docker compose ps          # STATUS 里应出现 (healthy)
+
+# ④ 这次走的是哪条路？（入口日志里第一条中文说明就是答案）
+docker compose logs osm-city | head -20
+#   走预建库时：「[deploy] ✅ 用镜像内预建库（已含人口网格与索引）：/opt/osm-seed/osm.sqlite」
+#                「[deploy] 校验通过：population_cells 17065 行 · ways.lod_zoom 已回填 319818 行」
+#                「[deploy] 拷贝完成：…（492.0M，用时 N s）」
+#   走下载+导入时：「[deploy] 这次不用镜像内预建库，走「下载 + 导入」：<原因>」
+#   已有库时：    「[deploy] 已有数据集，跳过下载与导入：…」
+
+# ⑤ 服务器是否跳过人口推算（这是"一次性计算已经烘进镜像"的直接证据）
+docker compose logs osm-city | grep '\[pop\]'
+#   期望看到：「[pop] 已有人口网格：10805312 人 / 0 个岗位 / 17065 格」
+#   而不是：    「[pop] 首次启动：正在从 OSM 建筑/用地推算人口网格…」（那是 `OSM_SEED=0` 的路径）
 ```
 
 然后浏览器打开 `http://你的服务器IP:8787/`，点「注册新账号」建一个账号（昵称 + 至少 4 位密码）就能开始玩。
@@ -259,9 +369,10 @@ sudo ss -ltnp | grep 8787                  # 宿主机在监听吗
 
 ```bash
 docker compose logs -f --tail 200          # 日志（stdout，没有日志文件）
-docker compose restart                     # 重启（约 15~20 秒恢复）
+docker compose restart                     # 重启：卷里已经有库 ⇒ 只重建路网，本机实测约 1 秒初始化
 docker compose down                        # 停掉，数据卷保留
 docker compose up -d                       # 再起
+docker compose up -d --force-recreate      # 换了环境变量（例如 OSM_SEED/OSM_CITY）时用这个
 ```
 
 **备份**（重要：这是一份**多人共享的可编辑数据集**，误删无法从 OSM 官方恢复）：
@@ -393,20 +504,24 @@ location / {
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| `端口 8787 已被占用` | 宿主机上有别的进程占用。`sudo ss -ltnp \| grep 8787` 找到并停掉，或换端口（同时改 compose 的映射） |
+| **镜像怎么变大了？**（≈260 MB 而不是 ≈100 MB） | 镜像里多带了一份**构建期算好的预建库**（`/opt/osm-seed/osm.sqlite`：北京 492 MB，`gzip -6` 后 158.7 MB）。这是为了把"下载 + 导入 + 首次人口推算"从**你的服务器**搬到**构建机**上：换来的是一次 `docker run` 几秒可用，而不是 497.9 秒导入 + 一段把小机器压死的推算。不想要：`OSM_SEED=0`（行为回到老版本），但体积还得自己改 Dockerfile 才能去掉 |
+| **首次启动日志里说"城市不匹配，退回下载 + 导入"** | 镜像里的预建库只有一个城市（默认 beijing），而你设了别的 `OSM_CITY`。要么改回 `OSM_CITY=beijing`，要么重新构建一个带该城市预建库的镜像（CI 的 `seed_city` 输入） |
+| **想更新地图数据（同一座城的新包）** | 预建库是**快照**，不会自己变新：`OSM_CITY=beijing OSM_FORCE_REIMPORT=1 docker compose up -d` 会强制重新下载 + 导入（旧行为），或者在别处导好库再拷进卷 |
+| 端口 8787 已被占用 | 宿主机上有别的进程占用。`sudo ss -ltnp \| grep 8787` 找到并停掉，或换端口（同时改 compose 的映射） |
 | 容器起来了但浏览器打不开 | 云**安全组**没放行 8787；或 `host` 被改成了 `127.0.0.1` |
-| 页面一直转圈、地图不出来 | 初始化还没完（首次 15~20 秒，导入时 1~2 分钟，全国 1~2 小时）；`curl /api/ready` 看进度。反代场景多半是 WebSocket 升级头没配 |
-| **导入期间 `curl` 8787 直接拒绝连接** | 正常现象：ENTRYPOINT 里的下载/导入跑完才会执行 `CMD` 里的服务器，这期间**没有进程监听端口**。看 `docker compose logs -f` 的进度 |
-| `磁盘空间不足：… 需要约 xx GB` | 下载前的预检拦住了。按提示扩卷，或换分省包（`OSM_CITY=hebei`），或在别的机器上导好库再拷进卷里。想强行跳过：`node tools/fetch-osm.js … --no-space-check`（风险自负） |
+| 页面一直转圈、地图不出来 | 初始化还没完（用预建库时：拷贝几秒 + 建路网约 1~20 秒；`OSM_SEED=0` 时导入 1~2 分钟、全国 1~2 小时）；`curl /api/ready` 看进度。反代场景多半是 WebSocket 升级头没配 |
+| **启动时 `curl` 8787 直接拒绝连接（几秒）** | 正常现象：ENTRYPOINT 里在拷预建库（或旧路径里在下载/导入），这时还没执行 `CMD` 里的服务器，**没有进程监听端口**。看 `docker compose logs -f`：会打印这次走的是哪条路 |
+| **日志出现"预建库校验失败/内容不完整"** | 入口拷完之后会开库查一次（`population_cells` 与 `ways.lod_zoom` 都不能为空），不合格就把文件删掉并退出（不会把一个坏库当"已有数据集"用下去）。重试一次；仍不行就 `OSM_SEED=0` 走下载 + 导入 |
+| `磁盘空间不足：…` | 下载前的预检拦住了。按提示扩卷，或换分省包（`OSM_CITY=hebei`），或在别的机器上导好库再拷进卷里。想强行跳过：`node tools/fetch-osm.js … --no-space-check`（风险自负） |
+| `要 XX MB（含 64 MB 余量），可是 /app/data 只剩 …` | 拷贝预建库前的空间预检。给卷扩空间，或者换更小的数据集（`OSM_CITY=monaco` 只有几 MB） |
 | 全国数据导入太慢/装不下 | 见 2C 的容量表：库 **25~40 GB**、1~2 小时。便宜 VPS 请改用分省包；或者"别处导好 + 拷库进卷" |
 | 下载中断（网络抖动） | `tools/fetch-osm.js` 会**断点续传**（HTTP Range）并在失败后退避重试；`.part` 文件会保留，重跑同一条命令就接着下。想强制重下加 `--force` |
 | 下载的 md5 对不上 | 下载器会删除 `.part` 与半成品并退出 1（实测过）。重跑一次；老是失败就检查是不是被 CDN/代理改写了响应 |
 | 想换成别的城市/加城市 | 见「附录 B」与 [CITIES.md](CITIES.md) |
-| `/app/... entrypoint.sh: not found` 或 `\r` 相关报错 | 代码从 Windows 传来时带了 CRLF。Dockerfile 里已经 `sed -i 's/\r$//'` 兜住；若你手动挂载脚本，请先 `dos2unix deploy/docker-entrypoint.sh` |
+| `/app/... entrypoint.sh: not found` 或 `\r` 相关报错 | 代码从 Windows 传来时带了 CRLF。Dockerfile 里已经 `sed -i 's/\r$//'` 兜住（`docker-entrypoint.sh` 与构建用的 `build-seed.sh` 都处理了）；若你手动挂载脚本，请先 `dos2unix deploy/docker-entrypoint.sh` |
 | `Cannot find module 'node:sqlite'` | Node 太老。基础镜像固定 `node:22-slim`（需 ≥22.5）；自建镜像请用 22.x 最新版，或给命令加 `--experimental-sqlite` |
 | 重启后存档没了 | 数据卷没挂上（绑错目录/用了 `down -v`）。确认 `docker compose ps` 里挂载了 `osm-data:/app/data` |
 | 内存被杀（OOMKilled） | `docker inspect osm-city \| grep OOMKilled`。调高 `mem_limit` 或加内存（见「服务器要求」） |
-| 想换成别的城市/加城市 | 见文末「附录 B」 |
 
 ---
 
@@ -485,22 +600,28 @@ docker compose exec osm-city node tools/rebuild-population.js --db data/osm/osm.
 
 ## 附录 C：这份部署没被验证到哪一步
 
-诚实说明：**我没有 Docker 环境**，也没有 `bash` 能用（这台机器的沙箱禁止命名管道，Git Bash 一启动就报
-`couldn't create signal pipe`，WSL 未安装），所以下面这些东西**没有被真正执行过**：
+诚实说明：**我没有 Docker 环境**（`docker --version` 直接是"命令不存在"），也没有 `bash` 能用
+（这台机器的沙箱禁止命名管道，Git Bash / dash 一启动就报 `couldn't create signal pipe, Win32 error 5`，
+WSL 未安装），所以下面这些东西**没有被真正执行过**：
 
-- `docker build` / `docker compose up`：`Dockerfile` / `docker-compose.yml` / `docker-entrypoint.sh`
-  只做了逐条核对与语法审查。
-- `bash -n deploy/docker-entrypoint.sh`：**没跑成**（沙箱禁止命名管道，bash/dash 都无法启动）。
-  替代措施：脚本只用了 POSIX sh 的写法（`${VAR-default}`、`case`、`[ ]`，没有 `[[` / 数组 / `local`），
-  且 `--print-env` 的值全部用单引号包好（中文城市名带括号也不会把 `eval` 弄崩），并用 Node 写了一个
-  结构检查（配对 `if/fi`、`case/esac`、引号、CRLF）——**这只是启发式检查，不等于语法验证**。
-- 容器里"curl 不存在"的假设**不成立**：`Dockerfile` 装了 curl。即便如此，下载仍改走纯 Node 的
-  `tools/fetch-osm.js`（断点续传/重试/进度/校验/磁盘预检都自己做），这样不依赖镜像里装了什么。
+- **镜像从来没有真正构建过**：`docker build` 一次都没跑起来过。镜像体积、`COPY --from=seed` 的分层、
+  多架构（amd64/arm64）构建、`docker compose up`、健康检查探针，全都只是**逐条核对 + 书面推算**。
+  文里出现的"镜像大约增加 ~160 MB"是**用 gzip 压缩率估的**（见下表最后一行），不是实测的镜像层大小。
+- `bash -n deploy/docker-entrypoint.sh` 与 `bash -n deploy/build-seed.sh`：**都没跑成**
+  （沙箱禁止命名管道，bash / dash / sh 都无法启动）。替代措施：
+  ① 两个脚本都只用 POSIX sh 写法（`${VAR-default}`、`case`、`[ ]`，没有 `[[` / 数组 / `local`）；
+  ② 用 Node 写了个结构检查（BOM/CRLF、`if/fi` 配对、`"…"` 里再套 `"…"` 的可疑行）；
+  ③ **脚本里内嵌的两个 Node 小程序被原样抽出来真跑过**（`wait-ready.mjs` / `inspect-seed.mjs`）——
+  这意味着脚本里那段 JS 是对的，但**外壳（sh 的控制流）没有语法验证**。这是本次最大的未验证项。
+- 容器里 `node tools/import-osm.js` / `node server/index.js` 组合**没有在容器里跑过**：
+  它们在**宿主机上**用同一批 Node 命令、同样的参数（`--osm` / `--port 8799` / `--data <临时目录>`）跑过，
+  但"容器里再跑一遍"这件事只能等真 Docker。
 
 已经在本机**真实跑过**的部分：
 
 | 验证项 | 结果 |
 | --- | --- |
+| **构建期种子链（`deploy/build-seed.sh` 里那条命令链，逐条在宿主机上真跑）** | 见下面单独一节 |
 | `tools/pbf.js` 解析真实的 Geofabrik PBF | 摩纳哥 675.8 KB → 41,703 节点 / 6,248 way / 348 relation，0.10 秒 |
 | 导入真实的摩纳哥 PBF | `nodes=41703 ways=6248 relations=348`，库 11.2 MB，**0.9 秒**；R\*Tree 与 bbox/length 全齐，`--force` 二次导入幂等 |
 | 导入真实的北京分省 PBF（35.1 MB） | 4,828,790 节点 / 518,666 way / 12,580 relation，库 928 MB，**110 秒**，峰值 RSS 194 MB |
@@ -509,18 +630,46 @@ docker compose exec osm-city node tools/rebuild-population.js --db data/osm/osm.
 | 下载器磁盘预检 | `--min-free-gb 99999` → 退出码 1，中文说明差多少与三条出路；**未留下任何 `.part`** |
 | `--print-env`（entrypoint 靠它取城市预设） | 输出单引号包裹的 `KEY='VALUE'`，可被 `eval` 安全消费 |
 | Node 侧 | `node --check` 全部改过的文件通过；`node tests/import-test.js` 82/82、`node tests/pbf-import-test.js` 149/149、`node tools/check-dom.js`、`node tools/check-load-order.js` 全绿 |
-| 健康检查用的 Node 单行命令（`fetch('http://127.0.0.1:8787/api/health')`）实测返回 200、退出码 0 |
-| `/api/health`、`/api/ready` 的真实响应形状；端口 200 ms 内监听、初始化 15~20 秒 |
-| 项目所有路径都相对项目根解析（与工作目录无关）；`DATA_DIR` 环境变量被 `server/index.js` 读取 |
-| `.dockerignore` 排除了 `data/`（约 1 GB）与 `passport/`（约 2 GB），否则构建上下文会大到离谱 |
+| 健康检查用的 Node 单行命令（`fetch('http://127.0.0.1:8787/api/health')`） | 实测返回 200、退出码 0 |
+| `/api/health`、`/api/ready` 的真实响应形状 | 形状确认；端口 **139 ms** 就开（本次种子实例实测） |
+| 项目所有路径都相对项目根解析（与工作目录无关） | 确认：`--osm` / `--data` 都按项目根解析，`DATA_DIR` 环境变量被 `server/index.js` 读取 |
+| **入口里那段"拷完种子库之后的开库校验"（`node -e` 内联代码）** | 从 `docker-entrypoint.sh` 里**原样抽出**、对着真种子库跑：输出「校验通过：population_cells 17065 行 · ways.lod_zoom 已回填 319818 行」，退出码 0，耗时 0.12 s |
+| `.dockerignore` 的规则 | 排除了 `data/`（约 1 GB）与 `passport/`（约 2 GB），并**放行** `deploy/seed/**`（CI 预生成种子的必经之路）；按"最后匹配者胜"逐条核对（**没有**运行 docker 的 matcher，因为没有 Docker） |
+
+### 构建期种子链：本机实测（2026-09-21，Windows 10 / Node v22.22.0 / 20 核 / D: 盘）
+
+跑的是 `deploy/build-seed.sh` 会执行的**同一条命令链**（同参数、同顺序，端口 8799、`--data` 用临时目录、
+**绝不碰 `data/osm/osm.sqlite`**）；两个内嵌 Node 小程序是从脚本里原样抽出来的：
+
+| 步骤 | 实测 |
+| --- | --- |
+| ① 来源包 | 复用已有的 `data/osm/Beijing.osm.gz`（49,094,438 字节，md5 计算通过；**没有**重新下载，只读使用） |
+| ② `node tools/import-osm.js --file … --db <临时库> --city beijing --force --quiet` | **53.9 秒**，库 **479.0 MB**，2,071,057 节点 / 319,818 way / 10,004 relation / 2,541,654 way_nodes |
+| ③ 起临时服务器（`--osm <临时库> --port 8799 --data <临时目录>`，**用仓库 config.json 原样**） | 迁移：`ways.road_class/lod_zoom` 回填 **319,818 行 / 1.43 s** + `idx_ways_lod_zoom` 0.10 s + `idx_nodes_poi_low` 0.23 s；铁路网 376 ms；**人口网格全量推算 9.9 s**（扫 317,090/317,090 条 way，102,955 条有贡献 → 10,805,312 人，分 34 批提交，让出事件循环 241 次、最长一次占住 48 ms）；服务器自报**初始化 10.3 s**；**临时实例峰值 RSS 286 MB** |
+| ④ 停掉临时实例（Windows 上只能强杀）→ WAL 检查点 | 强杀后 `PRAGMA wal_checkpoint(TRUNCATE)` 返回 `busy=0 log=0 checkpointed=0`（说明数据本来就已全部落盘），`-wal` 从 50.9 MB → **0 字节** |
+| ⑤ 种子库体检（`inspect-seed.mjs`） | **492.1 MB**（516,018,176 字节）· `ways.lod_zoom` 非空 **319,818 行**（= 全部）· `population_cells` **17,065 行** · `population_sources` **102,955 行** · `meta.population_model=2` · `population_build_state.done=1`、`processed=317,090/317,090` · 索引 17 个（含 `idx_ways_lod_zoom`） |
+| ⑥ **用这份种子库再起一次服务器**（＝用户拿到镜像后的首次启动） | `/api/ready` **1.4 秒**就 ready（服务器自报：端口 139 ms 就开、**初始化 1039 ms**）；日志是「`[pop] 已有人口网格：10805312 人 / 0 个岗位 / 17065 格`」——**确认跳过了人口推算**；峰值 RSS 192 MB |
+| ⑦ 拷贝成本（入口要做的唯一一件事） | `cp` 492.1 MB：**0.20 秒**（宿主机 D: 盘、热缓存；容器里 overlayfs → 卷会慢一些，量级仍是秒） |
+| ⑧ `gzip -6` 压缩率（**估算**镜像层增加多少） | 492.1 MB → **158.7 MB（32.3%）** ⇒ 镜像大约增加 **~160 MB**（估算，未在真 Docker 里验证） |
+
+> 顺带说明一个**本次验证中撞到的坑**：第一次跑③时，`/api/ready` 在 5.1 秒就回了 `ready=true`，
+> 但库里 `population_build_state.done` 还是 0、人口网格只算了 2% —— 因为 `index.js` 在初始化**出错**时
+> 也会调 `finishInit()`，`ready=true` 并不代表算好。所以 `build-seed.sh` 的判据是
+> **`ready=true` 且库里 `done=1` 且 `processed>=total`**，不合格就**失败退出**（最多重试 6 次续算），
+> 绝不把一个只算了一半的库交给 Dockerfile。
 
 **没有验证到的部分（重要）**：
 
+- **镜像是怎么分层的、体积到底多大、两个架构能不能都构建成功 —— 没有实测**（没有 Docker）。
+  CI 流水线里那些步骤（`actions/setup-node`、在 runner 上生成种子、`buildx` 双架构、推 GHCR）
+  同样**没有执行过**，只做了逐条核对。
 - 全国 `china-latest.osm.pbf` **没有真正导入过**（1.5 GB 源文件 + 25~40 GB 库，本机磁盘与时间都不划算）。
   表里的全国数字是"下前 24 MiB 实测节点密度 + 北京分省包实测字节/节点"的**外推**，误差可能有 ±50%。
   第一次上全国数据请**先 `--check` 看预检**，并留足磁盘。
 - 分省包（河北等）同样只有外推，没有实测。
-- `docker-entrypoint.sh` 的端到端流程（容器内下载 → 导入 → 起服务）没有在容器里跑过；
-  它的每一步命令都在宿主机上单独验证过。
+- `docker-entrypoint.sh` 的端到端流程（容器内拷贝/下载 → 导入 → 起服务）没有在容器里跑过；
+  它的每一步命令都在宿主机上单独验证过（上面的种子链 + 入口里那段 `node -e` 校验逻辑同样在宿主机上验证过）。
+- 1 GB 内存 VPS 上的行为**不能**由本机（20 核、内存充足）实测推断：文里"1 GB 机器上这一段最吃力"
+  依据的是用户在 1 GB VPS 上的实测（导入 497.9 秒、整机被拖到无法登录）。
 
 第一次 `docker compose up -d --build` 如果报错，把 `docker compose logs` 的输出发我，我照着改。

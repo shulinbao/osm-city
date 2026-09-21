@@ -2825,7 +2825,7 @@
 
         <div class="st-sec">
           <div class="st-sec-head"><div class="st-sec-title">覆盖与客流</div></div>
-          <div class="tp-row"><span>覆盖人数</span><b>${util.fmt(c.pop || 0)} 人${weighted === null ? '' : `（等效 ${util.fmt(weighted)}）`} · ${util.fmt(c.jobs || 0)} 岗位</b></div>
+          <div class="tp-row"><span>覆盖人数</span><b>${util.fmt(c.pop || 0)} 人${weighted === null ? '' : `（等效 ${util.fmt(weighted)}）`}</b></div>
           <div class="tp-row"><span>等车人数</span><b><span class="stm-wait">${util.fmt(waiting)}</span> 人
             <span class="stm-trend ${trend.dir === 'up' ? 'warn' : (trend.dir === 'down' ? 'ok' : '')}"
               title="每 10 秒比较一次，看队伍在涨还是在消化">${util.esc(trendTxt)}</span>
@@ -3028,7 +3028,7 @@
         <div class="st-stat">
           <span>等车人数 <b>${util.fmt(waiting)}</b></span>
           <span>失去耐心 <b>${util.fmt(lost)}</b></span>
-          ${station.catchment ? `<span>覆盖 <b>${util.fmt(station.catchment.pop)}</b> 人${Number.isFinite(Number(station.catchment.weightedPop)) ? `（等效 <b>${util.fmt(station.catchment.weightedPop)}</b>）` : ''} · <b>${util.fmt(station.catchment.jobs)}</b> 岗位</span>` : ''}
+          ${station.catchment ? `<span>覆盖 <b>${util.fmt(station.catchment.pop)}</b> 人${Number.isFinite(Number(station.catchment.weightedPop)) ? `（等效 <b>${util.fmt(station.catchment.weightedPop)}</b>）` : ''}</span>` : ''}
           <span>路网 <b>${station.nodeId || station.onRail ? '已接入' : '未接入'}</b></span>
         </div>
         <div class="popup-actions">
@@ -3245,7 +3245,7 @@
         lat: latlng.lat,
         lon: latlng.lng,
       }).then((res) => {
-        util.toast(`已建成 ${res.result.station.name}（吸附路网：${res.result.station.onRail ? '是' : '否'}，覆盖 ${res.result.station.catchment.pop} 人 / ${res.result.station.catchment.jobs} 岗位，花费 ${Transit.moneyShort(res.result.cost)}）`, 'success', 5000);
+        util.toast(`已建成 ${res.result.station.name}（吸附路网：${res.result.station.onRail ? '是' : '否'}，覆盖 ${res.result.station.catchment.pop} 人，花费 ${Transit.moneyShort(res.result.cost)}）`, 'success', 5000);
         Transit.renderPanelSoon();
         return res.result.station;
       }).catch((err) => {
@@ -5479,7 +5479,7 @@
         + '<div class="tp-legend-bar"></div>'
         + '<div class="tp-legend-scale"><span>稀疏</span><span>中等</span><span>稠密</span></div>'
         + (Transit.population.totals
-          ? `<div class="tp-legend-note">当前视野：${util.fmt(Transit.population.totals.population || 0)} 人 · ${util.fmt(Transit.population.totals.jobs || 0)} 岗位</div>`
+          ? `<div class="tp-legend-note">当前视野：${util.fmt(Transit.population.totals.population || 0)} 人</div>`
           : '');
       body.appendChild(box);
     },
@@ -5680,7 +5680,7 @@
         <div class="tp-row"><span>全服运送</span><b>${util.fmt(stats.riders || 0)} 人次</b></div>
         ${(Transit.config && Transit.config.economy) ? `<div class="tp-row"><span>票款</span><b>${util.fmt(stats.revenue || 0)} 元</b></div>` : ''}
         <div class="tp-row"><span>路网</span><b>${stats.rail ? util.fmt(stats.rail.ways) + ' 条轨道' : '—'}${road.ways ? ` · ${util.fmt(road.ways)} 条道路` : ''}</b></div>
-        <div class="tp-row"><span>人口模型</span><b>${util.fmt(pop.population || 0)} 人 / ${util.fmt(pop.jobs || 0)} 岗位</b></div>`;
+        <div class="tp-row"><span>人口模型</span><b>${util.fmt(pop.population || 0)} 人</b></div>`;
       box.appendChild(st);
       const clock = (Transit.data && Transit.data.clock) || null;
       box.appendChild(util.el('div', 'tp-note',

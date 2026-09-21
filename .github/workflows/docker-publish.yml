@@ -10,6 +10,22 @@
 #  多架构：同时构建 linux/amd64 与 linux/arm64 —— 便宜 VPS 里 arm64（Ampere/鲲鹏）
 #  很常见，构建时不知道服务器是什么架构，两个都推上去最省事。
 #
+#  ── 这个流水线现在多做一件事：**先在 runner 上把"种子库"算好** ──────────────
+#  背景：容器首次启动时，服务器除了导入 OSM，还要做数据库迁移、ways.road_class/lod_zoom
+#  回填、以及**首次人口/岗位网格全量推算**（population.js 的 buildAll：北京要扫 31.7 万条
+#  带标签的 way）。最后这一项在 1 GB 内存的小机器上会把整机压到无法登录
+#  （用户实测：导入就花了 497.9 秒，之后整机卡死只能重启）。所以：
+#    [步骤 A] 用 runner 自己的 Node 22 跑 deploy/build-seed.sh
+#             （下载 47 MB → 导入 → 起一次临时服务器把初始化跑完 → 停掉 → WAL 检查点）
+#             产物：deploy/seed/osm.sqlite（已含人口网格与索引；实测 492 MB）
+#    [步骤 B] docker build：Dockerfile 的种子阶段发现这份产物就直接拷进镜像
+#             （不再下载/不再导入/不再推算），amd64 与 arm64 **共用同一份快照**。
+#  为什么不在 Dockerfile 里直接生成、而是先在 runner 上生成：
+#    arm64 那条腿要在 amd64 runner 上走 QEMU 模拟，把"导入 + 人口推算"这种重活塞进模拟环境
+#    会慢好几倍、还更容易 OOM/超时；两个架构并行重算一遍也没有任何意义（库内容应当一致）。
+#    Dockerfile 仍然保留"自己生成"的能力：你本机 `docker build .`（上下文里没有
+#    deploy/seed/osm.sqlite）时它就会自己下载 + 导入 + 初始化，只是会慢（同架构构建没问题）。
+#
 #  第一次用需要在仓库设置里放开权限：
 #    Settings → Actions → General → Workflow permissions → Read and write permissions
 #  （否则 GITHUB_TOKEN 没有推包权限）。推完之后包默认是私有的，
@@ -19,6 +35,12 @@ name: docker-publish
 
 on:
   workflow_dispatch:            # 手动触发
+    inputs:
+      seed_city:
+        description: '种子库用哪个数据集（tools/cities.json 里的 id：beijing / beijing-pbf / hebei / monaco …）'
+        required: false
+        default: 'beijing'
+        type: string
   push:
     tags: ['v*']                # 打 v 开头的 tag 时自动构建
 
@@ -32,6 +54,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    # 整个 job 的上限：种子生成（下载 + 导入 + 人口推算）+ 两个架构的构建与推送。
+    # 卡住时宁可让流水线失败并留下日志，也不要挂几个小时。
+    timeout-minutes: 120
     # 放到 env 里再判断：`if:` 里能安全读的是 `env` / `github` 上下文，
     # 直接写 `if: secrets.X != ''` 在部分场景下不生效（会变成"永远为真"或直接报错）。
     env:
@@ -39,6 +64,68 @@ jobs:
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+
+      # 种子生成需要 Node ≥ 22.5（node:sqlite）。runner 上预装的版本不保证，
+      # 这里显式钉一个 22.x，与镜像里的 node:22-slim 保持一致。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # ----------------------------------------------------------------------
+      # 步骤 A：构建期种子库（这就是"把一次性计算挪到构建期"的那一步）
+      #   --out deploy/seed/osm.sqlite  → Dockerfile 的种子阶段会直接用它
+      #   --port 8799                   → **绝不用 8787**（那是用户线上服的端口）
+      #   --data $RUNNER_TEMP/seeddata  → 临时实例的 users.json 等落在临时目录，不进产物
+      #   --timeout 1800                → 等"就绪 + 人口网格 done=1"的最长 30 分钟
+      # 本机实测（Windows 20 核，北京 BBBike 包）：导入 53.9 秒 + 初始化 10.3 秒 + 体检，
+      # 其中人口网格全量推算 9.9 秒、峰值 RSS 286 MB。runner 是 4 核，预计整体 3~8 分钟。
+      # 内存：导入与建图都是流式/切片的，给 4 GB JS 堆上限足够，也能挡住失控膨胀。
+      # ----------------------------------------------------------------------
+      - name: 构建期生成种子库（下载 → 导入 → 跑完一次性初始化 → 停掉 → 校验）
+        timeout-minutes: 45
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+          # 打 tag 触发时没有输入，取默认值 beijing（`inputs` 在 step 级 env 里一定可用）
+          SEED_CITY: ${{ inputs.seed_city || 'beijing' }}
+        run: |
+          bash deploy/build-seed.sh \
+            --out deploy/seed/osm.sqlite \
+            --city "$SEED_CITY" \
+            --data "$RUNNER_TEMP/seeddata" \
+            --port 8799 \
+            --timeout 1800
+
+      # 种子没算好就不要往下走：这里再断言一次关键行数（build-seed.sh 内部已经查过一遍，
+      # 这一步是为了让失败信息出现在 Actions 的这一步里，一眼能看到是哪一项不合格）
+      - name: 检查种子库（大小 + 关键行数）
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const p = "deploy/seed/osm.sqlite.seed.json";
+            const rep = JSON.parse(fs.readFileSync(p, "utf8"));
+            const c = rep.verify.counts;
+            console.log("种子库：" + rep.seed.path + " · " + (rep.seed.bytes / 1048576).toFixed(1) + " MB");
+            console.log("生成耗时：导入 " + rep.build.importSeconds + " s · 等就绪 " + rep.build.readyWaitMs + " ms"
+              + "（服务器自报：端口 " + rep.build.serverListenMs + " ms 就开 · 初始化 " + rep.build.serverInitMs + " ms）");
+            console.log("元素：nodes=" + c.nodes + " ways=" + c.ways + " relations=" + c.relations);
+            console.log("LOD 回填：ways.lod_zoom=" + c.waysWithLodZoom + " 行 · ways.road_class=" + c.waysWithRoadClass + " 行");
+            console.log("人口网格：population_cells=" + c.populationCells + " 行（非空 " + c.populationCellsUsed + "）"
+              + " · population_sources=" + c.populationSources + " 行 · meta.population_model=" + rep.verify.meta.population_model);
+            console.log("人口网格断点：done=" + rep.verify.populationBuild.done
+              + " · processed=" + rep.verify.populationBuild.processed + "/" + rep.verify.populationBuild.total);
+            const bad = [];
+            if (!c.nodes || c.nodes < 1000) bad.push("nodes=" + c.nodes);
+            if (!c.populationCells) bad.push("population_cells 是空的（人口网格没算）");
+            if (!c.waysWithLodZoom) bad.push("ways.lod_zoom 一行都没回填");
+            if (!rep.verify.indexes.includes("idx_ways_lod_zoom")) bad.push("缺部分索引 idx_ways_lod_zoom");
+            if (rep.seed.bytes < 20971520) bad.push("库只有 " + rep.seed.bytes + " 字节，太小了");
+            if (!(rep.verify.populationBuild.processed >= rep.verify.populationBuild.total)) {
+              bad.push("人口网格进度对不上：processed=" + rep.verify.populationBuild.processed
+                + " < total=" + rep.verify.populationBuild.total);
+            }
+            if (bad.length) { console.error("种子库不合格：" + bad.join("；")); process.exit(1); }
+            console.log("✅ 种子库合格：迁移/LOD 回填/人口网格（done=1）/索引都在里面");
+          '
 
       # GHCR 的镜像名**必须全小写**，而 github.repository 会保留仓库原本的大小写
       #（仓库叫 Map 就会推成 ghcr.io/you/Map → 报 invalid reference format）。
@@ -49,7 +136,10 @@ jobs:
         run: echo "name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       # arm64 构建要在 amd64 的 runner 上跑，用 QEMU 模拟。
-      # 本项目零依赖、镜像里没有编译步骤（就是 COPY + 一条 apt 装 curl），所以模拟构建也很快。
+      # ⚠ 注意：**重活已经不在模拟环境里跑了** —— 种子库是上面用原生 Node 算好的，
+      #   buildx 在模拟环境里只做 COPY 分层，所以这里仍然很快。
+      #   （如果你把 deploy/seed/osm.sqlite 去掉，Dockerfile 的种子阶段就会在模拟环境里
+      #    重跑导入 + 人口推算，arm64 会慢很多倍 —— 别那么干。）
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
@@ -71,12 +161,17 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
+      # 上下文里带着 deploy/seed/osm.sqlite（几百 MB）——这是**有意**的：换两个架构共用同一份快照。
+      # 代价是这个上下文每次构建都要传给 builder（本地 docker-container builder，几十秒级）。
       - name: 构建并推送（GHCR，始终执行）
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          # 记录种子库对应哪个数据集，方便排查"这个镜像里是哪个城市的快照"
+          build-args: |
+            OSM_SEED_CITY=${{ inputs.seed_city || 'beijing' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # 构建缓存：第二次构建快很多
@@ -88,7 +183,7 @@ jobs:
       # 只有在仓库里配好了这两个 secrets 才会执行，没配就自动跳过（不会让整个流水线失败）：
       #   Settings → Secrets and variables → Actions → New repository secret
       #     DOCKERHUB_USERNAME = 你的 Docker Hub 用户名
-      #     DOCKERHUB_TOKEN    = Docker Hub 的 Access Token（**不要**用登录密码）
+      #     DOCKERHUB_TOKEN    = 你的 Docker Hub 的 Access Token（**不要**用登录密码）
       # 然后用 `docker login` + `docker push` 或直接 docker run docker.io/你的用户名/osm-city:latest
       # ----------------------------------------------------------------------
       - name: 登录 Docker Hub（配了 secrets 才跑）
@@ -97,7 +192,7 @@ jobs:
         with:
           registry: docker.io
           username: ${{ env.DOCKERHUB_USER }}
-          password: ${{ env.DOCKERHUB_TOKEN }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: 构建并推送（Docker Hub，可选）
         if: env.DOCKERHUB_USER != ''
@@ -106,6 +201,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            OSM_SEED_CITY=${{ inputs.seed_city || 'beijing' }}
           # 上一步刚构建过，这里命中缓存，基本只是重打标签再推一次
           tags: |
             docker.io/${{ env.DOCKERHUB_USER }}/osm-city:latest

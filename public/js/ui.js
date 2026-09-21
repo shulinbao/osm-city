@@ -2546,8 +2546,9 @@
             if (c.error) extra = `数据读取失败：${c.error}`;
             else if (mode === 'population' && c.list.length) {
               const pop = c.list.reduce((a, x) => a + (Number(x.pop) || 0), 0);
-              const jobs = c.list.reduce((a, x) => a + (Number(x.jobs) || 0), 0);
-              extra = `视野内合计 ${util.fmtShort(pop)} 人 · ${util.fmtShort(jobs)} 岗位`;
+              // ⚠ 「岗位」不再显示：这个游戏里没有岗位系统（服务端默认也不算岗位，
+              //    见 config.json 的 population.computeJobs 与 server/population.js 的说明）。
+              extra = `视野内合计 ${util.fmtShort(pop)} 人`;
             } else if (mode === 'activity' && c.list.length) {
               const sum = c.list.reduce((a, x) => a + (Number(x.activity) || 0), 0);
               extra = `视野内 ${util.fmt(c.list.length)} 格 · 平均系数 ${(sum / c.list.length).toFixed(2)}`;
@@ -3019,7 +3020,7 @@
     /* ------------------------------ 服务器资讯窗口 ------------------------------ */
     /**
      * 集中一处看服务器资讯：数据集来源与导入时间、要素总数、变更集、在线玩家、路网、
-     * 人口与岗位（新口径）、活跃度格子数、游戏时钟与倍速、服务器运行时长。
+     * 人口（新口径）、活跃度格子数、游戏时钟与倍速、服务器运行时长。
      * 数据全部来自现成接口（/api/health、/api/meta、/api/transit、/api/history），服务器不用改。
      */
     openServerInfo() {
@@ -3143,12 +3144,12 @@
       const wc = World.counts();
       row(secNet, '视野内已载入', `<span class="srv-sub">道路 ${util.fmt(wc.ways)} · 节点 ${util.fmt(wc.nodes)}（只统计已载入视野的本地缓存）</span>`);
 
-      // 5) 人口与岗位（新口径）
+      // 5) 人口（新口径）—— ⚠ 「岗位」不再显示：这个游戏里没有岗位系统
+      //    （服务端默认也不算岗位，见 config.json 的 population.computeJobs）
       const pop = tStats.population || Render.cells.totals || null;
-      const secPop = section('人口与岗位（新口径）');
+      const secPop = section('人口（新口径）');
       if (pop) {
         row(secPop, '总人口', num(pop.population));
-        row(secPop, '岗位', num(pop.jobs));
         row(secPop, '人口网格', pop.cellM ? `<b>${pop.cellM}</b> 米一格 · <b>${util.fmt(pop.cells)}</b> 格` : num(pop.cells) + ' 格');
         row(secPop, '活跃度格子数', pop.activityCells == null ? '—'
           : `<b>${util.fmt(pop.activityCells)}</b> <span class="srv-sub">格（平均系数 ${Number(pop.activity || 0).toFixed(2)}）</span>`);

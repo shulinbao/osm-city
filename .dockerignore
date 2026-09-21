@@ -12,6 +12,8 @@ logs
 # 测试与临时目录（镜像里不需要；要跑测试请在本机跑）
 tests
 tmp-verify
+# 本机验证种子生成时的临时目录（logs/ 已经排除了，这里再写一遍防止有人改 logs 规则）
+logs/seed-test
 
 # 与本项目无关的另一份代码
 passport
@@ -21,6 +23,29 @@ legacy
 # Windows 专用启动脚本（服务器上看不到它，容器里有 entrypoint）
 start.cmd
 
-# 文档留在仓库里就好，不必进镜像（deploy/ 要保留：entrypoint 在里面）
+# 文档留在仓库里就好，不必进镜像（deploy/ 要保留：entrypoint 与 build-seed.sh 在里面）
 *.md
 !deploy/DEPLOY.md
+
+# ---------------------------------------------------------------------------
+# 构建期"种子库"（把一次性计算烘进镜像，见 deploy/build-seed.sh）
+#
+# CI 会先在 runner 上用原生 Node 跑一遍 deploy/build-seed.sh，把成果放在
+# deploy/seed/osm.sqlite（几百 MB），再由 Dockerfile 的种子阶段拷进镜像。
+# 所以这里**必须放行**它 —— 被排除掉的话，CI 会退化成"amd64 / arm64 各自在容器里
+# 重算一遍"，arm64 那条还要走 QEMU 模拟，构建时间会长得多。
+#
+# 放行是有代价的：构建上下文会带上这几百 MB（每次构建都要传给 builder）。
+# 换来的是两个架构共用**同一份快照**，而且不用在模拟环境里跑导入与人口推算。
+# 最终镜像里只有一份（/opt/osm-seed/osm.sqlite），不会把 deploy/seed/ 也塞进去。
+# ---------------------------------------------------------------------------
+!deploy/seed
+!deploy/seed/**
+
+# 种子的伴生临时件一律不进上下文：-wal / -shm 是运行时产物，
+# 种子脚本在收工前已经做过 WAL 检查点（把 -wal 折回主库），交付的就是一个 .sqlite。
+deploy/seed/*.sqlite-wal
+deploy/seed/*.sqlite-shm
+deploy/seed/*.sqlite-journal
+# 种子生成时的临时数据目录（users.json 之类的运行时数据，绝不该进镜像）
+deploy/seed/data

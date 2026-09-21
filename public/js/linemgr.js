@@ -1033,7 +1033,9 @@
 
     const info = util.el('div', 'tp-item-sub');
     info.innerHTML = `单程 ${line.travelSeconds ? util.esc(fmtDur(line.travelSeconds)) : '—'} · 日客流约 ${util.fmt(line.dailyTrips || 0)} 人次`
-      + ` · 站点覆盖 ${util.fmt(line.popTotal || 0)} 人 / ${util.fmt(line.jobsTotal || 0)} 岗位`
+      // ⚠ 只显示"站点覆盖人口"：本作没有岗位系统（服务端默认也不算岗位），
+      //    而客流本来就只看人口 —— 见 server/population.js 的文件头第 1 条。
+      + ` · 站点覆盖合计 ${util.fmt(line.popTotal || 0)} 人`
       + (line.pathError ? ` · <span class="warn">${util.esc(shortText(line.pathError, 80))}</span>` : '');
     box.appendChild(info);
 
