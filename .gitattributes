@@ -1,0 +1,29 @@
+# 行尾统一：这个项目在 Windows 上开发、在 Linux 上（Docker / CI）运行，
+# 混着来会出两类隐蔽问题 ——
+#   ① shell 脚本带 CRLF 时，Linux 上 `#!/bin/sh\r` 直接报 "not found"（容器起不来）
+#   ② .cmd 带 LF 时，Windows 批处理的 goto/label 会行为异常
+# 所以：默认一律 LF，只有 Windows 专用脚本明确用 CRLF。
+* text=auto eol=lf
+
+# Windows 专用启动脚本必须 CRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 容器与 Linux 侧脚本强制 LF（Dockerfile 里另有 sed 兜底，这里是根因上的预防）
+Dockerfile text eol=lf
+*.sh text eol=lf
+Dockerfile.* text eol=lf
+
+# 二进制：不要做任何行尾/编码转换
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.sqlite binary
+*.gz binary
+*.pbf binary
+
+# 让 GitHub 的语言统计不被内置的 Leaflet 等第三方文件带偏
+public/vendor/** linguist-vendored

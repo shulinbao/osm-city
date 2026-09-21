@@ -1,0 +1,49 @@
+{
+  "port": 8787,
+  "host": "0.0.0.0",
+  "dataDir": "data",
+  "osmDb": "data/osm/osm.sqlite",
+  "osmSource": "data/osm/Beijing.osm.gz",
+  "defaultCenter": {
+    "lat": 39.9042,
+    "lng": 116.4074,
+    "zoom": 16
+  },
+  "maxPlayers": 64,
+  "sessionDays": 30,
+  "allowAnyRollback": false,
+  "allowGuests": false,
+  "historyLimit": 200,
+  "limits": {
+    "opsPer10s": 120,
+    "chatPer10s": 6,
+    "maxChatLength": 200,
+    "viewportLimit": 15000,
+    "wayCandidates": 12,
+    "nodeCandidates": 8,
+    "relationLimit": 10000,
+    "groupMaxDepth": 8,
+    "groupMaxSteps": 500,
+    "groupIdleMs": 5000,
+    "groupTtlMs": 120000
+  },
+  "transit": {
+    "startingCash": 200000000,
+    "stationCost": 30000000,
+    "costPerMeter": {
+      "surface": 20000,
+      "elevated": 60000,
+      "tunnel": 120000
+    },
+    "vehicleBaseCost": 20000000,
+    "vehiclePerCarCost": 5000000,
+    "maintenancePerCarPerDay": 20000,
+    "fareBase": 3,
+    "farePerKm": 0.5,
+    "tripRatePerDay": 0.22,
+    "serviceHours": 18,
+    "dwellSeconds": 30,
+    "economy": false,
+    "minGapMeters": 45
+  }
+}

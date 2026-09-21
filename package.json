@@ -1,0 +1,32 @@
+{
+  "name": "osm-city-online",
+  "version": "2.0.0",
+  "private": true,
+  "description": "多人在线 OSM 地图编辑器：服务器本地持有真实 OpenStreetMap 数据集（北京），多人实时协作编辑真实 OSM 元素（node/way/relation + 标签）。零第三方依赖。",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "import": "node tools/import-osm.js --file data/osm/Beijing.osm.gz --db data/osm/osm.sqlite --force",
+    "test": "node tests/osm-e2e.js",
+    "test:import": "node tests/import-test.js",
+    "test:style": "node tests/style-test.js",
+    "test:browser": "node tests/browser-osm-e2e.js",
+    "test:boot": "node tests/browser-boot-e2e.js",
+    "check": "node tools/check-dom.js && node tools/check-load-order.js",
+    "test:transit": "node tests/transit-e2e.js",
+    "smoke:transit": "node tools/smoke-transit.js"
+  },
+  "keywords": [
+    "osm",
+    "openstreetmap",
+    "editor",
+    "multiplayer",
+    "websocket",
+    "sqlite",
+    "gis"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5"
+  }
+}

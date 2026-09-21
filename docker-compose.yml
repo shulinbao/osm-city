@@ -1,0 +1,45 @@
+# 我是市委书记（OSM 城市在线）—— Docker Compose 部署
+#
+#   docker compose up -d --build      # 首次（会下载数据包并导入，约 1~2 分钟）
+#   docker compose logs -f            # 看日志
+#   docker compose down               # 停掉（数据卷保留）
+#
+# 数据集与玩法存档都在命名卷 osm-data 里，删容器不会丢；
+# 只有 `docker compose down -v` 才会连数据一起删。
+services:
+  osm-city:
+    build: .
+    image: osm-city:2.0
+    container_name: osm-city
+    restart: unless-stopped
+
+    # 直接开放 IP:8787（你选的方式）。
+    # ⚠ 这是**明文 HTTP**：登录密码和 token 在网络上不加密。
+    #   收口办法见 deploy/DEPLOY.md 的「安全」一节（防火墙白名单 / Caddy 反代 + HTTPS）。
+    ports:
+      - "8787:8787"
+
+    volumes:
+      - osm-data:/app/data
+
+    environment:
+      DATA_DIR: /app/data
+      # 想临时放开游客登录（本地测试用）就放开下面这行；
+      # 正式服建议保持关闭：任何能访问的人都能注册，而按玩法设计玩家之间可以互相改删资产。
+      # DSH_ALLOW_GUESTS: "1"
+      # 不想让容器联网自动下载数据（推荐：自己把 Beijing.osm.gz 放进卷里再启动）
+      # OSM_AUTO_DOWNLOAD: "0"
+
+    # 内存：本机实测运行中 RSS 约 0.55~0.85 GB（路网/人口缓存 + 车队都在内存里）。
+    # 服务器建议 4 GB；给 2 GB 也能跑，但数据量大、人多时会紧。
+    mem_limit: 3g
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 3
+
+volumes:
+  osm-data:

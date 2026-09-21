@@ -1,0 +1,59 @@
+# 运行时数据：本地 OSM 数据集、账号、导入源文件
+data/
+!data/.gitkeep
+
+# 测试产物
+tests/tmp-*/
+tests/edge-profile*/
+tests/*.png
+tests/dom.html
+tests/dom.err.txt
+
+# 旧版（游戏版）归档，不参与运行
+legacy/
+
+# 系统 / 编辑器
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+
+# === 安全：这些东西一旦提交就等于泄露账号 =================================
+# data/ 上面已经整体忽略了，这里再把最要紧的两份点名一遍（防止将来有人改 data/ 规则）：
+#   data/users.json —— 账号库（scrypt 哈希 + **明文会话 token**，拿到即可直接冒充登录）
+#   data/world.json —— 旧版世界存档（含玩家名单）
+data/users.json
+data/world.json
+data/osm/
+
+# 账号库转储：tests/backup-transit-companies-*.json 里带着
+# **497 个账号 + 499 个有效 session token** 的完整快照（由 tests/tmp-backup-transit.js 生成）
+tests/backup-*.json
+tests/backup-*.json.sha256
+
+# 诊断脚本残留：tests/tmp-*.js 里出现过硬编码的 admin/admin 凭据，
+# 以及"从 users.json 里读出真实 token 再去请求"的脚本
+tests/tmp-*.js
+tests/tmp-*.txt
+
+# 测试实例的数据目录（每个都带一份 users.json 副本）
+tests/lagfix/
+tests/tmp-lagfix/
+
+# 临时验证产物（含 Edge 临时 profile 与账号库副本）
+tmp-verify/
+tmp-*/
+
+# 与本项目无关的另一份代码（passport/，约 3.3 GB）——
+# 它躺在同一个工作目录里，不忽略掉的话一次 `git add -A` 就会把它整包提交上去。
+passport/
+
+# 其它不该进仓库的本地杂物
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.osm.gz
+*.pbf
+.idea/
+.vscode/
+*.swp

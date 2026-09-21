@@ -1,0 +1,114 @@
+# ============================================================================
+#  把镜像构建好并推到镜像仓库（GHCR / GitHub Container Registry）。
+#
+#  为什么要有这个：这样你的服务器上**不需要源码、也不需要构建**，
+#  一行命令就能部署：
+#     docker run -d --name osm-city -p 8787:8787 -v osm-data:/app/data \
+#       --restart unless-stopped ghcr.io/<你的用户名>/<仓库名>:latest
+#
+#  触发方式：手动（Actions 页面点 Run workflow）或打 tag（v2.0 这种）。
+#  多架构：同时构建 linux/amd64 与 linux/arm64 —— 便宜 VPS 里 arm64（Ampere/鲲鹏）
+#  很常见，构建时不知道服务器是什么架构，两个都推上去最省事。
+#
+#  第一次用需要在仓库设置里放开权限：
+#    Settings → Actions → General → Workflow permissions → Read and write permissions
+#  （否则 GITHUB_TOKEN 没有推包权限）。推完之后包默认是私有的，
+#  服务器上要先 `docker login ghcr.io` 才能拉；想公开就把包的可见性改成 public。
+# ============================================================================
+name: docker-publish
+
+on:
+  workflow_dispatch:            # 手动触发
+  push:
+    tags: ['v*']                # 打 v 开头的 tag 时自动构建
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}      # 例如 someone/osm-city
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    # 放到 env 里再判断：`if:` 里能安全读的是 `env` / `github` 上下文，
+    # 直接写 `if: secrets.X != ''` 在部分场景下不生效（会变成"永远为真"或直接报错）。
+    env:
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR 的镜像名**必须全小写**，而 github.repository 会保留仓库原本的大小写
+      #（仓库叫 Map 就会推成 ghcr.io/you/Map → 报 invalid reference format）。
+      # 这里用 tr 转小写：**不要**用 bash 的 ${VAR,,} —— 那是 bash 4+ 才有的写法，
+      # 实测在没有它的 shell 里会**静默地什么都不做**（名字没变小写，报错要到 push 那一步才出现）。
+      - name: 计算小写镜像名
+        id: img
+        run: echo "name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # arm64 构建要在 amd64 的 runner 上跑，用 QEMU 模拟。
+      # 本项目零依赖、镜像里没有编译步骤（就是 COPY + 一条 apt 装 curl），所以模拟构建也很快。
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录镜像仓库
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成 tag（latest + 提交哈希 + 语义化版本）
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.img.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: 构建并推送（GHCR，始终执行）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 构建缓存：第二次构建快很多
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ----------------------------------------------------------------------
+      # 可选：同时推到 Docker Hub。
+      # 只有在仓库里配好了这两个 secrets 才会执行，没配就自动跳过（不会让整个流水线失败）：
+      #   Settings → Secrets and variables → Actions → New repository secret
+      #     DOCKERHUB_USERNAME = 你的 Docker Hub 用户名
+      #     DOCKERHUB_TOKEN    = Docker Hub 的 Access Token（**不要**用登录密码）
+      # 然后用 `docker login` + `docker push` 或直接 docker run docker.io/你的用户名/osm-city:latest
+      # ----------------------------------------------------------------------
+      - name: 登录 Docker Hub（配了 secrets 才跑）
+        if: env.DOCKERHUB_USER != ''
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ env.DOCKERHUB_USER }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: 构建并推送（Docker Hub，可选）
+        if: env.DOCKERHUB_USER != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # 上一步刚构建过，这里命中缓存，基本只是重打标签再推一次
+          tags: |
+            docker.io/${{ env.DOCKERHUB_USER }}/osm-city:latest
+            docker.io/${{ env.DOCKERHUB_USER }}/osm-city:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

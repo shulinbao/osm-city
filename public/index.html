@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>我是市委书记 · 多人在线城市建设与交通经营</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%8F%9B%EF%B8%8F%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body data-tool="select" data-basemap="vector">
+
+<!-- 地图容器：整屏，z-index 0 -->
+<div id="map"></div>
+
+<!-- 顶栏：只留品牌、连接状态、时钟、历史、服务器资讯、退出
+     （「🚈 交通公司」与「🔍 搜索」已经搬进左栏「编辑工具」的按钮列表里；
+       数据集与导入资讯统一在「服务器资讯」窗口里看） -->
+<header id="topbar">
+  <div class="brand"><span class="logo">🏛️</span><span class="title">我是市委书记</span></div>
+  <!-- 数据集/导入资讯不再占顶栏：#data-info 只作为占位节点留在这里（内容一律显示在「服务器资讯」窗口） -->
+  <div id="data-info" class="data-info hidden" aria-hidden="true"></div>
+  <div class="top-actions">
+    <span id="conn" class="conn connecting">连接中…</span>
+    <div id="clock-box" class="clock-box">
+      <!-- 时钟拆成两个独立控件（以前是一个按钮兼两职）：
+           #clock-pause = 暂停 / 继续（暂停时 Transit.setSpeed(0)，再点恢复上一次倍速）
+           #clock-speed = 只负责展开「倍速 + 跳到…」菜单（tests/browser-osm-e2e.js 点它开菜单） -->
+      <button id="clock-pause" class="ghost clock-pause" type="button" aria-pressed="false" title="暂停游戏时间（铺轨、画线时用）；再点一次恢复上一次的倍速">⏸ 已暂停</button>
+      <button id="clock-speed" class="ghost clock-speed" type="button" aria-haspopup="true" aria-expanded="false" title="点击打开「倍速 + 跳到…」菜单（当前 ×1 = 实时：1 实时秒 = 1 游戏秒；×60 = 1 实时秒 = 1 游戏分钟；×300 = 1 实时秒 = 5 游戏分钟）；Shift+点击 = 顺序切到下一档">▶ ×1 实时</button>
+      <div id="clock-menu" class="clock-menu hidden" role="menu" aria-label="游戏时间倍速与跳转"></div>
+      <span id="clock-time" class="clock-time">00:00</span>
+      <!-- 时钟只显示时间：#clock-day 只是给 transit.js 的 renderClock 留的落点（它直接写 textContent，节点不存在会抛错），永远隐藏 -->
+      <span id="clock-day" class="clock-day hidden" aria-hidden="true">第 1 天</span>
+    </div>
+    <!-- 「🚈 交通公司」与「🔍 搜索」两个按钮已经搬进左栏的「🧰 编辑工具」列表里（#tool-list，
+         与编辑工具同一套小图标按钮；id 一个都没改，#btn-transit / #btn-search 照旧可点）。 -->
+    <button id="btn-history" class="ghost">历史</button>
+    <button id="btn-server-info" class="ghost" title="数据集、在线玩家、路网、人口与游戏时钟的集中资讯窗口">📊 服务器资讯</button>
+    <button id="btn-logout" class="ghost hidden">退出</button>
+  </div>
+</header>
+
+<!-- 左侧：一列（宽 = --rail-w = 130px），自上而下**只有两块、各自独立** ——
+       编辑工具（#toolbox）→ 图层与显示模式（#layers，**紧贴在编辑工具下面**）。
+     **两块 = 两个独立面板**（各自都是 .tb-panel.rc-panel）：各有自己的标题栏（标题 + 折叠按钮）、
+     自己的内部滚动层（.panel-body）和自己的底边高度拖柄（.panel-grip，接线在 ui.js 的 initPanelResize）——
+     谁都不许滚到对方那边去：#toolbar 自己**不再**是"两块共用一条滚动条"的滚动容器
+     （那条耦合见 app.css 第 7 节），只有两块加起来真的超过整列可用高度（--rail-h）时它才兜底滚动。
+     高度：两块都只有内容那么高（height: auto + 各自的上限 --toolbox-max-h / --layers-max-h，
+     上限**跟视口走**，不再是 48vh/42vh 那种"人为限制"），超出上限就在**块内部**滚动；
+     按住底边拖动改高度（拖出来的高度绝不缩回）、双击拖柄恢复"内容多高就多高"，
+     记忆写在 localStorage 的 osmcity.panel.h.toolbox / osmcity.panel.h.layers。
+     宽度 130px 是**三个工具按钮那么宽**（--rail-w），也是给下面图层 / 显示模式那张表定的：
+     图层行（勾选框 + 色块 + 名称）与显示模式行（勾选框 + 色块 + 名称 + 右侧状态）都要在 130px 里
+     一行放得下，不横滚、不切字；编辑工具本身**是小图标按钮**（3 列网格、每个 36×36、图标 15px）——
+     它不占大格：工具名与用法只写在 title / aria-label 上（.lbl 由 CSS 隐藏），见 app.css 第 7 节。
+     整列的上限停在左下「协作频道」上面（宽 ≤1200px 时协作频道隐藏，左栏可以用满高度），
+     左栏从上到下也就仍是一整条深色竖条（tools/check-screenshot.js 的像素判据要求）。 -->
+<aside id="toolbar">
+  <section id="toolbox" class="tb-panel rc-panel">
+    <div class="panel-head">
+      <span class="panel-title" title="编辑工具">🧰 编辑工具</span>
+      <button id="toolbox-collapse" class="mini panel-toggle" aria-expanded="true" title="折叠 / 展开编辑工具面板（折叠状态会记住）">▾ 折叠</button>
+    </div>
+    <!-- 面板自己的滚动层（同 #inspector / #toolopts / #layers）：这一块的内容多了只滚这一层，
+         不会再有一条滚动条横跨「编辑工具」与「图层与显示模式」两块 -->
+    <div class="panel-body">
+    <!-- 编辑工具 = 一排**小的图标按钮**（.tool-list：3 列 × 36px；名字只写在 title 上）。
+         #btn-transit / #btn-search 是**从顶栏搬进来的两个入口**：与编辑工具同一张网格、同一种小图标风格，
+         id 一个都没改（tests/browser-boot-e2e.js / ui.js 的 bind() 照旧按 id 接线）。
+         它们是**静态节点**：renderTools() 会先把这两枚摘下来、重排完工具按钮再放回列表末尾 ——
+         直接 box.innerHTML = '' 会把它们一起清掉（那样 #btn-transit / #btn-search 就没了）。 -->
+    <div id="tool-list" class="tool-list">
+      <button id="btn-transit" class="tool tool-entry" type="button"
+        title="🚈 交通公司 · 打开 / 关闭交通公司窗口（浮动窗口，与右栏的「属性检查器」「工具选项」并存；按住标题栏可拖动）"><span class="ico">🚈</span><span class="lbl">交通公司</span></button>
+      <button id="btn-search" class="tool tool-entry" type="button"
+        title="🔍 搜索 · 按名称（如「天安门」）或 key=value（如 amenity=restaurant）搜索要素；Ctrl+F 也能打开，Esc 关闭"><span class="ico">🔍</span><span class="lbl">搜索</span></button>
+    </div>
+    <!-- 撤销 / 重做 / 取消选择 属于「编辑工具」本身：紧贴在工具按钮下面
+         （#status-undo 仍是同一个节点，文字由 ui.js 的 updateStatus 刷新）。
+         #btn-clear-select = 「✕ 取消选择」：只有选中了东西（点选单个元素，或框选出一批）才可点，
+         点它同时清掉点选与框选结果并收起属性检查器（ui.js 的 clearSelection → Editor.deselect）。 -->
+    <div class="to-actions" role="group" aria-label="撤销、重做与取消选择">
+      <span id="status-undo" class="to-depth status-item">可撤销 0 步 · 可重做 0 步</span>
+      <button id="btn-undo" class="mini" title="撤销上一步（Ctrl+Z）">↩ 撤销</button>
+      <button id="btn-redo" class="mini" title="重做（Ctrl+Y）">↪ 重做</button>
+      <button id="btn-clear-select" class="mini clear-select" type="button" disabled aria-disabled="true"
+        title="取消选择：先在地图上点选或框选元素，这个按钮才会亮起来">✕ 取消选择</button>
+    </div>
+    </div>
+    <!-- 高度拖柄（同 #inspector / #toolopts / #layers）：按住上下拖动改高度，双击恢复「内容多高就多高」 -->
+    <div class="panel-grip" data-grip="toolbox" role="separator" aria-orientation="horizontal" tabindex="0"
+      title="按住上下拖动：调整「编辑工具」的高度；双击恢复「内容多高就多高」（高度记在浏览器里）"></div>
+  </section>
+
+  <!-- 图层与显示模式：**紧贴在「编辑工具」下面**（左栏只有这两块）。
+       内部顺序（用户指定）：图层 → 显示模式。
+       id 一个都没改（#layers / #layer-list / #display-mode-group / #mode-legend / #mode-settings /
+       #layer-legend / #pop-toggle / #layers-collapse），tests/browser-osm-e2e.js 点
+       #layer-list input[data-cat=...] 与 #pop-toggle 照旧有效。
+       排版（见 app.css 第 21 节）：
+         · 图层 = 一张紧凑表，每行只有 勾选框 + 色块 + 名称（**不再显示要素计数**）；
+         · 显示模式 = **层级式 checkbox**（顶层 5 行与图层行同一样式；勾了轨交 / 公交，下面缩进出现子 checkbox）。
+       两者都按左栏 130px（--rail-w = 三个工具按钮那么宽）排，不会横向滚动、也不会切字。 -->
+  <section id="layers" class="tb-panel rc-panel">
+    <div class="panel-head">
+      <span class="panel-title">图层与显示模式</span>
+      <button id="layers-collapse" class="mini panel-toggle" aria-expanded="true" title="折叠 / 展开图层面板（折叠状态会记住）">▾ 折叠</button>
+    </div>
+    <div class="panel-body">
+      <!-- 图层：**所有显示开关都在这一张表里** —— 要素分类（道路 / 铁路 / 步道…由 ui.js 渲染到 #layer-cats）
+           与人口密度 / 活跃度 / 车站覆盖范围都是同一种普通勾选框：不分组、不换行样式。
+           每行只有 勾选框 + 色块 + 名称：**要素计数已经删掉**（"为什么要知道有多少道路 / 建筑 / 水系？"），
+           渲染时也不再为了显示数字去统计或请求任何东西。 -->
+      <div class="panel-title mini-title">图层</div>
+      <div id="layer-list" class="layer-list">
+        <!-- 要素分类勾选（道路 / 铁路 / 步道与小径 / 建筑…）由 ui.js 渲染到这一格 -->
+        <div id="layer-cats" class="layer-cats"></div>
+
+        <!-- 叠加图层：和上面的分类勾选框同一张表、同一种行样式 -->
+        <label class="layer-item" title="人口密度图层：按服务器的人口网格（250 米一格）着色，颜色越红人越多">
+          <input type="checkbox" id="pop-toggle">
+          <span class="sw cat-pop"></span>
+          <span class="lname">人口密度</span>
+        </label>
+        <label class="layer-item" title="活跃度图层：按每格的繁华度系数着色（1.0 为基准，商业/枢纽更高、绿地更低）；需要服务器的人口接口返回 activity 字段">
+          <input type="checkbox" id="activity-toggle">
+          <span class="sw cat-activity"></span>
+          <span class="lname">活跃度（繁华度）</span>
+        </label>
+        <!-- 单开关图层：车站覆盖范围（不再依赖每个车站自己的勾选） -->
+        <label class="layer-item" title="一个开关控制所有车站的覆盖范围：每座车站画一个半透明圆盘，半径 = 该站的吸引半径">
+          <input type="checkbox" id="catchment-toggle">
+          <span class="sw cat-catchment"></span>
+          <span class="lname">车站覆盖范围</span>
+        </label>
+        <label class="layer-item sub-item" title="只画那些在车站表单里勾了「在地图上显示覆盖范围」的车站；关掉则所有车站都画">
+          <input type="checkbox" id="catchment-only-flagged">
+          <span class="lname">↳ 只画车站自己勾选过的</span>
+        </label>
+      </div>
+
+      <!-- 显示模式（互斥）：普通 / 轨交模式 / 公交模式 / 道路车速 / 拥堵模式 —— **层级式 checkbox**，
+           与上面「图层」那张表同一种行样式（勾选框 + 色块 + 名称 + 右侧状态）。
+           勾了「轨交模式」或「公交模式」，它下面会**缩进出现子 checkbox**（都由 ui.js 渲染进 #display-mode-group）：
+             分色方式（按线路色 / 按公交公司 / 按票价，单选，取 Render.transitColorSchemeDefs()）
+             线路类别（高铁/城际/地铁/普速/轻轨/有轨电车，多选，写进 osmcity.modeFilter.rail/bus）
+           子项下面只有**一行简单图例**（几个色块 + 名称，或一条色带），不再有解释文字 / 统计块。 -->
+      <div class="panel-title mini-title">显示模式</div>
+      <div id="display-mode-group" class="mode-group"></div>
+      <!-- 轨交 / 公交模式下「只显示指定线路」（我的线路多选，写进 osmcity.modeFilter.<模式>.lines）：
+           只在轨交 / 公交模式下渲染，其它模式下这一格是空的（:empty → 收起）。 -->
+      <div id="mode-settings" class="mode-settings"></div>
+      <!-- 拥堵模式的图例：色带 + 刻度 + 一行中文摘要（由 ui.js 渲染；别的模式下是空的，不占地方） -->
+      <div id="mode-legend" class="mode-legend"></div>
+      <div id="layer-legend" class="layer-legend"></div>
+    </div>
+    <!-- 高度拖柄（同 #inspector / #toolopts） -->
+    <div class="panel-grip" data-grip="layers" role="separator" aria-orientation="horizontal" tabindex="0"
+      title="按住上下拖动：调整「图层与显示模式」的高度；双击恢复「内容多高就多高」（高度记在浏览器里）"></div>
+  </section>
+</aside>
+
+<!-- 图层与显示模式（#layers）留在左栏，紧贴在「编辑工具」下面；它的 id 一个都没改：
+     tests/browser-osm-e2e.js 用到的 #layers / #layer-list / #display-mode-group / #mode-legend /
+     #mode-settings / #layer-legend / #pop-toggle 全都还在。
+     「工具选项」（#toolopts / #tool-options / #inspector-create）在下面的右栏里（用户指定的顺序）。 -->
+
+<!-- 右侧栏：一条窄栏（--rightcol-w = 316px），自上而下两块（**用户指定的顺序**）：
+       #inspector（属性检查器）→ #toolopts（工具选项，含 #inspector-create + #tool-options）。
+     每块**只有内容那么高**（不拉伸、不占满整列），超出上限时在块**内部**滚动；
+     底边各有一条拖柄（.panel-grip，按住拖改高度、双击恢复自适应，高度记在 localStorage，
+     接线在 ui.js 的 initPanelResize）。
+     **交通公司面板打开时这条右栏照旧显示**（用户明确要求）：交通面板是浮动窗口（默认停在右栏左边，
+     按住标题栏可拖动），与 #inspector / #toolopts 并存 —— 见 ui.js 的 initRightRail。 -->
+<div id="rightcol">
+<aside id="inspector" class="rc-panel">
+  <div class="panel-head">
+    <span class="panel-title">属性检查器</span>
+    <button id="inspector-collapse" class="mini panel-toggle" aria-expanded="true" title="折叠 / 展开属性检查器（状态会记住）">▾ 折叠</button>
+  </div>
+  <!-- 面板本体 overflow: hidden，滚动条只长在这一层：内容多了滚 .panel-body，
+       底部留出 6px 给下面的拖柄，最后一行的勾选框不会被抓手压住 -->
+  <div class="panel-body">
+  <div id="inspector-empty" class="empty-hint">
+    <span class="help-row"><span class="help-row-label">点击地图上的道路、建筑或 POI 查看和修改标签</span><span class="help-host"><button class="mini opt-help" type="button" aria-label="新建要素说明" data-help="要新建要素？先选好左侧「编辑工具」里的工具 —— 它的全部设置都在右栏下面那块「工具选项」面板里（与「属性检查器」同在右栏）。画完之后选中它，属性仍然在这里改。">?</button></span></span>
+  </div>
+  <div id="inspector-body" class="hidden">
+    <!-- 标题：几何类型 + 元素 id + 名字 + 版本/最后编辑者 -->
+    <div class="insp-head">
+      <span id="insp-element-title" class="insp-title"></span>
+      <span id="insp-element-meta" class="insp-meta"></span>
+    </div>
+    <!-- 类型：一个元素只有这一张类型表（点一下即生效，再点同一个芯片就换回原来的类型） -->
+    <div class="insp-section-title" data-sec="type">类型</div>
+    <div id="insp-presets" class="insp-presets"></div>
+    <!-- 几何：只放几何本身（节点数 / 长度 / 面积 / 坐标） -->
+    <div class="insp-section-title" data-sec="geometry">几何</div>
+    <div id="insp-geometry" class="insp-geometry"></div>
+    <!-- 属性：这个元素自己的数值设置（建筑的楼层与由楼层推算的人口、道路的限速） -->
+    <div class="insp-section-title" data-sec="fields">属性</div>
+    <div id="insp-fields" class="insp-fields"></div>
+    <!-- 标签：原始 OSM 标签表 -->
+    <div class="insp-section-title" data-sec="tags">OSM 标签 <button id="insp-add-tag" class="mini">＋ 添加</button></div>
+    <div id="insp-tags" class="insp-tags"></div>
+    <!-- 操作：作用在这个元素上的动作 -->
+    <div class="insp-section-title" data-sec="actions">操作</div>
+    <div id="insp-actions" class="insp-actions"></div>
+    <div id="insp-relations" class="insp-relations"></div>
+    <div class="insp-section-title" data-sec="history">该元素的改动历史</div>
+    <div id="insp-history" class="insp-history"></div>
+  </div>
+  </div>
+  <!-- 高度拖柄：整条底边都能抓，视觉上只有中间一小段握把（ui.js 的 initPanelResize） -->
+  <div class="panel-grip" data-grip="inspector" role="separator" aria-orientation="horizontal" tabindex="0"
+    title="按住上下拖动：调整「属性检查器」的高度；双击恢复「内容多高就多高」（高度记在浏览器里）"></div>
+</aside>
+
+<!-- 工具选项：右栏第二块，**紧贴在「属性检查器」下面**（用户指定的顺序：属性检查器 → 工具选项）。
+     「画之前」的全部设置（名字 / 区域类型 / 楼层 / 设站模式 / 类型表 / 将写入标签）都在创作面板里；
+     属性检查器只留给选中的元素。这一块**留在右栏**，不要再搬回左边。 -->
+<section id="toolopts" class="tb-panel rc-panel">
+  <div class="panel-head">
+    <span class="panel-title">工具选项</span>
+    <span id="toolopts-tool" class="to-tool">🔍 选择</span>
+    <button id="toolopts-help" class="mini opt-help" title="当前这个工具怎么用">?</button>
+    <button id="toolopts-collapse" class="mini panel-toggle" aria-expanded="true" title="折叠 / 展开工具选项面板（折叠状态会记住）">▾ 折叠</button>
+  </div>
+  <!-- 面板的滚动层（同 #inspector：内容多了滚这一层，底边留出拖柄的位置） -->
+  <div class="panel-body">
+  <!--
+    创作面板（「画之前」的全部设置：名字 / 区域类型 / 楼层 / 设站模式 / 类型表 / 将写入标签）
+    统一住在这里 —— 属性检查器只留给选中的元素。
+    id 仍是 inspector-create：tests/browser-osm-e2e.js 用 `#inspector-create .preset-chip` 与
+    `#inspector-create .will-write` 断言"画之前就能选类型"，改名会让那两个断言失去落点。
+  -->
+  <div id="inspector-create" class="create-panel hidden"></div>
+  <div id="tool-options" class="tool-options"></div>
+  </div>
+  <!-- 高度拖柄（同 #inspector）：按住上下拖动改高度，双击恢复「内容多高就多高」 -->
+  <div class="panel-grip" data-grip="toolopts" role="separator" aria-orientation="horizontal" tabindex="0"
+    title="按住上下拖动：调整「工具选项」的高度；双击恢复「内容多高就多高」（高度记在浏览器里）"></div>
+</section>
+
+<!-- 右栏两块面板的 id 一个都没改：
+     tests/browser-osm-e2e.js 用到的 #toolopts / #tool-options / #inspector-create /
+     #inspector-body / #insp-tags / #insp-add-tag 与 #layers 那一组全都还在。 -->
+</div>
+
+<!-- 右侧：交通公司面板（默认隐藏的**浮动窗口**，与右栏的 #inspector / #toolopts **并存**（打开它不会隐藏 / 关闭右栏，
+      它默认停在右栏左边：CSS 的 right = 右栏宽 + 20px）；可放大成大窗口；
+     按住标题栏能拖到别处，位置记在 localStorage 的 osmcity.panel.transitPos，双击标题栏复位 —— 见 ui.js 的 initTransitDrag。
+     尺寸也能改：右边缘拖宽、下边缘拖高、右下角同时改，记在 osmcity.panel.transitSize（ui.js 的 initTransitSize） -->
+<aside id="transit" class="hidden">
+  <div class="tp-head panel-head">
+    <span class="panel-title">交通公司</span>
+    <!-- 「🛠 管理器」(#line-mgr) 按钮已彻底删除：交通面板每个分区本身就是管理器。
+         独立的线路管理器窗口仍可由代码打开：window.G.LineMgr.open() / UI.openLineMgr()（没有按钮入口了）。 -->
+    <button id="transit-size" class="mini" title="放大 / 缩小面板">⤢ 放大</button>
+    <button id="transit-collapse" class="mini panel-toggle" aria-expanded="true" title="折叠 / 展开交通公司面板（状态会记住）">▾ 折叠</button>
+    <button id="transit-close" class="mini">关闭</button>
+  </div>
+  <div id="transit-tabs" class="tp-tabs"></div>
+  <div id="transit-body" class="tp-body"><div class="empty-hint small">正在载入交通数据…</div></div>
+</aside>
+
+<!-- 左下：聊天（可折叠） -->
+<section id="chat">
+  <div class="chat-head panel-head">
+    <span class="panel-title">💬 协作频道</span>
+    <button id="chat-collapse" class="mini panel-toggle" aria-expanded="true" title="折叠 / 展开协作频道（折叠状态会记住）">▾ 折叠</button>
+  </div>
+  <div id="chat-log" class="chat-log"></div>
+  <form id="chat-form">
+    <input id="chat-input" maxlength="200" placeholder="说点什么…（Enter 发送）" autocomplete="off">
+    <button type="submit">发送</button>
+  </form>
+</section>
+
+<!-- 右下：在线协作者 + 元素锁（可折叠，和左侧/聊天面板同一套机制） -->
+<section id="collab">
+  <div class="panel-head collab-head">
+    <span class="panel-title">👥 在线协作者 <span id="collab-count" class="count">0</span></span>
+    <button id="collab-collapse" class="mini panel-toggle" aria-expanded="true" title="折叠 / 展开在线协作者面板（折叠状态会记住）">▾ 折叠</button>
+  </div>
+  <ul id="player-list" class="player-list"></ul>
+  <div class="panel-title">元素锁</div>
+  <ul id="lock-list" class="lock-list"></ul>
+</section>
+
+<!-- 底部状态条：视野、选中与提示（撤销/重做属于「编辑工具」，在左侧工具条底部）。
+     提示只有这一格：不再有浮在地图上的独立提示框 —— #status-hint（状态话）与 #hint（util.hint 的落点）
+     都住在这条状态条的最右边，右对齐、单行、超出省略号 -->
+<footer id="statusbar">
+  <span id="status-coords" class="status-item">—</span>
+  <span id="status-zoom" class="status-item">z16</span>
+  <span id="status-counts" class="status-item">—</span>
+  <span id="status-select" class="status-item">未选中任何元素</span>
+  <span class="spacer"></span>
+  <span id="status-hint" class="status-item hint-text"></span>
+  <span id="hint" class="status-item hint-text"></span>
+</footer>
+
+<!-- 浮层：错误条与轻提示（提示文字已经并进状态条，这里没有浮框） -->
+<div id="client-errors" class="hidden"></div>
+<div id="toasts"></div>
+
+<!-- 搜索面板（默认隐藏） -->
+<div id="search-panel" class="floating hidden">
+  <input id="search-input" placeholder="搜索名称（如 天安门）、或 key=value（如 amenity=restaurant）" autocomplete="off">
+  <div id="search-help" class="search-help">回车搜索 · 支持 <code>名称</code> / <code>key=value</code> / <code>key</code> · Esc 关闭</div>
+  <ul id="search-results" class="search-results"></ul>
+</div>
+
+<!-- 导出面板（默认隐藏）：顶栏的「导出」按钮已下线，面板本身保留 ——
+     tests/browser-osm-e2e.js 会用 G.UI.openExport() + `#export-options a.export-btn` + `#export-close` 断言导出入口 -->
+<div id="export-modal" class="modal hidden">
+  <div class="modal-card">
+    <h1>导出为 OSM 文件 <span class="help-host"><button class="mini opt-help" type="button" aria-label="导出说明" data-help="导出得到标准 .osm / .osmChange XML 文件，可以导入 JOSM / iD 等编辑器查看。<br>数据来自服务器本地数据集，<b>不会</b>写入 OpenStreetMap 官方数据库。">?</button></span></h1>
+    <p class="sub">导出服务器本地数据集（当前视野 / 全量）。</p>
+    <div id="export-options" class="export-options"></div>
+    <button id="export-close" class="ghost">关闭</button>
+  </div>
+</div>
+
+<!-- 历史面板（默认隐藏） -->
+<div id="history-modal" class="modal hidden">
+  <div class="modal-card wide">
+    <h1>编辑历史 <span class="help-host"><button class="mini opt-help" type="button" aria-label="编辑历史说明" data-help="每次编辑会话（一个变更集）都留档：可以查看改动内容、导出 osmChange，也可以整批回滚。<br>回滚会记成一条新的变更集，同样可以再被回滚。">?</button></span></h1>
+    <p class="sub">每次编辑会话（变更集）都会留档。</p>
+    <div id="history-list" class="history-list"></div>
+    <button id="history-close" class="ghost">关闭</button>
+  </div>
+</div>
+
+<!-- 服务器资讯（默认隐藏）：数据集 / 在线 / 路网 / 人口 / 时钟 集中一处 -->
+<div id="server-info" class="modal hidden">
+  <div class="modal-card wide">
+    <h1>📊 服务器资讯 <span class="help-host"><button class="mini opt-help" type="button" aria-label="服务器资讯说明" data-help="数据来自 /api/health、/api/meta、/api/transit、/api/history，服务器不需要额外改动。<br>没有的字段写「—」，取不到的接口会在下面「读取提示」里写明原因。">?</button></span></h1>
+    <p class="sub">数据集、在线玩家、路网、人口与游戏时钟，集中在这一处。</p>
+    <div id="server-info-body" class="srv-body"><div class="empty-hint small">正在读取服务器资讯…</div></div>
+    <div class="srv-actions">
+      <button id="server-info-refresh" class="mini" title="重新向服务器取一次资讯">↻ 刷新</button>
+      <button id="server-info-close" class="ghost">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 帮助面板已下线：顶栏不再有「帮助」按钮，也就没有入口去打开它。#help 只是给 tools/check-dom.js 的关键节点自检留的空节点。 -->
+<div id="help" class="modal hidden" aria-hidden="true"></div>
+
+<!-- 登录弹窗（默认显示）：上任即接管这份真实数据集 -->
+<div id="login" class="modal">
+  <div class="modal-card">
+    <h1><span class="logo">🏛️</span> 我是市委书记 <span class="help-host"><button class="mini opt-help" type="button" aria-label="账号说明" data-help="账号只用于区分是哪位市委书记（批示会记进编辑历史），与 OpenStreetMap 账号无关；昵称最多 16 字，密码至少 4 位。">?</button></span></h1>
+    <p class="sub">上任即接管服务器上的真实北京数据集（多人联机）</p>
+    <div class="tabs">
+      <button data-tab="login" class="active">登录</button>
+      <button data-tab="register">注册新账号</button>
+    </div>
+    <form id="login-form">
+      <input id="login-name" maxlength="16" placeholder="昵称（中英文/数字，最多 16 字）" autocomplete="username">
+      <input id="login-pass" type="password" placeholder="密码（至少 4 位）" autocomplete="current-password">
+      <div id="login-error" class="error"></div>
+      <button id="login-submit" type="submit" class="primary">登录</button>
+    </form>
+    <button id="btn-guest" class="ghost wide">🚀 以游客身份先上任</button>
+    <!-- 游客登录开关（服务器 config.json 的 allowGuests，默认 false）：
+         ui.js 的 applyGuestPolicy() 按 /api/meta 的 allowGuests 决定藏哪个 ——
+         允许时藏掉这行提示、露出上面那个按钮；关闭时反过来。
+         节点**始终留在 DOM 里**（按钮也留着），只加 .hidden：静态自检 tools/check-dom.js
+         与 tests/browser-boot-e2e.js 都认这几个 id。 -->
+    <p id="guest-hint" class="tip hidden">本服务器已关闭游客登录，请注册账号或使用已有账号登录。</p>
+  </div>
+</div>
+
+<!-- 启动进度（B 方案：服务器端口先开、静态页面先出，路网/人口/线路路径切片初始化）。
+     默认就是 .hidden 的，**不是**一直转圈的空白页：main.js 的 showBootProgress() 会去掉 .hidden、
+     填上「正在初始化路网…（阶段 N%）」并给进度条设宽度；等免鉴权的 GET /api/ready 报 ready，
+     hideBootProgress() 再把 .hidden 加回来（节点留着不删，静态自检 tools/check-dom.js 才认得到这几个 id）。
+     底子是 .boot-error 那层全屏底色（z-index 90，压得住登录弹窗），细节样式见 app.css 第 17.2 节。 -->
+<div id="boot-progress" class="boot-error hidden" role="status" aria-live="polite">
+  <div class="boot-progress-card">
+    <div id="boot-progress-text">正在初始化路网…</div>
+    <div class="boot-progress-track"><div id="boot-progress-bar"></div></div>
+    <div id="boot-progress-detail" class="muted">端口已开，路网 / 人口 / 线路路径正在切片初始化，请稍候…</div>
+  </div>
+</div>
+
+<script src="/vendor/leaflet/leaflet.js"></script>
+<script src="/js/util.js"></script>
+<script src="/js/style.js"></script>
+<script src="/js/presets.js"></script>
+<script src="/js/net.js"></script>
+<script src="/js/world.js"></script>
+<script src="/js/mapdata.js"></script>
+<script src="/js/render.js"></script>
+<script src="/js/editor.js"></script>
+<script src="/js/transit.js"></script>
+<script src="/js/linemgr.js"></script>
+<script src="/js/inspector.js"></script>
+<script src="/js/ui.js"></script>
+<script src="/js/main.js"></script>
+</body>
+</html>

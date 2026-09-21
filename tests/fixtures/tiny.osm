@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="handmade-fixture">
+  <bounds minlat="39.8900" minlon="116.3900" maxlat="39.9200" maxlon="116.4200"/>
+  <node id="1" lat="39.9000000" lon="116.4000000" version="2" timestamp="2020-01-02T03:04:05Z" user="alice" uid="11">
+    <tag k="name" v="天安门东"/>
+    <tag k="highway" v="bus_stop"/>
+  </node>
+  <node id="2" lat="39.9010000" lon="116.4010000" version="1"/>
+  <node id="3" lat="39.9020000" lon="116.4020000" version="1"/>
+  <node id="4" lat="39.9030000" lon="116.4030000" version="1"/>
+  <node id="5" lat="39.9100000" lon="116.4100000" version="3"/>
+  <node id="6" lat="39.9100000" lon="116.4110000" version="3"/>
+  <node id="7" lat="39.9105000" lon="116.4110000" version="3"/>
+  <node id="8" lat="39.9105000" lon="116.4100000" version="3"/>
+  <node id="9" lat="39.9500000" lon="116.4500000" version="1" visible="false"/>
+  <way id="100" version="4" timestamp="2021-05-06T07:08:09Z" user="bob" uid="22">
+    <nd ref="1"/>
+    <nd ref="2"/>
+    <nd ref="3"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="测试路"/>
+    <tag k="lanes" v="2"/>
+  </way>
+  <way id="200" version="1">
+    <nd ref="5"/>
+    <nd ref="6"/>
+    <nd ref="7"/>
+    <nd ref="8"/>
+    <nd ref="5"/>
+    <tag k="building" v="yes"/>
+    <tag k="building:levels" v="6"/>
+  </way>
+  <way id="300" version="1" visible="false">
+    <nd ref="4"/>
+    <nd ref="4"/>
+    <tag k="highway" v="service"/>
+  </way>
+  <relation id="400" version="2">
+    <member type="way" ref="200" role="outer"/>
+    <tag k="type" v="multipolygon"/>
+    <tag k="building" v="yes"/>
+  </relation>
+</osm>

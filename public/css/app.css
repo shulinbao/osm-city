@@ -1,0 +1,3412 @@
+@charset "utf-8";
+/* ==========================================================================
+   OSM 城市在线 · 多人在线 OSM 编辑器 — 界面样式
+   深色专业工具风：半透明面板浮在整屏矢量地图之上，紧凑、高信息密度。
+   层级约定：#map 0 · 面板 20~40 · 搜索浮层 45 · 模态框 60 · 提示 70~80
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   1. 设计令牌
+   -------------------------------------------------------------------------- */
+:root {
+  /* 底色 */
+  --bg: #0d1015;
+  --bg-2: #12161d;
+  --panel: rgba(18, 22, 29, .84);
+  --panel-solid: #161b23;
+  --panel-2: rgba(255, 255, 255, .045);
+  --panel-hover: rgba(255, 255, 255, .085);
+  --overlay: rgba(4, 6, 10, .66);
+
+  /* 线条 */
+  --line: rgba(255, 255, 255, .10);
+  --line-2: rgba(255, 255, 255, .18);
+  --line-3: rgba(255, 255, 255, .06);
+
+  /* 文字 */
+  --fg: #e7ebf3;
+  --fg-dim: #9fadc2;
+  --fg-mute: #6d7a8c;
+
+  /* 强调与状态 */
+  --accent: #4c9aff;
+  --accent-2: #7cb4ff;
+  --accent-soft: rgba(76, 154, 255, .16);
+  --accent-line: rgba(76, 154, 255, .55);
+  --ok: #3ecf8e;
+  --ok-soft: rgba(62, 207, 142, .14);
+  --warn: #f0b429;
+  --warn-soft: rgba(240, 180, 41, .14);
+  --err: #f2555a;
+  --err-soft: rgba(242, 85, 90, .14);
+  --info: #58c4dd;
+
+  /* 尺寸 */
+  --radius: 11px;
+  --radius-sm: 7px;
+  --radius-xs: 5px;
+  --topbar-h: 44px;
+  --statusbar-h: 26px;
+  --gap: 10px;
+  /* 左栏里那排编辑工具按钮的尺寸（--rail-w 就是按它们算出来的）：按钮 36×36、格间 4px、
+     列表内边距 6px（.tool-list 的 padding，与 #toolbox .tool-list 那条保持一致）。 */
+  --tool-btn: 36px;
+  --tool-gap: 4px;
+  --tool-pad: 6px;
+  /* 左侧那一列的宽度 = **三个工具按钮那么宽**（用户的要求：「三个编辑工具按钮的宽度就够了」）：
+       3 × 36px 按钮 + 2 × 4px 间隙 + 2 × 6px 内边距 + 2 × 1px 面板边框 = 130px。
+     工具网格是 repeat(3, minmax(0, 1fr))，按钮 width: min(100%, --tool-btn) —— 正好每格 36px；
+     工具名与用法只写在 title / aria-label 上（.lbl 隐藏），所以按钮不需要"图标 + 中文名"的大格。
+     下面「图层 / 显示模式」两棵树是按这个 128px 的内容宽排的（见第 21 节）：
+     行里只留 勾选框 + 色块 + 名称（显示模式行右侧还有一格状态），中文名**允许折到第二行**，
+     不横滚、不切字。（历史上这里先后是 236px 与 84px 两版，130px 是"三个按钮"这一版。） */
+  --rail-w: calc(var(--tool-btn) * 3 + var(--tool-gap) * 2 + var(--tool-pad) * 2 + 2px);
+  /* 右栏（属性检查器 → 工具选项）的宽度 */
+  --rightcol-w: 316px;
+  /* 各块面板的默认高度上限（都是"内容多高就多高"，只有超过上限才在面板内部滚动；
+     用户拖过拖柄之后改由内联 height 说话 —— ui.js 的 liftPanelHeightCap() 会同时写 max-height: none，
+     真正的高度上限交给 panelHeightCap()（视口 86%）在 JS 里钳制）。
+     右栏：#inspector 属性检查器 / #toolopts 工具选项；左栏：#toolbox 编辑工具 / #layers 图层与显示模式
+     （左栏两块**各自独立**、各有一条自己的底边拖柄，见第 7 / 8 节）。 */
+  --inspector-max-h: 48vh;
+  --toolopts-max-h: 42vh;
+  /* 左栏那一列（#toolbar）的可用高度：顶栏 54px 之下、**正好停在左下「协作频道」上面**
+     （#chat 顶边 = 100vh - 206px），既不盖住聊天框，也保证左栏从上到下是一整条深色竖条。
+     宽 ≤1200px 时协作频道整块隐藏，左栏于是可以用满高度 —— 见第 19 节的媒体查询（那里覆盖 --rail-h）。 */
+  --rail-h: calc(100vh - 260px);
+  /* 左栏两块各自的高度上限：**跟视口走**（不再是 48vh / 42vh 那种看着像"人为限死"的百分比）——
+     每一块都允许单独长到差不多整列那么高；两块同时都那么大时，滚的是 #toolbar 自己（兜底）。
+     减掉的 80px = 给另一块留的下限（72px）＋两块之间的缝（8px）。 */
+  --toolbox-max-h: calc(var(--rail-h) - 80px);
+  --layers-max-h: calc(var(--rail-h) - 80px);
+  --shadow: 0 10px 28px rgba(0, 0, 0, .46), 0 1px 0 rgba(255, 255, 255, .04) inset;
+
+  /* 字体 */
+  --font: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* 地图「图纸」底色（矢量底图未覆盖处） */
+  --map-paper: #f3f1ec;
+}
+
+/* --------------------------------------------------------------------------
+   2. 基础重置
+   -------------------------------------------------------------------------- */
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  user-select: none;
+}
+
+h1, h2, h3, h4, p, ul, ol, li { margin: 0; padding: 0; }
+ul, ol { list-style: none; }
+button, input, select, textarea { font-family: inherit; font-size: inherit; color: inherit; }
+a { color: var(--accent-2); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code, kbd, .mono, .tag-key, .insp-meta, .data-info, #statusbar {
+  font-family: var(--mono);
+}
+
+kbd {
+  display: inline-block;
+  min-width: 16px;
+  padding: 0 4px;
+  border: 1px solid var(--line-2);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--panel-2);
+  color: var(--fg);
+  font-size: 11px;
+  line-height: 17px;
+  text-align: center;
+}
+
+code {
+  padding: 1px 4px;
+  border: 1px solid var(--line-3);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, .05);
+  color: #ffd479;
+  font-size: 11.5px;
+}
+
+::selection { background: var(--accent-soft); color: #fff; }
+
+/* 滚动条：深色细条 */
+* { scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, .22) transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .18);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .3); background-clip: padding-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* --------------------------------------------------------------------------
+   3. 地图容器
+   -------------------------------------------------------------------------- */
+#map {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--map-paper);
+}
+
+#map:focus { outline: none; }
+
+/* 工具模式下的光标（JS 通过 body[data-tool] 切换） */
+body[data-tool="pan"] #map { cursor: grab; }
+body[data-tool="pan"] #map:active { cursor: grabbing; }
+body[data-tool="select"] #map { cursor: default; }
+body[data-tool="point"] #map,
+body[data-tool="node"] #map,
+body[data-tool="way"] #map,
+body[data-tool="line"] #map,
+body[data-tool="area"] #map,
+body[data-tool="polygon"] #map,
+body[data-tool="draw"] #map { cursor: crosshair; }
+body[data-tool="delete"] #map,
+body[data-tool="erase"] #map { cursor: not-allowed; }
+body[data-tool="move"] #map { cursor: move; }
+
+/* --------------------------------------------------------------------------
+   4. 顶栏
+   -------------------------------------------------------------------------- */
+#topbar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: var(--topbar-h);
+  padding: 0 10px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(13, 16, 21, .88);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+#topbar .brand {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+#topbar .brand .logo { font-size: 17px; line-height: 1; }
+#topbar .brand .title { font-size: 14px; font-weight: 700; letter-spacing: .3px; }
+
+/* 数据集统计：可横向滚动，过长省略 */
+#data-info,
+.data-info {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
+  font-size: 11.5px;
+  color: var(--fg-dim);
+  padding: 0 2px;
+}
+#data-info::-webkit-scrollbar { height: 0; }
+#data-info > * { flex: 0 0 auto; }
+#data-info .di-item { display: inline-flex; align-items: center; gap: 5px; }
+#data-info b, #data-info strong { color: var(--fg); font-weight: 600; }
+#data-info .dim { color: var(--fg-mute); }
+#data-info .sep { color: var(--line-2); }
+/* 顶栏里那个"去服务器资讯看统计"的小徽标 */
+#data-info .di-badge {
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+#data-info .di-badge:hover { border-color: var(--accent-line); background: var(--accent-soft); color: #fff; }
+
+.top-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+/* 连接状态徽标 */
+.conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.conn::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 7px currentColor;
+}
+.conn.open { color: var(--ok); border-color: rgba(62, 207, 142, .38); background: var(--ok-soft); }
+.conn.connecting { color: var(--warn); border-color: rgba(240, 180, 41, .34); background: var(--warn-soft); }
+.conn.connecting::before { animation: pulse 1.1s ease-in-out infinite; }
+.conn.reconnecting { color: #ff9f43; border-color: rgba(255, 159, 67, .38); background: rgba(255, 159, 67, .14); }
+.conn.reconnecting::before { animation: pulse .7s ease-in-out infinite; }
+.conn.unauthorized,
+.conn.closed { color: var(--err); border-color: rgba(242, 85, 90, .38); background: var(--err-soft); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .35; transform: scale(.72); }
+}
+
+/* --------------------------------------------------------------------------
+   5. 底部状态条
+   -------------------------------------------------------------------------- */
+#statusbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: var(--statusbar-h);
+  padding: 0 10px;
+  border-top: 1px solid var(--line);
+  background: rgba(13, 16, 21, .9);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+#statusbar .status-item { flex: 0 0 auto; }
+#statusbar .status-item:empty { display: none; }
+#statusbar #status-coords { min-width: 150px; color: var(--fg); }
+#statusbar #status-zoom { color: var(--fg-dim); }
+#statusbar #status-counts { color: var(--fg-dim); }
+#statusbar #status-select {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 34vw;
+  color: var(--fg-dim);
+}
+#statusbar .hint-text {
+  color: var(--warn);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40vw;
+}
+/* 提示并进状态条最右边：右对齐、单行、超出省略号，没有背景/边框，也不吃地图上的地方。
+   #status-hint = 状态话（工具怎么用、已改成什么），#hint = util.hint 的落点（同样在这一格里） */
+#statusbar #status-hint,
+#statusbar #hint {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+#statusbar #status-hint { max-width: 46vw; }
+#statusbar #hint { display: none; max-width: 32vw; color: var(--fg-dim); }
+#statusbar #hint.show { display: block; }
+#statusbar #hint b { color: var(--fg); font-weight: 600; }
+#statusbar #status-undo { color: var(--fg-mute); }
+
+/* --------------------------------------------------------------------------
+   6. 面板通用外观
+   -------------------------------------------------------------------------- */
+/* 一块面板自带底色 / 边框 / 圆角。.tb-panel = 左栏的每一块（编辑工具 / 工具选项 / 图层与显示模式）
+   ＋ 交通公司面板的标题栏（以前这套外观挂在 #toolbar 上；面板各自成块之后，每块都得自己带） */
+.tb-panel,
+#inspector,
+#chat,
+#collab,
+#search-panel,
+.modal-card,
+#client-errors,
+#toasts .toast {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: var(--shadow);
+}
+
+/* --------------------------------------------------------------------------
+   6b. 叠在一起的面板：两块之间必须是**干净的缝**（#7）
+   --------------------------------------------------------------------------
+   症状（用户报的"黑色半透明连通"）：左栏「编辑工具 ↔ 图层与显示模式」、
+   右栏「属性检查器 ↔ 工具选项」之间本来是 6px 的地图缝，看起来却像两块被一条半透明的黑带连在一起。
+   成因（两个叠加在一起）：
+     1) 面板底色是**半透明**的（--panel = rgba(18,22,29,.84)）＋ backdrop-filter 模糊，
+        于是"上面那块投射下来的阴影 / 缝里的地图"会**透过下面那块的面板**显出来；
+     2) 投影阴影是 `0 10px 28px rgba(0,0,0,.46)`：向下溢出 38px，正好糊满那条 6px 的缝，
+        再从下一块的半透明底里透出来 —— 缝隙因此变成一条黑带。
+   修法（三件事一起做，任何宽高下都成立）：
+     · 叠放的这两列面板改成**不透明底**（--panel-solid）：阴影不再能透过来；
+     · 阴影收紧成"贴边"的（负 spread 抵消 blur/2 + 下移量 → 溢出 ≈ 2px < 8px 的缝）：
+       外溢量 = 下移(5px) + 模糊半径的一半(7px) − spread(10px) = 2px，落在缝里也只是 2px 的
+       一层淡淡投影（正常立体感），不会再糊成一条黑带；tools/check-screenshot.js 的像素判据
+       （左栏要够暗 / 面板与地图要有对比）不受影响；
+     · 每块都 `overflow: hidden` ＋ 标题栏/底栏圆角跟随面板 —— 子元素不会再盖住圆角（角落瑕疵同源）。
+   #chat / #collab / 弹层这些**没有叠放**的面板照旧用半透明底（浮在地图上更好看）。 */
+#toolbar > .tb-panel,
+#rightcol > .rc-panel {
+  background: var(--panel-solid);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: 0 5px 14px -10px rgba(0, 0, 0, .85), 0 1px 0 rgba(255, 255, 255, .04) inset;
+  overflow: hidden;              /* 圆角不会被内部元素顶破（拖柄/底栏不再画出方角） */
+}
+/* 叠放面板之间的缝：8px（比下面那圈收紧后的阴影溢出还大，缝里就是纯粹的地图）——
+   具体的 gap 写在 #toolbar / #rightcol 各自的规则里（第 7 / 8 节），这里只说明口径。 */
+
+.panel-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px 6px;
+  border-bottom: 1px solid var(--line-3);
+  color: var(--fg-mute);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: linear-gradient(180deg, rgba(18, 22, 29, .96), rgba(18, 22, 29, .82));
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.panel-title .count,
+.count {
+  margin-left: auto;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 15px;
+  letter-spacing: 0;
+}
+
+/* --------------------------------------------------------------------------
+   7. 左侧那一列（编辑工具 → 图层与显示模式）
+   -------------------------------------------------------------------------- */
+/* 左栏自己**不画**底色 / 边框：外观由里面每一块 .tb-panel 承担，块与块之间的缝隙能看见地图。
+   左栏里就是**两块各自独立的面板**（#toolbox / #layers），每块自带标题栏 + .panel-body + .panel-grip
+   （见第 8 节）—— **这一层不再是"两块共用一条滚动条"的滚动容器**：
+   默认情况下 #layers 的 flex-shrink 会把剩下的高度吃掉（多出来的内容滚**它自己**的 .panel-body），
+   用户拖高某一块时让位的是另一块，所以这一层的 overflow-y 只是个兜底 ——
+   正常操作（含 1400×900 / 900×600）永远轮不到它，滚动条只出现在两块**各自**的内部。 */
+#toolbar {
+  position: fixed;
+  top: 54px;
+  left: 10px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  /* 8px 的缝（原来是 6px）：两块面板都是不透明底 + 贴边阴影，缝里只剩地图，
+     视觉上就是"两块各自独立"，不会连成一条半透明黑带（#7） */
+  gap: 8px;
+  width: var(--rail-w);
+  height: auto;
+  max-height: var(--rail-h);
+  overflow-y: auto;          /* 兜底：只有"存档高度赶上窗口变小"这类情况才会滚（见上面） */
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+/* 左栏里的两块**各按各的来**（原来是一条 `#toolbar > * { flex: 0 0 auto }`：
+   两块都不许缩 → 整列一超过上限就变成"一条滚动条横跨两块"，用户报的就是它）。
+   默认（用户没拖过高度）：
+     · #toolbox（编辑工具）**一点都不缩**（flex: 0 0 auto）：工具 / 撤销 / 重做必须一眼看全，
+       半像素都不让（被 flex 压出 0.x px 时，面板内部会冒出一条 1px 的滚动条，看着像"东西被切了"）；
+       工具实在太多时靠它自己的上限（--toolbox-max-h）在 .panel-body 里滚，不抢兄弟的高度。
+     · #layers（图层与显示模式）**把剩下的高度吃掉**（flex: 0 1 auto）：内容多了在**它自己**的
+       .panel-body 里滚，于是整列在默认可视高度里永远是"正好放下"（算术见 :root 的 80px 那条注释）。 */
+#toolbar > #toolbox { flex: 0 0 auto; }
+#toolbar > #layers { flex: 0 1 auto; }
+/* 用户拖过高度（ui.js 的 liftPanelHeightCap 会给那一块加 .panel-sized，并给整列加 .has-sized）：
+   拖大的那一块不吃 flex（flex-shrink: 0，内联 height 说了算），**让位的是另一块** ——
+   缩到 .rc-panel 的 72px 下限为止，于是拖柄永远还在手边、整列也不会溢出。
+   拖柄那边还会把高度夹到"整列刚好放得下"为止（ui.js 的 panelDragMax，用的就是这里的 --rail-h 与 72px），
+   所以正常操作下这一层永远轮不到滚动；这里的 overflow-y 只留给"存档里的高度赶上窗口变小"这类兜底。 */
+#toolbar.has-sized > #toolbox { flex-shrink: 1; }
+#toolbar > #toolbox.panel-sized,
+#toolbar > #layers.panel-sized { flex-shrink: 0; }
+
+/* 编辑工具：**小的图标按钮** —— 3 列网格（= 左栏宽度，用户要求的"三个按钮的宽度"），
+   按钮 36×36、图标 15px，名字与用法只写在 title / aria-label 上（.lbl 隐藏）。
+   130px 的左栏（--rail-w）减去面板左右各 1px 边框、再减去 .tool-list 左右各 6px 内边距 = 116px：
+   3 列 × 4px 间隙后每格正好 36px（列宽写成 minmax(0, 1fr)，任何情况下都不会把整列顶出横向滚动条；
+   按钮 width: min(100%, --tool-btn) 也是这个意思：格子够宽就 36px，万一变窄就跟着格子缩）。
+   这样"工具"只占 4 行（11 个按钮）× 40px ≈ 160px，剩下的高度都留给下面的图层 / 显示模式表。 */
+.tool-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  justify-items: center;
+  gap: var(--tool-gap);
+  padding: var(--tool-pad);
+  min-height: 0;
+  /* 工具列表**自己不再是滚动容器**：编辑工具这块面板有自己的 .panel-body（第 8 节），
+     一个面板只该有一条滚动条（21.5）—— 工具太多时滚的是 .panel-body 那一层 */
+  overflow: visible;
+}
+
+/* 工具按钮：36×36 见方的小图标格子（不是"图标 + 中文名"的大格）。
+   宽高都用 --tool-btn，并用 min(100%, …) 兜住"格子被压窄"的情况（宁可按钮小一点，也不要横滚）。 */
+.tool {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: min(100%, var(--tool-btn));
+  height: auto;
+  aspect-ratio: 1 / 1;
+  min-height: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-size: 10.5px;
+  line-height: 1;
+  text-align: center;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, color .12s ease, transform .08s ease;
+}
+.tool .ico { font-size: 15px; line-height: 1; }
+/* 名字不进按钮（格子只有 36px 见方）：完整名字与用法都在 .tool 的 title / aria-label 上 */
+.tool .lbl {
+  display: none;
+}
+.tool:hover { background: var(--panel-hover); border-color: var(--line-2); color: var(--fg); }
+.tool:active { transform: translateY(1px); }
+.tool.active,
+.tool[aria-pressed="true"] {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: #fff;
+  box-shadow: 0 0 0 1px rgba(76, 154, 255, .22) inset;
+}
+.tool.active .ico { filter: drop-shadow(0 0 6px rgba(76, 154, 255, .6)); }
+.tool[disabled], .tool.disabled { opacity: .4; cursor: not-allowed; }
+/* 从顶栏搬进来的两个入口（交通公司 / 搜索）：与编辑工具同一套小图标外观，
+   只是底色稍深一点，一眼看得出"这不是编辑工具本身"（id 仍是 #btn-transit / #btn-search） */
+.tool-entry { background: rgba(255, 255, 255, .045); }
+
+/* 工具选项 / 预设 */
+.tool-options {
+  padding: 2px 8px 8px;
+  border-top: 1px solid var(--line-3);
+}
+.tool-options:empty { display: none; }
+.tool-options .opt { padding-top: 6px; }
+.tool-options .opt .panel-title {
+  position: static;
+  padding: 4px 2px 5px;
+  border: none;
+  background: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+.tool-options .opt-title,
+.tool-options .opt label {
+  display: block;
+  padding: 5px 2px 4px;
+  color: var(--fg-mute);
+  font-size: 10.5px;
+  letter-spacing: .06em;
+}
+.tool-options .hint,
+.tool-options .opt-hint { color: var(--fg-mute); font-size: 11px; padding: 4px 2px; }
+
+/* 选项小芯片 */
+.chips,
+.tool-options .chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 2px 0 6px;
+}
+.chip,
+.tool-options .chips button {
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease, border-color .12s ease;
+}
+.chip:hover,
+.tool-options .chips button:hover { background: var(--panel-hover); color: var(--fg); }
+.chip.active,
+.tool-options .chips button.active {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: #fff;
+}
+
+/* 图层列表 */
+.layer-list { padding: 6px 6px 8px; }
+
+/* 一行图层 / 显示模式：勾选框 + 色块 + 名称（+ 显示模式行右侧的状态）。
+   **右侧的要素计数已经删掉**（.lcount 不再存在），所以名称吃掉整行剩下的宽度。 */
+.layer-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 5px;
+  border-radius: var(--radius-xs);
+  color: var(--fg-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+.layer-item:hover { background: var(--panel-2); color: var(--fg); }
+/* 勾选框与「分色方式」的单选框长得一样大（显示模式那棵树里子项用 radio 语义） */
+.layer-item input[type="checkbox"],
+.layer-item input[type="radio"] {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.layer-item .sw {
+  flex: 0 0 auto;
+  width: 11px;
+  height: 11px;
+  border: 1px solid rgba(0, 0, 0, .35);
+  border-radius: 3px;
+  background: currentColor;
+}
+.layer-item .lname {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 显示模式行右侧那一格状态（「当前」/「已筛选」；没有状态时是空的，不占宽度） */
+.layer-item .lstate {
+  flex: 0 0 auto;
+  color: var(--fg-mute);
+  font-size: 10px;
+  letter-spacing: .02em;
+}
+.layer-item .lstate:empty { display: none; }
+.layer-item input[type="checkbox"]:not(:checked) ~ .sw,
+.layer-item input[type="radio"]:not(:checked) ~ .sw,
+.layer-item input[type="checkbox"]:not(:checked) ~ .lname,
+.layer-item input[type="radio"]:not(:checked) ~ .lname { opacity: .45; }
+/* 当前生效的显示模式：整行点亮一点（勾选框 + 名称已经说明了状态，这里只是加强） */
+.layer-item.active .lname { color: #fff; }
+
+/* --------------------------------------------------------------------------
+   8. 面板列：左栏两块（编辑工具 → 图层与显示模式）+ 右栏两块（属性检查器 → 工具选项）
+   --------------------------------------------------------------------------
+   **每一块都是独立的卡片**：标题栏 + 自己的滚动层（.panel-body）+ 底边的 .panel-grip。
+   **每块都只有内容那么高**（flex-grow: 0：不拉伸、不占满整列、也不被兄弟撑高），
+   超出各自 max-height 时在**块内部**滚动 —— 滚动条只长在 .panel-body 这一层
+   （所以"一块面板 = 一条滚动条"，不会有滚动条横跨左栏的两块），
+   面板本体 overflow: hidden（圆角不会被内容顶破），底边留 22px 给高度拖柄。
+   拖柄（.panel-grip）的接线在 ui.js 的 initPanelResize：按住上下拖改高度（写死像素高，
+   且 .panel-sized 让它不许被 flex 缩回）、双击恢复"内容多高就多高"、键盘 ↑/↓ 微调，
+   高度记在 localStorage 的 osmcity.panel.h.<名字>（左栏两块 = .toolbox / .layers）。 */
+/* 右栏（= 属性检查器 + 工具选项那一列的容器） */
+#rightcol {
+  position: fixed;
+  top: 54px;
+  right: 10px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  /* 同左栏：8px 的缝 + 不透明面板底，两块之间不会出现"半透明连通"（#7） */
+  gap: 8px;
+  width: var(--rightcol-w);
+  max-height: calc(100vh - 88px);
+  /* 很矮的屏上放不下时整列兜底滚动；正常情况下滚动条只出现在面板内部 */
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  /* 面板之间的缝隙不吃地图上的鼠标事件（拖动地图 / 点要素照旧） */
+  pointer-events: none;
+}
+#rightcol > * { pointer-events: auto; }
+
+/* 带高度拖柄的面板（右栏的 #inspector / #toolopts 与左栏的 #toolbox / #layers） */
+.rc-panel {
+  position: relative;       /* 高度拖柄（.panel-grip）的定位基准 */
+  display: flex;
+  flex-direction: column;
+  /* 关键：只按内容长高，**不跟着整列一起长**（flex-grow = 0）。
+     shrink = 1 + min-height 72px 是给矮屏兜底的：整列放不下时，
+     "谁高谁让步"（各自在内部滚动），而不是把最后一块挤出屏幕外面看不见 */
+  flex: 0 1 auto;
+  min-height: 72px;
+  min-width: 0;
+  overflow: hidden;
+}
+/* 面板里唯一的滚动容器：内容多了滚这里，横向永不滚动 */
+.rc-panel > .panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  padding-bottom: 22px;     /* 给底边的拖柄（14px）留够位置，最后一行不会被抓手压住 */
+}
+/* 折叠后只剩标题栏：宽度自己收，并且贴到右栏的右边（不要横着占满一整条） */
+#rightcol > .panel-collapsed { align-self: flex-end; }
+
+#inspector { max-height: var(--inspector-max-h); }
+
+/* 工具选项：右栏第二块，**紧贴在「属性检查器」下面**（用户指定的顺序：属性检查器 → 工具选项） */
+#rightcol > #toolopts { max-height: var(--toolopts-max-h); }
+
+/* 编辑工具：左栏第一块（面板本体是 .rc-panel —— 有自己的标题栏 / .panel-body / .panel-grip）。
+   上限跟视口走（--toolbox-max-h）：工具再多也只在**它自己**的 .panel-body 里滚，
+   不会把下面的「图层与显示模式」挤出屏幕 */
+#toolbar > #toolbox { max-height: var(--toolbox-max-h); }
+
+/* 图层与显示模式：左栏第二块，**紧贴在「编辑工具」下面**（上限同样跟视口走 —— 见 :root 的注释） */
+#toolbar > #layers { max-height: var(--layers-max-h); }
+
+/* 高度拖柄：整条底边都能抓（14px 高，够粗才抓得住；以前只有 9px，很容易点不中），
+   视觉上只有中间一小段握把，悬停 / 拖动时变亮变长。
+   z-index 高于内容层：拖柄永远压在 .panel-body 上面，不会被最后一行挡住。
+   圆角跟随面板（#7）：拖柄自己是方角的深色渐变，不给圆角就会在面板左下 / 右下画出两个方角，
+   看着就是"面板角落有瑕疵"。 */
+.panel-grip {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 14px;
+  border-radius: 0 0 calc(var(--radius) - 1px) calc(var(--radius) - 1px);
+  cursor: ns-resize;
+  touch-action: none;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0), rgba(0, 0, 0, .26));
+}
+.panel-grip::after {
+  content: "";
+  width: 40px;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, .22);
+  transition: width .12s ease, background .12s ease;
+}
+.panel-grip:hover::after,
+.panel-grip:focus-visible::after,
+.panel-grip.dragging::after { width: 54px; background: var(--accent); }
+.panel-grip:hover,
+.panel-grip:focus-visible,
+.panel-grip.dragging { background: linear-gradient(180deg, rgba(76, 154, 255, .04), rgba(76, 154, 255, .22)); }
+.panel-grip:focus-visible { outline: none; }
+/* 拖过尺寸的面板：拖动中不要选中文字 */
+.rc-panel.resizing,
+.rc-panel.resizing * { user-select: none; }
+
+/* 用户拖过高度的面板（ui.js 的 liftPanelHeightCap 会给它加 .panel-sized）：
+   **内联 height 必须真的说了算** —— 默认上限（--inspector-max-h: 48vh / --toolopts-max-h: 42vh /
+   --toolbox-max-h / --layers-max-h）的优先级高于内联 height，会把拖出来的高度原地压回默认上限
+   （内联写 700px、画面上还是 432px，就是"拖了没反应"的根因）。
+   ui.js 在拖动 / 恢复存档高度时同时写内联 max-height: none；这条是同一个意思的 CSS 兜底。
+   左栏两块还各有一条 flex-shrink: 0（见第 7 节）：拖过的那块不许被整列压回去。 */
+#inspector.panel-sized,
+#rightcol > #toolopts.panel-sized,
+#toolbar > #toolbox.panel-sized,
+#toolbar > #layers.panel-sized { max-height: none; }
+
+.empty-hint {
+  padding: 18px 14px;
+  color: var(--fg-mute);
+  font-size: 12px;
+  line-height: 1.7;
+  text-align: center;
+}
+.empty-hint.small,
+small.empty-hint {
+  padding: 6px 6px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  text-align: left;
+}
+.insp-tags .empty-hint,
+.insp-presets .empty-hint,
+#insp-history .empty-hint,
+#insp-relations .empty-hint,
+#export-options .empty-hint { padding: 8px 0; }
+/* 列表里的空状态不要继承 li 的 flex 布局 */
+.player-list .empty-hint,
+.lock-list .empty-hint,
+#search-results .empty-hint,
+.history-list .empty-hint { display: block; color: var(--fg-mute); }
+
+.insp-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 10px 8px;
+  border-bottom: 1px solid var(--line-3);
+}
+.insp-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: #fff;
+  word-break: break-all;
+}
+.insp-meta {
+  font-size: 10.5px;
+  color: var(--fg-mute);
+  word-break: break-all;
+}
+
+.insp-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 8px 10px 5px;
+  color: var(--fg-mute);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.insp-geometry {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line-3);
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.insp-geometry:empty { display: none; }
+.insp-geometry .geo,
+.insp-geometry .geo-row {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--line-3);
+  border-radius: 999px;
+  background: var(--panel-2);
+}
+.insp-geometry .geo-row { border-radius: var(--radius-xs); }
+.insp-geometry .geo-key,
+.insp-geometry .k { color: var(--fg-mute); font-size: 10.5px; }
+.insp-geometry .geo-val,
+.insp-geometry .v { color: var(--fg); font-family: var(--mono); }
+.insp-geometry b { color: var(--fg); font-family: var(--mono); font-weight: 600; }
+
+/* 标签表 */
+.insp-tags {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 10px 6px;
+  max-height: 34vh;
+  overflow-y: auto;
+}
+.insp-tags:empty::after {
+  content: "暂无标签 · 点「＋ 添加」补充";
+  display: block;
+  padding: 6px 0;
+  color: var(--fg-mute);
+  font-size: 11.5px;
+}
+
+.tag-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.tag-row input {
+  min-width: 0;
+  height: 25px;
+  padding: 0 7px;
+  font-size: 12px;
+}
+.tag-row input.tag-key {
+  flex: 0 0 40%;
+  width: 40%;
+  color: #9fd0ff;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.tag-row input.tag-value {
+  flex: 1 1 auto;
+  width: auto;
+}
+.tag-row .tag-del {
+  flex: 0 0 auto;
+  width: 25px;
+  height: 25px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: var(--panel-2);
+  color: var(--fg-mute);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease, border-color .12s ease;
+}
+.tag-row .tag-del:hover { background: var(--err-soft); border-color: rgba(242, 85, 90, .45); color: var(--err); }
+.tag-row.dirty input.tag-key,
+.tag-row.dirty input.tag-value { border-color: var(--accent-line); }
+.tag-row .tag-key:placeholder-shown { color: var(--fg-mute); }
+
+/* 推荐标签（预设） */
+.insp-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 2px 10px 10px;
+}
+.insp-presets:empty { display: none; }
+.insp-presets button,
+.insp-presets .preset {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease, border-color .12s ease;
+}
+.insp-presets button:hover,
+.insp-presets .preset:hover {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: #fff;
+}
+.insp-presets .preset .ico { font-size: 12px; }
+
+/* 操作区 */
+.insp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 2px 10px 10px;
+}
+.insp-actions:empty { display: none; }
+.insp-actions button {
+  flex: 1 1 auto;
+  min-width: 84px;
+  height: 27px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease, border-color .12s ease;
+}
+.insp-actions button:hover { background: var(--panel-hover); border-color: var(--line-2); color: var(--fg); }
+.insp-actions button[data-act="delete"],
+.insp-actions button.danger { color: #ffb0b3; }
+.insp-actions button[data-act="delete"]:hover,
+.insp-actions button.danger:hover {
+  border-color: rgba(242, 85, 90, .5);
+  background: var(--err-soft);
+  color: #fff;
+}
+.insp-actions button[data-act="split"],
+.insp-actions button.primary {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: #fff;
+}
+.insp-actions button[disabled] { opacity: .4; cursor: not-allowed; }
+
+/* 关系与元素历史 */
+.insp-relations,
+.insp-history {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 10px 10px;
+  font-size: 11.5px;
+  color: var(--fg-dim);
+}
+.insp-relations:empty,
+.insp-history:empty { display: none; }
+.insp-relations > *,
+.insp-history > * {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 5px 7px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--radius-xs);
+  background: var(--panel-2);
+}
+.insp-relations .rel-role,
+.insp-history .hist-time {
+  flex: 0 0 auto;
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+.insp-relations .rel-name,
+.insp-history .hist-who { color: var(--fg); }
+.insp-history .hist-what { flex: 1 1 auto; min-width: 0; word-break: break-word; }
+.insp-history .hist-diff { font-family: var(--mono); font-size: 10.5px; color: var(--fg-mute); }
+.insp-history .hist-diff .add, .diff-add { color: var(--ok); }
+.insp-history .hist-diff .del, .diff-del { color: var(--err); }
+
+/* --------------------------------------------------------------------------
+   9. 左下聊天
+   -------------------------------------------------------------------------- */
+#chat {
+  position: fixed;
+  left: 10px;
+  bottom: 36px;
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  width: 320px;
+  height: 170px;
+  overflow: hidden;
+}
+
+#chat .chat-head {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line-3);
+  color: var(--fg-mute);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .05em;
+}
+
+#chat .chat-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 9px;
+  font-size: 12px;
+  line-height: 1.55;
+  user-select: text;
+}
+.chat-log .msg,
+.chat-log .chat-msg,
+.chat-log .line { padding: 1px 0; word-break: break-word; color: var(--fg-dim); }
+.chat-log .who,
+.chat-log .msg .who { color: var(--c, var(--accent-2)); font-weight: 600; margin-right: 4px; }
+.chat-log .msg .body,
+.chat-log .msg .text { color: var(--fg); }
+.chat-log .time { color: var(--fg-mute); font-family: var(--mono); font-size: 10px; margin-right: 4px; }
+.chat-log .sys,
+.chat-log .system { color: var(--fg-mute); font-size: 11px; font-style: normal; }
+.chat-log .me .who { color: var(--ok); }
+.chat-log .chat-empty { color: var(--fg-mute); font-size: 11.5px; }
+
+#chat-form {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 5px;
+  padding: 6px;
+  border-top: 1px solid var(--line-3);
+}
+#chat-form input { flex: 1 1 auto; min-width: 0; height: 26px; font-size: 12px; }
+#chat-form button {
+  flex: 0 0 auto;
+  height: 26px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: #dbe9ff;
+  font-size: 12px;
+  cursor: pointer;
+}
+#chat-form button:hover { background: rgba(76, 154, 255, .28); color: #fff; }
+
+/* --------------------------------------------------------------------------
+   10. 右下协作者 / 元素锁
+   -------------------------------------------------------------------------- */
+#collab {
+  position: fixed;
+  right: 10px;
+  bottom: 36px;
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  width: 320px;
+  max-height: 240px;
+  overflow: hidden;
+}
+
+.player-list,
+.lock-list {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 6px 6px;
+}
+.player-list { flex: 0 1 auto; max-height: 108px; }
+.lock-list { flex: 1 1 auto; }
+
+.player-list:empty::after,
+.lock-list:empty::after {
+  content: "暂无";
+  display: block;
+  padding: 5px 6px;
+  color: var(--fg-mute);
+  font-size: 11.5px;
+}
+
+.player-list li,
+.lock-list li {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 5px;
+  border-radius: var(--radius-xs);
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.player-list li:hover,
+.lock-list li:hover { background: var(--panel-2); }
+
+.player-list .dot,
+.lock-list .dot,
+.dot {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--c, #8a94a6);
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, .35), 0 0 8px var(--c, transparent);
+}
+
+.player-list .pname,
+.lock-list .pname,
+.lock-list .lname {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
+}
+.lock-list .lname { font-family: var(--mono); font-size: 11.5px; }
+.player-list .pname em,
+.lock-list .pname em {
+  color: var(--fg-mute);
+  font-style: normal;
+  font-size: 10.5px;
+}
+
+.player-list .pstate,
+.lock-list .pstate,
+.lock-list .lowner,
+.lock-list .lstate {
+  flex: 0 0 auto;
+  max-width: 52%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-mute);
+  font-size: 10.5px;
+}
+.player-list li.editing .pstate,
+.player-list .pstate.editing { color: var(--ok); }
+.player-list li.idle .pstate { color: var(--fg-mute); }
+
+.lock-list .lock-item,
+.lock-list li { align-items: baseline; }
+.lock-list .lock-el { color: var(--fg); font-family: var(--mono); font-size: 11.5px; }
+.lock-list .lock-mine .lowner { color: var(--accent-2); }
+
+/* --------------------------------------------------------------------------
+   11. 浮层：搜索 / 提示 / toast / 错误台
+   -------------------------------------------------------------------------- */
+#search-panel,
+.floating {
+  position: fixed;
+  z-index: 38;
+}
+
+#search-panel {
+  top: 54px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 520px;
+  max-width: calc(100vw - 24px);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#search-input { height: 30px; font-size: 12.5px; }
+
+#search-panel .search-help {
+  color: var(--fg-mute);
+  font-size: 10.5px;
+  line-height: 1.6;
+  padding: 0 2px;
+}
+
+#search-results {
+  max-height: 46vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+#search-results:empty { display: none; }
+#search-results li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  font-size: 12px;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+#search-results li:hover,
+#search-results li.active,
+#search-results li.selected {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: #fff;
+}
+#search-results .sr-type {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+#search-results .sr-title { flex: 0 0 auto; color: var(--fg); font-weight: 600; }
+#search-results .sr-sub {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+/* 提示已经并进底部状态条（见 #statusbar #status-hint / #hint）：
+   这里不再有浮在地图右下角的独立提示框，也没有浮框的自动收起定时器 */
+
+/* toast 通知 */
+#toasts {
+  position: fixed;
+  right: 10px;
+  bottom: calc(36px + 250px);
+  z-index: 80;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  pointer-events: none;
+}
+#toasts .toast {
+  max-width: 320px;
+  padding: 7px 11px;
+  border-left: 3px solid var(--accent);
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-word;
+  animation: toast-in .16s ease-out;
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+#toasts .toast.ok, #toasts .toast.success { border-left-color: var(--ok); }
+#toasts .toast.warn, #toasts .toast.warning { border-left-color: var(--warn); }
+#toasts .toast.err, #toasts .toast.error { border-left-color: var(--err); }
+#toasts .toast.info { border-left-color: var(--info); }
+#toasts .toast.fade { opacity: 0; transition: opacity .3s ease; }
+
+/* 客户端错误台 */
+#client-errors {
+  position: fixed;
+  left: 10px;
+  top: 54px;
+  z-index: 75;
+  width: 380px;
+  max-height: 34vh;
+  overflow-y: auto;
+  padding: 8px;
+  border-color: rgba(242, 85, 90, .4);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.55;
+  color: #ffc9cb;
+  user-select: text;
+}
+#client-errors:empty { display: none; }
+#client-errors .ce-item,
+#client-errors > div {
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--line-3);
+  word-break: break-word;
+}
+#client-errors .ce-title { color: var(--err); font-weight: 700; }
+
+/* --------------------------------------------------------------------------
+   12. 模态框
+   -------------------------------------------------------------------------- */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: var(--overlay);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+}
+
+.modal-card {
+  width: 420px;
+  max-width: 100%;
+  max-height: 86vh;
+  overflow-y: auto;
+  padding: 16px;
+  background: var(--panel-solid);
+  border-color: var(--line-2);
+}
+.modal-card.wide { width: 640px; }
+
+.modal-card h1 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 6px;
+}
+.modal-card h1 .logo { font-size: 19px; }
+
+.modal-card .sub {
+  margin-bottom: 12px;
+  color: var(--fg-dim);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.modal-card .tip {
+  margin-top: 10px;
+  color: var(--fg-mute);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.modal-card .error {
+  min-height: 0;
+  margin-top: 6px;
+  color: var(--err);
+  font-size: 11.5px;
+}
+.modal-card .error:empty { display: none; }
+
+.modal-card > .ghost,
+.modal-card > .primary { margin-top: 10px; }
+
+/* 登录弹窗 tabs */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin: 4px 0 12px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, .22);
+}
+.tabs button {
+  flex: 1 1 0;
+  height: 28px;
+  border: none;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+.tabs button:hover { color: var(--fg); background: var(--panel-2); }
+.tabs button.active { background: var(--accent-soft); color: #fff; box-shadow: 0 0 0 1px var(--accent-line) inset; }
+
+/* 导出选项 */
+.export-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 2px;
+}
+.export-options button,
+.export-options .export-opt {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--fg);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease;
+}
+.export-options button:hover:not([disabled]) {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+.export-options button[disabled] { opacity: .45; cursor: not-allowed; }
+.export-options .eo-sub,
+.export-options small { color: var(--fg-mute); font-size: 11px; font-family: var(--mono); }
+
+/* 历史列表 */
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 56vh;
+  overflow-y: auto;
+  margin: 4px 0 2px;
+  user-select: text;
+}
+.history-list:empty::after {
+  content: "还没有任何编辑记录。";
+  display: block;
+  padding: 14px 4px;
+  color: var(--fg-mute);
+  font-size: 12px;
+  text-align: center;
+}
+.history-list .hist-item,
+.history-list > div,
+.history-list > li {
+  padding: 8px 10px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+}
+.history-list .hist-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12.5px;
+}
+.history-list .hist-time { color: var(--fg-mute); font-family: var(--mono); font-size: 10.5px; }
+.history-list .hist-who { color: var(--accent-2); font-weight: 600; }
+.history-list .hist-sum { color: var(--fg-dim); font-size: 11.5px; margin-top: 2px; }
+.history-list .hist-changes,
+.history-list .hist-detail {
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px dashed var(--line-3);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  max-height: 160px;
+  overflow-y: auto;
+}
+.history-list .hist-actions { display: flex; gap: 5px; margin-top: 6px; }
+.history-list .hist-actions button {
+  height: 25px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.history-list .hist-actions button:hover { border-color: var(--line-2); background: var(--panel-hover); color: var(--fg); }
+.history-list .hist-actions button[data-act="rollback"],
+.history-list .hist-actions button.danger { color: #ffb0b3; }
+.history-list .hist-actions button[data-act="rollback"]:hover { border-color: rgba(242, 85, 90, .5); background: var(--err-soft); color: #fff; }
+
+/* 帮助正文 */
+.help-body {
+  user-select: text;
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--fg-dim);
+}
+.help-body h3 {
+  margin: 14px 0 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--line-3);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+}
+.help-body h3:first-child { margin-top: 2px; }
+.help-body p { margin: 0 0 6px; }
+.help-body b, .help-body strong { color: var(--fg); font-weight: 600; }
+.help-body ul, .help-body ol { margin: 0 0 8px; padding-left: 20px; list-style: disc; }
+.help-body ol { list-style: decimal; }
+.help-body li { margin: 2px 0; }
+.help-body ul ul, .help-body ol ul { margin: 3px 0; list-style: circle; }
+.help-body code { font-size: 11px; }
+
+/* --------------------------------------------------------------------------
+   13. 表单控件（深色统一风格）
+   -------------------------------------------------------------------------- */
+input[type="text"],
+input[type="password"],
+input[type="search"],
+input[type="number"],
+input[type="email"],
+input:not([type]),
+select,
+textarea {
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, .06);
+  color: var(--fg);
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color .12s ease, background .12s ease, box-shadow .12s ease;
+  -webkit-appearance: none;
+  appearance: none;
+}
+textarea { height: auto; min-height: 60px; padding: 6px 8px; line-height: 1.5; resize: vertical; }
+
+input::placeholder, textarea::placeholder { color: var(--fg-mute); }
+
+input:focus, select:focus, textarea:focus {
+  border-color: var(--accent-line);
+  background: rgba(76, 154, 255, .08);
+  box-shadow: 0 0 0 3px rgba(76, 154, 255, .14);
+  outline: none;
+}
+input:disabled, select:disabled, textarea:disabled { opacity: .5; cursor: not-allowed; }
+input.invalid, input[aria-invalid="true"] { border-color: rgba(242, 85, 90, .6); }
+
+select {
+  padding-right: 24px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--fg-mute) 50%),
+                    linear-gradient(135deg, var(--fg-mute) 50%, transparent 50%);
+  background-position: right 11px center, right 7px center;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+}
+select option { background: var(--panel-solid); color: var(--fg); }
+
+input[type="checkbox"], input[type="radio"] {
+  width: auto;
+  height: auto;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+input[type="range"] {
+  width: 100%;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+#login-form { display: flex; flex-direction: column; gap: 8px; }
+#login-form input { height: 32px; font-size: 13px; }
+
+/* --------------------------------------------------------------------------
+   14. 按钮
+   -------------------------------------------------------------------------- */
+button { user-select: none; }
+
+button.ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+button.ghost:hover { background: var(--panel-hover); border-color: var(--line-2); color: var(--fg); }
+button.ghost:active { transform: translateY(1px); }
+button.ghost.active { border-color: var(--accent-line); background: var(--accent-soft); color: #fff; }
+button.ghost.wide { width: 100%; height: 30px; }
+
+button.primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 14px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, #3f8ef0, #2f79dd);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter .12s ease, transform .08s ease;
+}
+button.primary:hover { filter: brightness(1.08); }
+button.primary:active { transform: translateY(1px); }
+button.primary[disabled] { opacity: .5; cursor: not-allowed; filter: none; }
+button.primary.wide { width: 100%; }
+
+button.mini {
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-size: 10.5px;
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+button.mini:hover { border-color: var(--accent-line); background: var(--accent-soft); color: #fff; }
+
+button:focus-visible,
+input:focus-visible,
+.tool:focus-visible {
+  outline: 2px solid var(--accent-line);
+  outline-offset: 1px;
+}
+
+/* --------------------------------------------------------------------------
+   15. Leaflet 深色化
+   -------------------------------------------------------------------------- */
+.leaflet-container {
+  background: var(--map-paper);
+  font-family: var(--font);
+  font-size: 12px;
+  outline: none;
+}
+.leaflet-container a { color: var(--accent-2); }
+.leaflet-container .leaflet-control-attribution a { color: var(--fg-dim); }
+
+/* 缩放按钮 */
+.leaflet-bar,
+.leaflet-bar a {
+  border-radius: var(--radius-sm);
+  border-color: var(--line-2);
+  background: rgba(18, 22, 29, .88);
+  color: var(--fg);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.leaflet-bar a {
+  border-bottom: 1px solid var(--line);
+  color: var(--fg);
+  font-size: 16px;
+  line-height: 26px;
+  transition: background .12s ease, color .12s ease;
+}
+.leaflet-bar a:last-child { border-bottom: none; }
+.leaflet-bar a:hover,
+.leaflet-bar a:focus {
+  background: rgba(76, 154, 255, .22);
+  color: #fff;
+  border-bottom-color: var(--line);
+}
+.leaflet-bar a.leaflet-disabled {
+  background: rgba(18, 22, 29, .6);
+  color: var(--fg-mute);
+}
+
+/* 版权信息 */
+.leaflet-control-attribution {
+  padding: 0 5px;
+  background: rgba(13, 16, 21, .74);
+  color: var(--fg-mute);
+  font-size: 10px;
+  line-height: 15px;
+  border-radius: var(--radius-xs) 0 0 0;
+}
+.leaflet-control-attribution a { color: var(--fg-dim); }
+.leaflet-control-attribution svg { vertical-align: -2px; }
+
+/* 比例尺 */
+.leaflet-control-scale-line {
+  border: 1px solid var(--line-2);
+  border-top: none;
+  background: rgba(13, 16, 21, .74);
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.3;
+  padding: 1px 5px 0;
+  text-shadow: none;
+}
+
+/* 弹窗 */
+.leaflet-popup-content-wrapper {
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  background: rgba(18, 22, 29, .95);
+  color: var(--fg);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.leaflet-popup-content {
+  margin: 9px 11px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--fg);
+}
+.leaflet-popup-tip {
+  background: rgba(18, 22, 29, .95);
+  border: 1px solid var(--line-2);
+  box-shadow: none;
+}
+.leaflet-popup-close-button {
+  color: var(--fg-mute) !important;
+  font-size: 16px;
+  padding: 4px 6px 0 0;
+}
+.leaflet-popup-close-button:hover { color: var(--fg) !important; }
+.leaflet-container a.leaflet-popup-close-button { color: var(--fg-mute); }
+
+/* 工具提示 */
+.leaflet-tooltip {
+  padding: 3px 7px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-xs);
+  background: rgba(13, 16, 21, .92);
+  color: var(--fg);
+  font-size: 11px;
+  line-height: 1.45;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .4);
+  white-space: nowrap;
+}
+.leaflet-tooltip-top::before { border-top-color: rgba(13, 16, 21, .92); }
+.leaflet-tooltip-bottom::before { border-bottom-color: rgba(13, 16, 21, .92); }
+.leaflet-tooltip-left::before { border-left-color: rgba(13, 16, 21, .92); }
+.leaflet-tooltip-right::before { border-right-color: rgba(13, 16, 21, .92); }
+.leaflet-tooltip.leaflet-tooltip-no-arrow::before { display: none; }
+
+/* 交互光标 */
+.leaflet-crosshair, .leaflet-crosshair .leaflet-interactive { cursor: crosshair; }
+.leaflet-grab { cursor: grab; }
+.leaflet-dragging .leaflet-grab, .leaflet-dragging .leaflet-grab .leaflet-interactive { cursor: grabbing; }
+.leaflet-interactive:focus { outline: none; }
+
+/* canvas 矢量层 */
+.leaflet-image-layer, .leaflet-tile { will-change: auto; }
+canvas.leaflet-zoom-animated { image-rendering: auto; }
+
+/* --------------------------------------------------------------------------
+   16. 地图上的自定义元素（由 JS 创建）
+   -------------------------------------------------------------------------- */
+
+/* 协作者光标：小圆点 + 名字气泡 */
+.player-cursor-icon { background: none; border: none; pointer-events: none; }
+.player-cursor-icon .pcursor,
+.pcursor {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.pcursor .pc-dot,
+.pcursor::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: var(--c, #4c9aff);
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, .35), 0 0 10px var(--c, #4c9aff);
+}
+.pcursor .pc-name,
+.pcursor .pname {
+  padding: 1px 6px;
+  border: 1px solid rgba(0, 0, 0, .3);
+  border-radius: 999px;
+  background: var(--c, #4c9aff);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 15px;
+  text-shadow: 0 1px 1px rgba(0, 0, 0, .35);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .35);
+}
+.pcursor.editing .pc-name::after { content: " ✎"; }
+
+/* 绘制时跟随鼠标的提示气泡（长度 / 面积 / 标签提示） */
+.cost-tip-marker { background: none; border: none; pointer-events: none; }
+.cost-tip-marker .cost-tip,
+.cost-tip {
+  display: inline-block;
+  transform: translate(14px, -50%);
+  padding: 3px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-xs);
+  background: rgba(13, 16, 21, .92);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: nowrap;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .45);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.cost-tip b, .cost-tip .num { color: var(--accent-2); font-weight: 700; }
+.cost-tip .warn, .cost-tip.warn { color: var(--warn); }
+.cost-tip .err, .cost-tip.err { color: var(--err); }
+.cost-tip .tip-tag { color: #ffd479; }
+.cost-tip .tip-sep { color: var(--line-2); margin: 0 5px; }
+.cost-tip.invalid { border-color: rgba(242, 85, 90, .55); }
+
+/* 点击元素后的 Leaflet 弹窗内容 */
+.osmcity-popup {
+  min-width: 190px;
+  max-width: 300px;
+  color: var(--fg);
+  user-select: text;
+}
+.osmcity-popup .popup,
+.popup { display: flex; flex-direction: column; gap: 4px; }
+.popup-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--line-3);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  word-break: break-word;
+}
+.popup-title .popup-sub,
+.popup-title small {
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 400;
+}
+.popup-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+.popup-row .k,
+.popup-row .popup-k {
+  flex: 0 0 40%;
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  word-break: break-all;
+}
+.popup-row .v,
+.popup-row .popup-v {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--fg);
+  word-break: break-word;
+}
+.popup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line-3);
+}
+.popup-actions button {
+  flex: 1 1 auto;
+  height: 25px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-size: 11.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.popup-actions button:hover { border-color: var(--accent-line); background: var(--accent-soft); color: #fff; }
+.popup-actions button.danger { color: #ffb0b3; }
+.popup-actions button.danger:hover { border-color: rgba(242, 85, 90, .5); background: var(--err-soft); color: #fff; }
+.osmcity-popup .locked,
+.popup .locked { color: var(--warn); font-size: 11px; }
+
+/* 测量 / 长度标注文字 */
+.measure-label {
+  display: inline-block;
+  transform: translate(-50%, -50%);
+  padding: 0 4px;
+  color: #10202f;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 14px;
+  white-space: nowrap;
+  pointer-events: none;
+  text-shadow: 0 1px 0 #fff, 0 -1px 0 #fff, 1px 0 0 #fff, -1px 0 0 #fff,
+               1px 1px 0 #fff, -1px -1px 0 #fff, 1px -1px 0 #fff, -1px 1px 0 #fff,
+               0 2px 4px rgba(0, 0, 0, .25);
+}
+
+/* POI 名称标签：深色小字 + 白色描边 */
+.poi-label {
+  display: inline-block;
+  transform: translate(-50%, -50%);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #1c2026;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 14px;
+  pointer-events: none;
+  text-shadow: 0 0 2px #fff, 0 0 3px #fff, 1px 1px 0 #fff, -1px -1px 0 #fff,
+               1px -1px 0 #fff, -1px 1px 0 #fff, 0 1px 0 #fff, 0 -1px 0 #fff;
+}
+.poi-label.important, .poi-label.poi-major { font-size: 12.5px; font-weight: 700; }
+.poi-label.dim { opacity: .78; }
+
+/* --------------------------------------------------------------------------
+   17. 运行时 JS 动态生成的内层元素
+   （这些片段由脚本拼装，不属于静态骨架，但需要与面板风格一致）
+   -------------------------------------------------------------------------- */
+
+/* 4.1 顶栏数据集统计项 */
+#data-info .di-item { color: var(--fg-dim); }
+
+/* 8.1 检查器标题：#insp-element-title = .insp-type + .insp-id + .insp-name */
+#insp-element-title .insp-type {
+  margin-right: 6px;
+  padding: 0 6px;
+  border: 1px solid var(--accent-line);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: #cfe4ff;
+  font-size: 10.5px;
+  font-weight: 600;
+  vertical-align: 1px;
+}
+#insp-element-title .insp-id {
+  margin-right: 6px;
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 400;
+}
+#insp-element-title .insp-name { color: #fff; }
+
+/* 8.2 几何信息：JS 直接塞入裸 <span> */
+.insp-geometry > span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--line-3);
+  border-radius: 999px;
+  background: var(--panel-2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--fg-dim);
+}
+.insp-geometry > span b { color: var(--fg); }
+
+/* 8.3 所属关系行 */
+#insp-relations .insp-rel-row {
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+#insp-relations .insp-rel-row:hover {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: #fff;
+}
+
+/* 8.4 元素改动历史：.hist-row = 动作 + 作者 + 时间 + 回滚标记 */
+#insp-history .hist-row { flex-wrap: wrap; line-height: 1.5; }
+#insp-history .hist-action {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--panel-hover);
+  color: var(--fg);
+  font-size: 10.5px;
+}
+#insp-history .hist-author { flex: 0 0 auto; color: var(--accent-2); font-size: 11px; }
+#insp-history .hist-time { margin-left: auto; }
+#insp-history .hist-undone {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border: 1px solid rgba(240, 180, 41, .4);
+  border-radius: 999px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 10px;
+}
+
+/* 8.5 推荐预设：#insp-presets = .preset-hint + .preset-chips > .preset-chip */
+#insp-presets .preset-hint {
+  width: 100%;
+  margin-bottom: 2px;
+  color: var(--fg-mute);
+  font-size: 10.5px;
+}
+.insp-presets .preset-chips,
+.preset-chips,
+.preset-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  width: 100%;
+}
+.preset-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+.preset-chip:hover {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: #fff;
+}
+.preset-chip.more { border-style: dashed; color: var(--fg-mute); }
+
+/* 8.6 工具选项区（#tool-options 内容由 JS 生成） */
+.tool-options .opt-head,
+.tool-options .opt-current {
+  padding: 5px 2px;
+  color: var(--fg-dim);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+.tool-options .opt-head {
+  color: var(--fg-mute);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .07em;
+  border-bottom: 1px solid var(--line-3);
+}
+.tool-options .opt-search { height: 25px; font-size: 11.5px; }
+.tool-options .opt-btn {
+  display: block;
+  width: 100%;
+  margin-top: 5px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-size: 11.5px;
+  text-align: center;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+.tool-options .opt-btn:hover {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: #fff;
+}
+.tool-options .preset-cats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 0 4px;
+}
+.tool-options .preset-cat {
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg-mute);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.tool-options .preset-cat:hover { border-color: var(--line-2); color: var(--fg); }
+.tool-options .preset-items { max-height: 220px; overflow-y: auto; }
+.tool-options .preset-items .preset-chip { font-size: 11px; }
+
+/* 8.7 图层色块：与矢量地图上的类别配色一致 */
+.layer-item .sw.cat-landuse,
+.layer-item .sw.cat-landcover { background: #c8e6a0; }
+.layer-item .sw.cat-water { background: #aad3df; }
+.layer-item .sw.cat-waterway { background: #7fb4d8; }
+.layer-item .sw.cat-railway { background: #8a8a8a; }
+.layer-item .sw.cat-road,
+.layer-item .sw.cat-highway { background: #fcd6a4; }
+.layer-item .sw.cat-road-detail,
+.layer-item .sw.cat-path { background: #e4e0d8; }
+.layer-item .sw.cat-building { background: #d9d0c9; }
+.layer-item .sw.cat-boundary { background: #b8a0d8; }
+.layer-item .sw.cat-barrier { background: #9a9a9a; }
+.layer-item .sw.cat-power { background: #a0a0a0; }
+.layer-item .sw.cat-poi-area,
+.layer-item .sw.cat-amenity,
+.layer-item .sw.cat-shop { background: #f2dad9; }
+.layer-item .sw.cat-poi { background: #e892a2; }
+.layer-item .sw.cat-natural { background: #add19e; }
+.layer-item .sw.cat-leisure { background: #cdebb0; }
+.layer-item .sw.cat-tourism { background: #e8e0f0; }
+.layer-item .sw.cat-place { background: #333333; }
+.layer-item .sw.cat-aeroway { background: #dfe3e5; }
+.layer-item .sw.cat-man_made,
+.layer-item .sw.cat-office { background: #dcd9d4; }
+
+/* 12.1 导出面板的下载项（<a class="export-btn">） */
+.export-options .export-btn {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  color: var(--fg);
+  font-size: 12.5px;
+  text-decoration: none;
+  transition: background .12s ease, border-color .12s ease;
+}
+.export-options .export-btn:hover {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  text-decoration: none;
+}
+.export-options .export-btn b { color: #fff; font-weight: 600; }
+.export-options .export-btn span { color: var(--fg-mute); font-size: 11px; }
+.export-options .tip,
+.modal-card .tip { color: var(--fg-mute); }
+
+/* 12.2 历史面板：.history-row = .hs-main + .hs-comment + .hs-actions */
+.history-list .history-row {
+  padding: 8px 10px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+}
+.history-list .history-row.reverted { opacity: .62; }
+.history-list .hs-main {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.history-list .hs-author { color: var(--accent-2); font-weight: 600; font-size: 12.5px; }
+.history-list .hs-count { color: var(--fg-dim); font-size: 11px; }
+.history-list .hs-time {
+  margin-left: auto;
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+.history-list .hs-flag {
+  padding: 0 6px;
+  border: 1px solid rgba(240, 180, 41, .4);
+  border-radius: 999px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 10px;
+}
+.history-list .hs-comment {
+  margin-top: 3px;
+  color: var(--fg-dim);
+  font-size: 11.5px;
+  word-break: break-word;
+}
+.history-list .hs-comment:empty { display: none; }
+.history-list .hs-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.history-list .hs-actions a.mini,
+a.mini {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  font-size: 10.5px;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+}
+.history-list .hs-actions a.mini:hover,
+a.mini:hover {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: #fff;
+  text-decoration: none;
+}
+button.mini.danger { color: #ffb0b3; }
+button.mini.danger:hover {
+  border-color: rgba(242, 85, 90, .5);
+  background: var(--err-soft);
+  color: #fff;
+}
+
+/* 11.1 搜索结果行：#search-results li = .s-type + .s-name + .s-tags + .s-id */
+#search-results .s-type {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--fg-mute);
+  font-size: 10px;
+}
+#search-results .s-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
+  font-weight: 600;
+}
+#search-results .s-tags {
+  flex: 0 0 auto;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+#search-results .s-id {
+  flex: 0 0 auto;
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+/* 11.2 toast 消失动画（util.js 会添加 .out 后移除节点） */
+#toasts .toast.out {
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity .3s ease, transform .3s ease;
+}
+
+/* 3.1 地图 canvas 上的可点选要素（render.js 的交互层） */
+.osmcity-feature { cursor: pointer; }
+.osmcity-overlay { pointer-events: none; }
+
+/* 17.1 启动失败兜底（main.js 会整体替换 body 内容） */
+.boot-error {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 14px;
+  line-height: 1.9;
+  text-align: center;
+}
+.boot-error code {
+  margin: 0 4px;
+  color: #ffd479;
+  font-size: 12.5px;
+}
+
+/* --------------------------------------------------------------------------
+   17.2 启动进度（B 方案：端口先开、页面先出）
+   index.html 里的 #boot-progress 默认带 .hidden —— main.js 的 showBootProgress()
+   去掉 .hidden 并写 #boot-progress-text / #boot-progress-bar.style.width / #boot-progress-detail，
+   就绪后 hideBootProgress() 把 .hidden 加回来（节点保留，只是不显示）。
+   ⚠ 这几个类名与 main.js 动态建节点时用的**完全一致**：静态节点与兜底节点长得一样。
+   -------------------------------------------------------------------------- */
+.boot-progress-card { min-width: 260px; }
+
+#boot-progress-text { font-size: 14.5px; }
+
+.boot-progress-track {
+  margin: 10px auto 6px;
+  width: 260px;
+  max-width: 70vw;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, .14);
+  overflow: hidden;
+}
+
+#boot-progress-bar {
+  height: 6px;
+  width: 0%;
+  border-radius: 3px;
+  background: #ffd479;
+  transition: width .3s ease;
+}
+
+#boot-progress-detail { font-size: 12.5px; }
+
+/* --------------------------------------------------------------------------
+   18. 工具类
+   -------------------------------------------------------------------------- */
+.hidden { display: none !important; }
+.spacer { flex: 1; }
+
+.muted { color: var(--fg-mute); }
+.dim { color: var(--fg-dim); }
+.mono { font-family: var(--mono); }
+.nowrap { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.center { text-align: center; }
+.row { display: flex; align-items: center; gap: 6px; }
+.warn-text { color: var(--warn); }
+.err-text { color: var(--err); }
+.ok-text { color: var(--ok); }
+
+/* --------------------------------------------------------------------------
+   19. 响应式
+   -------------------------------------------------------------------------- */
+
+/* 中等屏幕：收起聊天 */
+@media (max-width: 1200px) {
+  #chat { display: none; }
+  /* 协作频道整块隐藏之后，左下角空出来了：左栏（#toolbar）可以用满高度 ——
+     原来那条"停在协作频道上面"的上限（100vh - 260px）在这里没必要，
+     两块面板各自的上限（--toolbox-max-h / --layers-max-h）都是从 --rail-h 算出来的，会一起跟着放宽 */
+  :root { --rail-h: calc(100vh - 88px); }
+}
+
+/* 窄屏：再收起协作者面板 */
+@media (max-width: 1000px) {
+  #collab { display: none; }
+  #data-info { display: none; }
+}
+
+/* 小屏：右栏（属性检查器 → 工具选项）改成一条底部抽屉；左栏宽度不变（还是 --rail-w = 三个工具按钮），
+   只是左栏那一列再收一档（--rail-h：给地图多留一点地方；两块各自的上限跟着它一起收）。
+   抽屉模式下右栏摊平：不再自己滚动（滚动交给整条抽屉），高度拖柄收起来（这里拖没有意义）。
+   交通公司窗口这时也回到 right: 10px（右栏已经不在右上角了，没必要再让位）。 */
+@media (max-width: 820px) {
+  #rightcol {
+    top: auto;
+    left: 0;
+    right: 0;
+    bottom: var(--statusbar-h);
+    width: auto;
+    max-height: 62vh;
+    gap: 8px;
+    overflow-y: auto;
+  }
+  /* 抽屉里两块照旧是**各自独立的两张卡片**（#7：不再摊平成一块 —— 摊平之后两块之间
+     只靠"共用一条半透明底"连起来，看着就是一条黑色半透明带；小屏上更要看得清哪块是哪块）。
+     高度都交给内容（flex: 0 0 auto），滚动仍由整条抽屉兜底；圆角/边框全部保留。 */
+  #rightcol > .rc-panel {
+    flex: 0 0 auto;
+    min-height: 0;
+    max-height: none;
+    border-radius: var(--radius);
+    border: 1px solid var(--line);
+  }
+  /* 摊平之后滚动条只该有一条：内容层不再自己滚（面板本身照旧 overflow: hidden 保住圆角） */
+  #rightcol > .rc-panel > .panel-body { overflow: visible; padding-bottom: 8px; }
+  #rightcol .panel-grip { display: none; }
+  #inspector .insp-tags { max-height: none; }
+  /* 左栏两块：小屏上再把整列的可用高度收一档，给地图留地方（两块各自的上限跟着 --rail-h 走） */
+  :root { --rail-h: calc(100vh - 200px); }
+  #rightcol > #toolopts { max-height: 34vh; }
+  #transit { right: 10px; }
+  #toasts { bottom: auto; top: 54px; right: 10px; left: 10px; align-items: stretch; }
+  #toasts .toast { max-width: none; }
+  .modal-card, .modal-card.wide { width: 100%; }
+  #search-panel { width: calc(100vw - 20px); }
+  #client-errors { width: calc(100vw - 20px); }
+}
+
+/* 矮屏：面板压缩高度（左栏两块与右栏两块的默认上限本来就是"跟视口走"的 calc()，矮屏会自动跟着缩，
+   整列放不下时整列滚，不在这里再压一遍 —— 否则会和上面的小屏布局（底部抽屉）打架） */
+@media (max-height: 640px) and (min-width: 1201px) {
+  /* 矮屏**且协作频道还在**（宽 >1200px）时聊天框只有 140px 高（见下一条），
+     左栏的上限跟着往下让一点，仍然停在它上面（宽 ≤1200px 时走上面那条 100vh - 88px，不受这条影响） */
+  :root { --rail-h: calc(100vh - 230px); }
+}
+@media (max-height: 640px) {
+  #rightcol { max-height: calc(100vh - 76px); }
+  #chat { height: 140px; }
+  #collab { max-height: 180px; }
+}
+
+/* 尊重系统「减少动态效果」 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}
+
+/* ============================ 交通经营玩法（铁路/公交） ============================ */
+.clock-box { display: flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 10px; background: rgba(255,255,255,0.06); border: 1px solid var(--line); }
+.clock-box button { padding: 3px 8px; font-size: 11px; }
+.clock-box button.paused { color: var(--accent-2); border-color: rgba(255,159,28,0.5); }
+/* 时钟的两个控件：暂停/继续（左）与倍速菜单（右）—— 状态一眼可辨 */
+.clock-box .clock-pause { min-width: 72px; text-align: center; }
+.clock-box .clock-pause.paused {
+  color: #ffcf8a; border-color: rgba(255,159,28,0.55);
+  background: rgba(255,159,28,0.16); font-weight: 700;
+}
+.clock-box .clock-pause.running { color: #dffbea; border-color: rgba(110,231,168,0.42); }
+.clock-box .clock-speed { min-width: 92px; text-align: center; }
+.clock-box .clock-speed.paused { color: #ffcf8a; border-color: rgba(255,159,28,0.45); }
+.clock-time { font-family: ui-monospace, monospace; font-size: 13px; font-weight: 700; letter-spacing: 0.04em; }
+.clock-day { font-size: 10px; color: var(--muted); }
+
+/* 交通公司：**与右栏并存的浮动窗口** ——
+   默认位置停在**右栏左边**（right = 右栏宽 + 20px：右栏自己 inset 10px，所以两者之间正好留 10px 缝），
+   也就是"屏幕中偏右、把右栏那 316px 让出来"，默认绝不压住 #inspector / #toolopts；
+   玩家拖动过就完全按 localStorage 的 osmcity.panel.transitPos 来（下面的 .tp-head 是拖手，
+   双击标题栏回到这个默认位置）；位置真的重叠了也靠玩家拖动解决 ——
+   打开 / 关闭这个窗口**不会**给 #inspector / #toolopts 加 .hidden、不改它们的宽高与位移、
+   也不动它们的滚动位置（ui.js 的 initRightRail 把这条兜住），左栏的编辑工具 / 图层同样不受影响。
+   管理器窗口（transit.js 的 .tmgr-win、linemgr.js 的 .lm-win）同样是 position:fixed 的浮动窗口，
+   与地图、右栏、图层、工具选项同时显示。 */
+#transit {
+  position: fixed; z-index: 32; top: 54px; right: calc(var(--rightcol-w) + 20px); width: 340px;
+  max-height: calc(100vh - 300px); display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  box-shadow: var(--shadow); backdrop-filter: blur(10px);
+}
+/* 标题栏可以按住拖动（接线在 ui.js 的 initTransitDrag，与线路管理器窗口的拖动同一套鼠标事件；
+   位置记在 osmcity.panel.transitPos，双击标题栏回到默认位置）。
+   只有标题栏是"拖手"：按钮上按下不算拖动，面板内部的滚动也照旧 */
+.tp-head { cursor: move; }
+.tp-head button,
+.tp-head .mini,
+.tp-head input,
+.tp-head select { cursor: pointer; }
+#transit.dragging {
+  border-color: var(--line-2);
+  box-shadow: 0 18px 46px rgba(0, 0, 0, .62);
+}
+#transit.dragging .tp-head { cursor: grabbing; }
+.tp-head { display: flex; align-items: center; justify-content: space-between; padding-right: 8px; }
+.tp-tabs { display: flex; gap: 4px; padding: 0 8px 6px; flex-wrap: wrap; }
+.tp-tab { padding: 4px 9px; font-size: 11px; border-radius: 8px; border: 1px solid var(--line); background: rgba(255,255,255,0.05); color: var(--muted); cursor: pointer; }
+.tp-tab.active { background: rgba(110,231,168,0.16); border-color: rgba(110,231,168,0.5); color: #dffbea; font-weight: 700; }
+.tp-body { overflow-y: auto; padding: 6px 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.tp-block { display: flex; flex-direction: column; gap: 3px; padding: 8px; border-radius: 10px; background: rgba(255,255,255,0.05); border: 1px solid var(--line); }
+.tp-row { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+.tp-row b { color: var(--text); }
+.tp-note { font-size: 11px; color: var(--muted); line-height: 1.6; padding: 6px 2px; }
+.tp-item { border: 1px solid var(--line); border-radius: 10px; padding: 7px 8px; background: rgba(255,255,255,0.04); }
+.tp-item-head { display: flex; align-items: center; gap: 6px; font-size: 12px; flex-wrap: wrap; }
+.tp-tag { font-size: 10px; padding: 1px 6px; border-radius: 999px; background: rgba(255,255,255,0.08); color: var(--muted); }
+.tp-tag.ok { color: var(--accent); border: 1px solid rgba(110,231,168,0.35); }
+.tp-tag.warn, .warn { color: #ffb3b3; }
+.tp-item-sub { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.5; }
+.tp-actions { display: flex; gap: 5px; margin-top: 6px; flex-wrap: wrap; }
+.tp-actions .mini { font-size: 11px; padding: 3px 8px; border-radius: 7px; border: 1px solid var(--line); background: rgba(255,255,255,0.07); color: var(--text); cursor: pointer; }
+.tp-actions .mini:hover { background: rgba(255,255,255,0.14); }
+.tp-actions .mini.danger { background: rgba(255,107,107,0.14); border-color: rgba(255,107,107,0.4); color: #ffb3b3; }
+.sw.cat-pop { background: linear-gradient(90deg, #ffb703, #e63946); }
+.opt-field { display: flex; flex-direction: column; gap: 4px; padding: 2px 8px 6px; }
+.opt-field label { font-size: 11px; color: var(--muted); }
+.opt-input { background: rgba(255,255,255,0.06); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; color: var(--text); font-size: 12px; outline: none; }
+.opt-input:focus { border-color: rgba(110,231,168,0.5); }
+.opt-chips { display: flex; gap: 5px; flex-wrap: wrap; padding: 2px 8px 6px; }
+.opt-btn.danger { background: rgba(255,107,107,0.16); border-color: rgba(255,107,107,0.4); color: #ffb3b3; }
+.tag-row-placeholder .tag-value { border-style: dashed; }
+
+/* ============ 检查器：创作面板 / 快捷标签 / 楼层控件 / 状态栏撤销 ============ */
+#inspector-create { padding: 0 2px 8px; }
+#inspector-create .opt-field { padding: 2px 0 6px; }
+.will-write { font-size: 11.5px; line-height: 1.6; color: var(--muted); background: rgba(110,231,168,0.08); border: 1px solid rgba(110,231,168,0.25); border-radius: 8px; padding: 6px 8px; margin: 6px 0; }
+.will-write b { color: #dffbea; }
+.quick-tags { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; padding: 6px 0 2px; }
+.quick-label { font-size: 10px; color: var(--muted); }
+.chip.small { font-size: 10px; padding: 2px 6px; font-family: ui-monospace, monospace; }
+.floors-ctl { display: flex; align-items: center; gap: 5px; margin-top: 6px; flex-wrap: wrap; }
+.floors-ctl label { font-size: 11px; color: var(--muted); }
+.floors-ctl input { width: 58px; background: rgba(255,255,255,0.06); border: 1px solid var(--line); border-radius: 7px; padding: 3px 6px; color: var(--text); font-size: 12px; outline: none; }
+.floors-ctl input:focus { border-color: rgba(110,231,168,0.5); }
+#statusbar .mini { font-size: 11px; padding: 2px 8px; border-radius: 7px; border: 1px solid var(--line); background: rgba(255,255,255,0.07); color: var(--text); cursor: pointer; margin: 0 2px; }
+#statusbar .mini:hover { background: rgba(255,255,255,0.15); }
+
+/* ============ 交通面板：大窗口 / 公司切换 / 筛选 / 图例 / 列表式指派 ============ */
+/* 放大成大窗口时锚回屏幕右边（不按"右栏 + 20px"算，否则 94vw 会从左边溢出屏幕）；
+   这一档是玩家自己按「⤢ 放大」要的全屏级窗口，压住右栏是预期的 */
+#transit.big { right: 10px; width: min(1180px, 94vw); max-width: 94vw; }
+#transit.big .tp-body { max-height: calc(100vh - 200px); }
+.tp-company-bar { display: flex; align-items: center; gap: 6px; padding: 6px 0; flex-wrap: wrap; }
+.tp-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: 0 0 auto; }
+/* 交通面板 / 管理器窗口里的**筛选下拉**统一成一套（用户要求：一样的行高、深色底、自绘箭头、统一聚焦环）：
+   这些类名都是 transit.js / ui.js 现成渲染的（.tp-select / .tp-toolbar select / .tp-fsel select），
+   所以只改样式、不动那个文件；.tp-company-select（顶栏公司选单）与 .tp-select-source（车站「来源」）
+   是本轮新加的类，走的也是这一套取值。 */
+.tp-select,
+.tp-toolbar select,
+.tp-fsel select,
+.tmgr-pick select,
+.tp-select-filter,
+.tp-company-select {
+  flex: 1 1 140px;
+  min-width: 110px;
+  height: 26px;
+  padding: 0 24px 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background-color: rgba(255,255,255,0.06);
+  background-image: linear-gradient(45deg, transparent 50%, var(--fg-mute) 50%),
+                    linear-gradient(135deg, var(--fg-mute) 50%, transparent 50%);
+  background-position: right 12px center, right 8px center;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+  color: var(--text);
+  font-size: 11.5px;
+  line-height: 24px;
+  cursor: pointer;
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: border-color .12s, box-shadow .12s, background-color .12s;
+}
+.tp-select.small { flex: 0 1 auto; min-width: 0; font-size: 11.5px; }
+.tp-select:hover,
+.tp-toolbar select:hover,
+.tp-fsel select:hover,
+.tp-company-select:hover { background-color: rgba(255,255,255,0.11); border-color: var(--line-2); }
+.tp-select:focus,
+.tp-toolbar select:focus,
+.tp-fsel select:focus,
+.tp-company-select:focus {
+  border-color: rgba(110,231,168,0.65);
+  box-shadow: 0 0 0 2px rgba(110,231,168,0.18);
+  background-color: rgba(255,255,255,0.11);
+}
+.tp-select:disabled,
+.tp-toolbar select:disabled,
+.tp-company-select:disabled { opacity: .5; cursor: not-allowed; }
+.tp-select option,
+.tp-toolbar select option,
+.tp-company-select option { background: var(--panel-solid); color: var(--fg); }
+.tp-select optgroup,
+.tp-company-select optgroup { background: var(--panel-solid); color: var(--fg-mute); }
+/* 顶栏那条公司选单：只占它自己的宽度，别把整行撑满（后面还有改名 / 删除按钮） */
+.tp-company-select { flex: 0 1 auto; min-width: 118px; max-width: 58%; font-weight: 600; }
+/* 车站「来源」筛选：选项最长的是「公共（底图导入）」，给一个够宽的底
+   （必须写成 .tp-select.tp-select-source：.tp-select.small 的 min-width: 0 是两类的选择器） */
+.tp-select.tp-select-source { min-width: 122px; }
+.tp-filter-bar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; padding: 4px 0 8px; border-bottom: 1px solid var(--line); margin-bottom: 6px; }
+.tp-search { flex: 1 1 120px; min-width: 100px; background: rgba(255,255,255,0.06); border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; color: var(--text); font-size: 12px; outline: none; }
+.tp-search:focus { border-color: rgba(110,231,168,0.5); }
+.tp-check { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text); padding: 2px 0; cursor: pointer; }
+.tp-picker { margin-top: 6px; border-top: 1px dashed var(--line); padding-top: 6px; display: flex; flex-direction: column; gap: 2px; }
+.tp-picker-title { font-size: 11px; color: var(--muted); padding-bottom: 2px; }
+.tp-picker .mini { margin-left: auto; }
+.tp-bulk { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 10px; padding: 6px 8px; margin: 6px 0; background: rgba(255,255,255,0.04); }
+.tp-bulk .opt-btn { margin: 0; }
+.tp-num { width: 72px; background: rgba(255,255,255,0.06); border: 1px solid var(--line); border-radius: 7px; padding: 3px 6px; color: var(--text); font-size: 11.5px; outline: none; }
+.tp-pick { margin-right: 2px; flex: 0 0 auto; }
+.mini.on { background: rgba(110,231,168,0.22); border-color: rgba(110,231,168,0.5); color: #dffbea; }
+.tp-legend { border: 1px solid var(--line); border-radius: 10px; padding: 6px 8px; margin: 4px 0 8px; background: rgba(255,255,255,0.04); }
+.tp-legend-title { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.tp-legend-bar { height: 9px; border-radius: 5px; background: linear-gradient(90deg, rgba(60,200,120,0.85), rgba(255,215,40,0.9) 55%, rgba(255,60,40,0.95)); }
+.tp-legend-scale { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 2px; }
+.tp-legend-note { font-size: 10.5px; color: var(--muted); margin-top: 3px; }
+
+/* ============================ 顶栏时钟倍速菜单 ============================ */
+#clock-box { position: relative; }
+.clock-menu {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 60;
+  display: flex; flex-wrap: wrap; gap: 4px; width: 234px; max-width: calc(100vw - 20px);
+  padding: 7px 8px 6px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+  box-shadow: var(--shadow); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+}
+.clock-menu.hidden { display: none; }
+.clock-chip {
+  padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px;
+  background: rgba(255,255,255,0.06); color: var(--muted);
+  font-size: 11px; line-height: 16px; cursor: pointer; white-space: nowrap;
+}
+.clock-chip:hover { border-color: var(--accent-line); background: var(--accent-soft); color: #fff; }
+.clock-chip.active { background: rgba(110,231,168,0.18); border-color: rgba(110,231,168,0.55); color: #dffbea; font-weight: 700; }
+.clock-chip.active:hover { border-color: rgba(110,231,168,0.75); }
+.clock-menu-hint { flex: 1 0 100%; margin-top: 2px; color: var(--muted); font-size: 10px; line-height: 1.4; }
+/* 「跳到…」整行：输入框 + 跳转 + 常用时刻快捷键 + 当前倍速说明（由 ui.js 挂在芯片下面） */
+.clock-menu-jump {
+  flex: 1 0 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+  margin-top: 4px; padding-top: 6px; border-top: 1px solid var(--line);
+}
+.clock-jump-label { flex: 0 0 auto; font-size: 10px; color: var(--muted); }
+.clock-jump-input {
+  flex: 1 1 92px; min-width: 0; padding: 3px 6px; font-size: 11px;
+  font-family: ui-monospace, monospace; color: var(--text);
+  background: rgba(255,255,255,0.06); border: 1px solid var(--line);
+  border-radius: 7px; outline: none;
+}
+.clock-jump-input::placeholder { color: var(--muted); font-family: inherit; }
+.clock-jump-input:focus { border-color: var(--accent-line); background: var(--accent-soft); }
+.clock-jump-go {
+  flex: 0 0 auto; padding: 3px 8px; font-size: 11px; border-radius: 7px; cursor: pointer;
+  border: 1px solid var(--line); background: rgba(255,255,255,0.07); color: var(--text);
+}
+.clock-jump-go:hover { border-color: var(--accent-line); background: var(--accent-soft); color: #fff; }
+.clock-jump-quick { flex: 1 0 100%; display: flex; flex-wrap: wrap; gap: 4px; }
+.clock-jump-chip {
+  padding: 2px 7px; font-size: 10.5px; line-height: 15px; white-space: nowrap; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 999px;
+  background: rgba(255,255,255,0.05); color: var(--muted);
+}
+.clock-jump-chip:hover { border-color: var(--accent-line); background: var(--accent-soft); color: #fff; }
+.clock-jump-note { flex: 1 0 100%; color: var(--muted); font-size: 10px; line-height: 1.45; }
+
+/* ============================ 面板折叠（交通公司 / 属性检查器） ============================ */
+.panel-head {
+  display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+  padding: 6px 8px 6px 10px; border-bottom: 1px solid var(--line-3);
+  position: sticky; top: 0; z-index: 3;
+  background: linear-gradient(180deg, rgba(18, 22, 29, .96), rgba(18, 22, 29, .82));
+  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  /* 圆角跟随面板（#7）：标题栏是方角的深色块，压在面板圆角上就是"角落有瑕疵" */
+  border-radius: calc(var(--radius) - 1px) calc(var(--radius) - 1px) 0 0;
+}
+.panel-head .panel-title {
+  flex: 1 1 auto; min-width: 0;
+  padding: 0; border-bottom: 0; position: static;
+  background: none; backdrop-filter: none; -webkit-backdrop-filter: none;
+}
+.tp-head { justify-content: flex-start; }
+.panel-toggle { flex: 0 0 auto; }
+/* 折叠后只剩标题栏：不再占着右侧一大片、也不挡地图 */
+#transit.panel-collapsed,
+#inspector.panel-collapsed {
+  width: auto; min-width: 148px; max-width: min(340px, 62vw);
+  height: auto; max-height: none; overflow: hidden; padding-bottom: 0;
+}
+#transit.panel-collapsed .tp-body,
+#transit.panel-collapsed .tp-tabs { display: none; }
+.panel-collapsed > *:not(.panel-head) { display: none !important; }
+
+/* ============================ 车站编辑表单（地图弹窗 + 面板共用） ============================ */
+.st-editor { gap: 5px; }
+.st-field { display: flex; align-items: center; gap: 6px; }
+.st-field > label { flex: 0 0 62px; color: var(--fg-mute); font-size: 11px; }
+.st-input, .st-select {
+  flex: 1 1 auto; min-width: 0;
+  background: rgba(255,255,255,0.06); border: 1px solid var(--line); border-radius: 7px;
+  padding: 4px 7px; color: var(--fg); font-size: 11.5px; outline: none;
+}
+.st-input:focus, .st-select:focus { border-color: rgba(110,231,168,0.55); }
+.st-input[readonly], .st-select[disabled] { opacity: .62; cursor: not-allowed; }
+.st-unit { flex: 0 0 auto; color: var(--fg-mute); font-size: 10.5px; }
+.st-check { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--fg); cursor: pointer; }
+.st-readonly { color: var(--warn); font-size: 10.5px; }
+.st-stat { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: var(--fg-mute); }
+.st-stat b { color: var(--fg); }
+.popup-actions button.save { border-color: rgba(110,231,168,0.45); background: rgba(110,231,168,0.14); color: #dffbea; }
+.popup-actions button.save:hover { background: rgba(110,231,168,0.26); color: #fff; }
+.tp-station-editor { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); }
+.tp-tag.wait { color: #ffd166; border: 1px solid rgba(255,209,102,0.4); }
+
+/* ==========================================================================
+   图层驱动的显示模式 + 左侧/聊天面板折叠（#layers / #toolopts / #chat）
+   一块面板 = .tb-panel：第一个子元素 .panel-head，其余内容在折叠时整块隐藏
+   （通用规则见上方 .panel-collapsed > *:not(.panel-head)）
+   ========================================================================== */
+
+/* 左栏两块（编辑工具 / 图层与显示模式）：底色**不透明** —— 它们紧挨着地图，
+   半透明会让底图把字的轮廓搅浑，两块叠在一起时上块的阴影还会透下来连成一条黑带（#7）；
+   像素自检也要求这一列够"暗"
+   （tools/check-screenshot.js 判「深色面板与浅色地图形成对比」：center.mean - leftStrip.mean > 60） */
+#toolbar .tb-panel { background: var(--panel-solid); }
+/* 编辑工具这一块**只按内容长高**（flex: 0 0 auto，见第 7 节）：工具在顶、撤销/重做在底；
+   面板本体是 .rc-panel（display / flex-direction / 内部滚动层由第 8 节统一给），
+   工具多了滚**它自己**的 .panel-body —— 一个面板只有一条滚动条（21.5），这一块不抢兄弟的高度
+   （原来这里的 flex / min-height 与 `#toolbar > *` 一起把整列变成了"两块共用一条滚动条"）。 */
+/* 标题栏自己就有下边框了，工具选项区不再重复画一条 */
+#toolopts .tool-options { border-top: 0; }
+#layers.panel-collapsed,
+#toolopts.panel-collapsed { min-width: 0; }
+
+/* --------------------------------------------------------------------------
+   左栏里的撤销 / 重做（接线在 ui.js：按钮与 #status-undo 都是老节点）
+   -------------------------------------------------------------------------- */
+/* 撤销 / 重做：左栏够宽（236px），一行文字 + 两个并排的小按钮（不再竖着堆、也不再藏起步数） */
+#toolbar .to-actions {
+  align-items: center;
+  gap: 5px;
+  padding: 4px 7px 6px;
+}
+#toolbar .to-actions .mini {
+  flex: 1 1 auto;
+  padding: 1px 6px;
+  text-align: center;
+  font-size: 12px;
+}
+/* 左栏只有 128px 内容宽：三个按钮挤在一行会切字。
+   「✕ 取消选择」自己占一整行（flex-basis 100% 强制换行），撤销/重做照旧并排 —— 一行放得下。 */
+#toolbar .to-actions .clear-select {
+  flex: 1 1 100%;
+  margin-top: 2px;
+  font-size: 11.5px;
+}
+
+/* 图层抽屉与「窄条里的 🗂️ 入口」都已经下线：#layers 是左栏的第三块（编辑工具 → 工具选项 →
+   图层与显示模式），布局见第 8 节（#toolbar / .rc-panel），宽栏里的排版见第 21 节。 */
+
+/* 协作频道折叠后只剩标题栏（原本是固定 320×170 的对话框） */
+#chat.panel-collapsed {
+  width: auto;
+  min-width: 168px;
+  max-width: 260px;
+  height: auto;
+  max-height: none;
+}
+#chat .chat-head { justify-content: flex-start; }
+#chat .chat-head .panel-title { letter-spacing: .05em; }
+
+/* 图层小标题（显示模式） */
+.panel-title.mini-title {
+  position: static;
+  padding: 8px 10px 3px;
+  border-bottom: 0;
+  background: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  font-size: 10px;
+}
+
+/* 图层里缩进的小项（子过滤器） */
+.layer-item.sub-item { padding-left: 22px; font-size: 11px; color: var(--fg-mute); }
+
+/* 类别色块：新增的两个图层开关 */
+.layer-item .sw.cat-catchment { background: #f4783c; }
+.layer-item .sw.cat-pop { background: #e4572e; }
+
+/* 显示模式：**层级式 checkbox**（顶层互斥，勾了轨交 / 公交下面缩进出现子 checkbox）。
+   行本身沿用上面 .layer-item 那一套（勾选框 + 色块 + 名称 + 右侧状态），
+   与「图层」表长得一模一样 —— 这一格只负责分组与子项的缩进。 */
+.mode-group {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 2px 6px 6px;
+}
+/* 子项容器：左边一条细竖线 + 缩进，一眼看出"这是上面那一行的下级" */
+.mode-children {
+  display: flex;
+  flex-direction: column;
+  margin: 1px 0 3px 9px;
+  padding-left: 7px;
+  border-left: 1px solid var(--line-3);
+}
+.mode-child-title {
+  padding: 5px 0 1px;
+  color: var(--fg-mute);
+  font-size: 9.5px;
+  letter-spacing: .1em;
+}
+.mode-child-note { padding: 2px 0 1px; color: var(--fg-mute); font-size: 9.5px; line-height: 1.5; }
+/* 「分色方式」下面**唯一**那一行图例：几个色块 + 名称（或一条色带），刻意只有一行 */
+.scheme-line {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 1px 2px;
+  overflow: hidden;
+}
+.scheme-line:empty { display: none; }
+.scheme-line .lg-item { display: flex; align-items: center; gap: 3px; min-width: 0; }
+.scheme-line .sw {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border: 1px solid rgba(0, 0, 0, .35);
+  border-radius: 3px;
+}
+.scheme-line .lg-name {
+  min-width: 0;
+  max-width: 52px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-dim);
+  font-size: 10px;
+}
+.scheme-line .lg-more { flex: 0 0 auto; color: var(--fg-mute); font-size: 9.5px; }
+.scheme-line .legend-bar {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 8px;
+  border: 1px solid rgba(0, 0, 0, .38);
+  border-radius: 3px;
+}
+
+/* 显示模式下方那一格：拥堵模式的色带 + 刻度 + 一行中文摘要（其它模式为空，整格收起） */
+.mode-legend { padding: 0 8px 6px; }
+.mode-legend:empty { display: none; }
+.mode-legend .legend-actions { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; }
+.mode-legend .legend-line .sw {
+  flex: 0 0 auto;
+  width: 11px;
+  height: 11px;
+  border: 1px solid rgba(0, 0, 0, .35);
+  border-radius: 3px;
+}
+
+/* 图例（画在图层面板里，不放交通面板） */
+.layer-legend { padding: 0 8px 8px; }
+.layer-legend:empty { display: none; }
+.legend-block { margin-bottom: 7px; }
+.legend-block:last-child { margin-bottom: 0; }
+.legend-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 3px;
+  color: var(--fg-mute);
+  font-size: 10px;
+}
+.legend-bar {
+  height: 9px;
+  border: 1px solid rgba(0, 0, 0, .38);
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .06) inset;
+}
+.legend-ticks {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 2px;
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  font-size: 9.5px;
+}
+.legend-note { margin-top: 3px; color: var(--fg-mute); font-size: 10px; line-height: 1.5; }
+.legend-note b { color: var(--fg-dim); font-weight: 600; }
+.legend-line { display: flex; align-items: center; gap: 6px; color: var(--fg-dim); font-size: 10.5px; }
+/* 分类配色的图例条目（公交线路分色：线路本色 / 公司 / 票价）：一行一项 = 色块 + 名称 + 计数。
+   行本身沿用上面的 .legend-line，这里只补名称（可省略号）与右侧计数，以及未知项的虚线色块 */
+.legend-line .li-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.legend-line .li-count {
+  flex: 0 0 auto;
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+.legend-line.unknown .sw { border-style: dashed; }
+#layer-legend .legend-line + .legend-line { margin-top: 2px; }
+.legend-disc {
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  border: 1px dashed rgba(244, 120, 60, .85);
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(244, 120, 60, .55), rgba(244, 120, 60, .04) 72%);
+}
+
+/* ==========================================================================
+   服务器资讯窗口
+   ========================================================================== */
+.srv-body { max-height: 62vh; overflow-y: auto; margin: 2px 0 8px; padding-right: 2px; }
+.srv-section { margin-bottom: 11px; }
+.srv-section:last-child { margin-bottom: 0; }
+.srv-section-title {
+  padding-bottom: 3px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--line-3);
+  color: var(--fg-mute);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .07em;
+}
+.srv-row { display: flex; align-items: baseline; gap: 10px; padding: 3px 2px; font-size: 12px; }
+.srv-row + .srv-row { border-top: 1px dashed rgba(255, 255, 255, .05); }
+.srv-k { flex: 0 0 132px; color: var(--fg-mute); font-size: 11.5px; }
+.srv-v { flex: 1 1 auto; min-width: 0; color: var(--fg); word-break: break-word; }
+.srv-v b { color: #fff; font-family: var(--mono); font-weight: 600; }
+.srv-v .srv-sub { color: var(--fg-mute); font-size: 11px; }
+.srv-v .srv-warn { color: var(--warn); }
+.srv-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+@media (max-width: 520px) {
+  .srv-k { flex: 0 0 96px; }
+}
+
+/* ==========================================================================
+   顶栏瘦身 + 所有面板都能折叠 + 工具选项里的撤销/重做 + 显示模式设置块
+   （数据集与导入资讯只在「服务器资讯」窗口里看，#data-info 只是占位节点）
+   ========================================================================== */
+
+/* 顶栏不再有占满中间的数据集统计：右侧入口自己贴到右边 */
+#topbar .top-actions { margin-left: auto; }
+
+/* 编辑工具（#toolbox）与工具选项 / 图层同一套折叠规则；左栏里的间距与列数见第 7 节 */
+#toolbox .tool-list { padding: 6px; }
+#toolbox.panel-collapsed .tool-list { display: none; }
+
+/* 撤销 / 重做 / 取消选择：属于「编辑工具」本身，紧贴在工具按钮下面（不是某个工具的选项），
+   按钮比 .mini 再小一档。
+   圆角跟随面板（#7）：这一行是整块面板的**最后一行**（自带 border-top），
+   不给圆角它就会在面板左下 / 右下压出两个方角 —— "编辑工具"的角落瑕疵就是这个。 */
+.to-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 7px 6px;
+  border-top: 1px solid var(--line-3);
+  border-radius: 0 0 calc(var(--radius) - 1px) calc(var(--radius) - 1px);
+}
+.to-actions .to-depth {
+  flex: 1 1 100%;
+  min-width: 0;
+  color: var(--fg-mute);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  line-height: 1.3;
+  letter-spacing: 0;
+}
+.to-actions .mini {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border-radius: 6px;
+  font-size: 10px;
+  line-height: 15px;
+}
+.to-actions .mini + .mini { margin-left: 0; }
+/* 「✕ 取消选择」：与撤销/重做同一行，占满剩下的宽度；没选中东西时是灰的（disabled），
+   选中之后亮起来（.active，与工具按钮的选中态同一套配色，一眼能认出来） */
+.to-actions .clear-select {
+  flex: 1 1 auto;
+  white-space: nowrap;
+}
+.to-actions .clear-select:disabled {
+  opacity: .45;
+  cursor: default;
+  color: var(--fg-mute);
+  border-color: var(--line);
+  background: var(--panel-2);
+}
+.to-actions .clear-select.active:not(:disabled) {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: #fff;
+}
+
+/* 右下「在线协作者 + 元素锁」面板折叠后只剩标题栏 */
+#collab .collab-head {
+  flex: 0 0 auto;
+  justify-content: flex-start;
+  padding: 6px 8px 6px 10px;
+}
+#collab .collab-head .panel-title { font-size: 11px; letter-spacing: .05em; }
+#collab.panel-collapsed {
+  width: auto;
+  min-width: 186px;
+  max-width: 260px;
+  max-height: none;
+}
+
+/* 轨交 / 公交模式下「只显示指定线路」（我的线路多选）。
+   **类别筛选不在这里**：它是显示模式那棵层级 checkbox 里的「线路类别」子项（见 .mode-children），
+   所以这里只有标签 + 线路行 + 一个「清除筛选」按钮，没有解释段落。 */
+.mode-settings { padding: 0 6px 6px; }
+.mode-settings:empty { display: none; }
+.ms-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 7px 7px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--radius-xs);
+  background: rgba(255, 255, 255, .03);
+}
+.ms-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  color: var(--fg-dim);
+  font-size: 10.5px;
+}
+.ms-label .ms-hint { color: var(--fg-mute); font-size: 9.5px; }
+.ms-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 132px;
+  overflow-y: auto;
+  padding: 2px 0;
+}
+.ms-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 3px;
+  border-radius: var(--radius-xs);
+  font-size: 10.5px;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.ms-line:hover { background: var(--panel-2); color: var(--fg); }
+.ms-line input[type="checkbox"] { flex: 0 0 auto; }
+.ms-line .dot { width: 8px; height: 8px; }
+.ms-line .ms-line-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ms-line .ms-kind { flex: 0 0 auto; color: var(--fg-mute); font-size: 9.5px; }
+.ms-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ms-note { flex: 1 1 100%; color: var(--fg-mute); font-size: 9.5px; line-height: 1.45; }
+.ms-foot .mini { padding: 1px 7px; border-radius: 6px; font-size: 10px; line-height: 15px; }
+
+/* 图层开关：活跃度色块 + 置灰状态（服务器没给 activity 字段时） */
+.layer-item .sw.cat-activity { background: #6a8cff; }
+.layer-item.disabled { opacity: .45; }
+.layer-item.disabled input[type="checkbox"] { cursor: not-allowed; }
+
+/* ==========================================================================
+   20. 界面重排：属性检查器分区 / 工具选项与「?」弹层 / 图层同一张表 / 小号按钮
+   ========================================================================== */
+
+/* --- 20.1 属性检查器：分区（标题 / 类型 / 几何 / 属性 / 标签 / 操作 / 历史）--- */
+/* 分区标题带 ＋添加 之类的按钮时不要大写化那个按钮 */
+.insp-section-title .mini {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+
+/* 属性区：这个元素自己的数值设置（建筑的楼层 + 由楼层推算的人口、道路的限速） */
+.insp-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 10px 8px;
+  border-bottom: 1px solid var(--line-3);
+}
+.insp-fields:empty { display: none; }
+.insp-fields .floors-ctl { margin-top: 0; position: relative; }
+.insp-fields .pop-people input { width: 74px; }
+.insp-fields .field-note { color: var(--fg-mute); font-size: 10.5px; }
+/* 限速行：数字芯片 + 自定义输入 + 按等级填默认值 / 清除 */
+.insp-fields .road-speed-ctl { position: relative; }
+.insp-fields .road-speed-ctl b { color: var(--fg); font-family: var(--mono); }
+.insp-fields .opt-chips { padding: 0; }
+.insp-fields .opt-actions { padding: 0; }
+
+/* 类型芯片：当前类型高亮；再点同一个芯片就是换回上一个类型（toggle） */
+.preset-chip.active,
+.preset-chip[aria-pressed="true"] {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: #fff;
+}
+.preset-chip.active:hover { border-color: var(--accent-line); background: var(--accent-soft); }
+
+/* --- 20.2 工具选项：当前工具名 + 「?」解释弹层 --- */
+#toolopts .to-tool {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-dim);
+  font-size: 10.5px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.opt-help {
+  flex: 0 0 auto;
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  border-radius: 50%;
+  font-size: 10.5px;
+  line-height: 15px;
+  text-align: center;
+}
+.opt-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px 3px;
+}
+.opt-row-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--fg-mute);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .05em;
+}
+.opt-pop {
+  position: absolute;
+  right: 7px;
+  left: 7px;
+  top: calc(100% + 2px);
+  z-index: 6;
+  max-height: 32vh;
+  overflow-y: auto;
+  padding: 7px 9px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-xs);
+  background: var(--panel);
+  color: var(--fg-dim);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.55;
+  letter-spacing: 0;
+  text-transform: none;
+  box-shadow: var(--shadow);
+}
+/* 创作面板（#inspector-create）住在「工具选项」面板里 */
+.create-panel { padding-bottom: 2px; }
+.create-panel .insp-section-title { padding: 8px 10px 4px; }
+
+/* --- 20.2b 「?」说明弹层的通用零件（面板 / 图例 / 弹窗共用同一套） ---
+   长段中文说明一律收进这里的弹层：面板上只留一行短标签 + 一枚 17px 的「?」。
+   .help-wrap / .help-host 是弹层的宿主，必须 position: relative（.opt-pop 是绝对定位）。 */
+.help-wrap,
+.help-host {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.help-wrap > .opt-pop,
+.help-host > .opt-pop {
+  left: 0;
+  right: auto;
+  width: 236px;
+  max-width: min(280px, 62vw);
+  max-height: 40vh;
+}
+/* 右栏（#inspector / #toolopts 那一列，贴在屏幕右边）里的「?」往**左**展开：
+   往右展开会顶出屏幕外。左栏与弹窗里往右展开（那边空着，正好盖在地图上）。 */
+#rightcol .help-wrap > .opt-pop,
+#rightcol .help-host > .opt-pop { left: auto; right: 0; }
+/* 面板标题行里的「?」（图例头 / 小节标题）：和标签同一行，不撑高、不换行 */
+.legend-title .help-wrap,
+.mode-child-title .help-wrap,
+.help-row .help-wrap { margin-left: 6px; }
+/* 图例头是 flex + space-between（[标题] … [右侧状态/按钮]）：
+   让「?」用 auto 外边距吃掉中间的空档 → [标题 ?] 挨在左边，右侧那一格照旧靠右 */
+.legend-title > .help-wrap { margin-right: auto; }
+.help-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 0;
+}
+.help-row-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--fg-dim);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+/* 图例里的「?」：比工具面板那枚再小一点，免得抢了色带的注意力 */
+.legend-title .opt-help,
+.mode-child-title .opt-help { width: 15px; height: 15px; font-size: 9.5px; line-height: 13px; }
+/* 图例说明行本身不再铺长句：行内只剩短状态 + 一枚「?」 */
+.legend-note .help-wrap { margin-left: 4px; }
+.ms-note .help-wrap { margin-left: 4px; }
+.opt-current .help-wrap { margin-left: 4px; }
+/* 弹窗标题行里的「?」：跟着标题走，不与标题文字抢宽度 */
+.modal-card h1 .help-host { margin-left: 2px; }
+/* 工具选项里的动作按钮（复制选中 / 删除选中 / 批量…） */
+.opt-actions { display: flex; flex-wrap: wrap; gap: 5px; padding: 3px 10px 6px; }
+.opt-actions button:disabled { opacity: .45; cursor: not-allowed; }
+
+/* --- 20.3 图层：所有显示开关都在同一张表里（要素分类 + 叠加图层），同一个行样式 --- */
+.layer-cats { display: flex; flex-direction: column; }
+#layer-list .layer-item { width: 100%; }
+
+/* ==========================================================================
+   21. 左栏（236px）/ 右栏（316px）排版 + 面板 / 窗口的尺寸拖柄
+   --------------------------------------------------------------------------
+   21.1 各块的标题栏与内层留白（一行放得下：标题 + 折叠按钮）
+   21.2 显示模式：**层级式 checkbox**（顶层 5 行互斥；勾了轨交 / 公交，下面缩进出现
+        分色方式（单选）+ 线路类别（多选）两组子 checkbox；子项下面只有一行图例）
+   21.3 图层：一张紧凑表（12px 勾选框 + 10px 色块 + 11.5px 名称），行高 24px，
+        行之间只有一条几乎看不见的分隔线。**每行右侧的要素计数已经删掉** ——
+        所以现在名称吃掉整行剩下的宽度（显示模式行右侧留一格「当前 / 已筛选」状态）。
+        （注：21.2 / 21.3 只是样式分节顺序；DOM 里是**图层表在前、显示模式在后**，
+         与左栏「编辑工具 → 图层 → 显示模式」一致）
+   21.4 图例 / 模式筛选块：同样收一档
+   21.5 面板自身滚动时，内层小块不再各自滚动（一个面板只有一条滚动条）
+   21.6 交通公司面板 / 独立管理器窗口（.tmgr-win）：右边缘拖宽、下边缘拖高、右下角同时改
+
+   注：图层与显示模式**住在左栏**（编辑工具下面），工具选项住在右栏（属性检查器下面）——
+   面板住在哪一列（#toolbar 左 / #rightcol 右），紧凑排版就挂在那一列上。
+   ========================================================================== */
+
+/* --- 21.1 标题栏与留白 --- */
+#rightcol > .rc-panel > .panel-head,
+#toolbar > .tb-panel > .panel-head {
+  padding: 5px 9px;
+  gap: 5px;
+}
+#rightcol > .rc-panel > .panel-head .panel-title,
+#toolbar > .tb-panel > .panel-head .panel-title {
+  font-size: 10.5px;
+  letter-spacing: .06em;
+}
+#rightcol > .rc-panel > .panel-head .panel-toggle,
+#toolbar > .tb-panel > .panel-head .panel-toggle {
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 10.5px;
+  line-height: 17px;
+}
+/* 分组小标题（显示模式 / 图层）：一枚小标签 + 一条向右延伸的细线，一列里看着更利落 */
+#toolbar .panel-title.mini-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 9px 4px;
+  font-size: 9.5px;
+  letter-spacing: .12em;
+}
+#toolbar .panel-title.mini-title::after {
+  content: "";
+  flex: 1 1 auto;
+  min-width: 8px;
+  height: 1px;
+  background: var(--line-3);
+}
+/* 「工具选项」住在右栏（316px）：工具名可以写得全一点，不用再压到 10px，也不用截断 */
+#rightcol > #toolopts .to-tool { font-size: 10.5px; max-width: none; }
+
+/* --- 21.2 显示模式：层级式 checkbox（顶层 5 行 + 轨交 / 公交的子项） ---
+   行本身与「图层」表共用 .layer-item（见 21.3），这里只把这一格收一档：
+   顶层 5 行 + 子项都按 236px 排，一行放得下勾选框 + 色块 + 名称 + 右侧状态，不横滚、不切字。 */
+#toolbar .mode-group { gap: 0; padding: 0 6px 6px; }
+#toolbar .mode-item { font-size: 11.5px; }
+#toolbar .mode-children { margin: 0 0 2px 8px; padding-left: 6px; }
+#toolbar .mode-children .layer-item { padding-left: 4px; font-size: 11px; }
+#toolbar .mode-child-title { font-size: 9.5px; }
+#toolbar .scheme-line { gap: 7px; }
+#toolbar .scheme-line .lg-name { max-width: 48px; }
+
+/* --- 21.3 图层：紧凑表（一行放得下勾选框 + 色块 + 中文名 / 右侧状态，不横滚、不切字；
+       **每行右侧的要素计数已经删掉**） --- */
+#toolbar .layer-list { padding: 2px 6px 6px; }
+#toolbar .layer-item {
+  gap: 6px;
+  padding: 3px 6px;
+  font-size: 11.5px;
+  line-height: 18px;
+}
+#toolbar .layer-item + .layer-item { border-top: 1px solid rgba(255, 255, 255, .035); }
+#toolbar .layer-item input[type="checkbox"],
+#toolbar .layer-item input[type="radio"] { width: 12px; height: 12px; }
+#toolbar .layer-item .sw { width: 10px; height: 10px; border-radius: 2px; }
+#toolbar .layer-item .lstate { font-size: 9.5px; }
+#toolbar .layer-item.sub-item { padding-left: 20px; font-size: 11px; }
+#toolbar .layer-item.sub-item .lname { color: var(--fg-mute); }
+
+/* --- 21.4 图例与模式筛选块 --- */
+#toolbar .mode-legend { padding: 0 8px 5px; }
+#toolbar .layer-legend { padding: 0 8px 5px; }
+#toolbar .legend-block { margin-bottom: 5px; }
+#toolbar .legend-title { font-size: 9.5px; }
+#toolbar .legend-note { font-size: 9.5px; }
+#toolbar .mode-settings { padding: 0 6px 5px; }
+#toolbar .ms-block { gap: 3px; padding: 5px 7px 6px; }
+#toolbar .ms-label { font-size: 10px; }
+#toolbar .ms-lines { max-height: 108px; }
+#toolbar .ms-line { font-size: 10px; }
+#toolbar .ms-line .ms-line-name { max-width: none; }
+
+/* --- 21.5 一个面板只有一条滚动条 --- */
+/* 标签表在面板内部再滚一次的话会出现两条滚动条：让面板自己滚 */
+#rightcol .insp-tags { max-height: none; overflow: visible; }
+/* 同理：编辑工具里的工具列表（.tool-list）也不再自己滚（见第 7 节的 .tool-list）——
+   滚的是它那块面板的 .panel-body。于是"左栏两块"各有各的那一条滚动条，谁也不横跨两块。 */
+/* 面板折叠时只该剩标题栏：用户拖过的高度（或 .rc-panel 的 72px 最小高）都不能把折叠后的面板撑高 */
+#rightcol > .rc-panel.panel-collapsed,
+#toolbar > .rc-panel.panel-collapsed {
+  height: auto !important;
+  max-height: none;
+  min-height: 0;
+}
+.rc-panel.resizing { box-shadow: 0 16px 40px rgba(0, 0, 0, .55); }
+.rc-panel.resizing > .panel-body { pointer-events: none; }
+
+/* --- 21.6 交通公司面板 / 独立管理器窗口：双向改尺寸 --- */
+/* 拖柄本体：透明，悬停 / 拖动时亮起来；刻意避开右下角 18×18 的方格 ——
+   那儿留给 .tmgr-win 的原生 resize: both 握把，两条路都能用，互不遮挡。
+   右边那条从 76px 起：上面是标题栏与页签 / "看哪一个"下拉，不该被抓手压住 */
+.win-grip {
+  position: absolute;
+  z-index: 6;
+  touch-action: none;
+  background: transparent;
+  transition: background .12s ease;
+}
+.win-grip.right { top: 76px; right: 0; bottom: 18px; width: 7px; cursor: ew-resize; }
+.win-grip.bottom { left: 0; right: 18px; bottom: 0; height: 7px; cursor: ns-resize; }
+.win-grip.corner { right: 0; bottom: 0; width: 18px; height: 18px; cursor: nwse-resize; }
+/* 内容区右边留 7px 给上面那条抓手：滚动条正好落在抓手左边，两者不会抢鼠标 */
+#transit .tp-body,
+.tmgr-win .tmgr-body { margin-right: 7px; scrollbar-width: thin; }
+.win-grip:hover,
+.win-grip.dragging { background: rgba(76, 154, 255, .22); }
+.win-grip.dragging { background: rgba(76, 154, 255, .34); }
+/* 右下角的一道斜杠：告诉人"这儿能拉大"。只画在 .tmgr-win 上 ——
+   它自己的原生 resize: both 握把就在同一个角上，两块图案正好叠成一处 */
+body .tmgr-win::after {
+  content: "";
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 10px;
+  height: 10px;
+  pointer-events: none;
+  z-index: 7;
+  background:
+    linear-gradient(135deg, transparent 46%, var(--fg-mute) 46%, var(--fg-mute) 54%, transparent 54%);
+  opacity: .55;
+}
+/* 用户拖过尺寸之后：内容区自己滚（默认是 max-height 撑开的，不用管），
+   并且**让开 CSS 的高度上限**（上面 #transit 的 calc(100vh - 300px)）——
+   那条上限比内联 height 优先级更高，不让开的话下边缘拖到 700px 画面上还是 600px
+   （"面板高度拖不动"）。真正的上限由 ui.js 的 sizeCaps()（视口 - 16px）在 JS 里钳制。 */
+#transit.sized { overflow: hidden; max-height: none; }
+#transit.sized .tp-body { flex: 1 1 auto; min-height: 0; max-height: none; }
+/* 折叠起来就只剩标题栏：拖过的宽高这一刻让开（内联尺寸还在，展开时自动恢复） */
+#transit.panel-collapsed.sized { width: auto !important; height: auto !important; }
+#transit.resizing,
+.tmgr-win.resizing { user-select: none; }
+/* 交通面板展开时的尺寸下限："标题栏 + 一排页签 + 一行内容"。
+   折叠后只剩标题栏，这条不能管（否则折叠起来还会被撑到 170px 高 / 260px 宽） */
+#transit:not(.panel-collapsed) { min-width: 260px; min-height: 170px; }
+
+/* 独立管理器窗口（transit.js 的 .tmgr-win / linemgr.js 的 #linemgr.lm-win）：
+   它们的样式表是**运行时注入**的（appendChild 到 <head>，排在 app.css 之后），所以这里必须用
+   更高优先级（body 前缀）才盖得住。它们自己写的是 max-width: 96vw / max-height: 92vh ——
+   比 ui.js 拖柄的上限（sizeCaps() = 视口 - 16px）更紧，于是右下角拖到 92vh 就停住、
+   连原生 resize: both 也一样，看着像"不能自由改大小"。这里放宽到与 JS 钳制一致。 */
+body .tmgr-win,
+body #linemgr.lm-win {
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+}

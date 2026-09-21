@@ -1,0 +1,26 @@
+# 构建上下文收窄：这些都不进镜像。
+# 没有它的话上下文会包含 2 GB 的 passport/（跟本项目无关的另一份代码）
+# 与约 1 GB 的 data/（数据集），构建会慢得离谱、镜像也会白白变大。
+.git
+.gitignore
+node_modules
+
+# 数据集与运行时产物：一律通过数据卷挂载，不进镜像
+data
+logs
+
+# 测试与临时目录（镜像里不需要；要跑测试请在本机跑）
+tests
+tmp-verify
+
+# 与本项目无关的另一份代码
+passport
+# 第一版（在 OSM 底图上叠一层自建城市），已不参与运行
+legacy
+
+# Windows 专用启动脚本（服务器上看不到它，容器里有 entrypoint）
+start.cmd
+
+# 文档留在仓库里就好，不必进镜像（deploy/ 要保留：entrypoint 在里面）
+*.md
+!deploy/DEPLOY.md
